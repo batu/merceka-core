@@ -4,7 +4,7 @@
 
 # %% auto 0
 __all__ = ['get_git_hash', 'config_name', 'Evaluation', 'TaskResult', 'ExperimentResults', 'Task', 'Evaluator', 'Experiment',
-           'run_experiment', 'to_dataframe', 'plot_success_rates', 'plot_heatmap', 'to_csv']
+           'run_experiment', 'to_dataframe']
 
 # %% ../nbs/01_evaluation.ipynb 2
 from dataclasses import dataclass, field
@@ -285,11 +285,18 @@ class ExperimentResults:
     
     @property
     def success_rate(self) -> float | None:
-        """Success percentage (0-100) if 'success' evaluation exists."""
+        """Success percentage (0-100) if 'success' evaluation exists.
+        
+        Only counts boolean True/False values. Non-boolean values are ignored.
+        """
         successes = self.get_evaluation_values("success")
         if not successes:
             return None
-        return sum(successes) / len(successes) * 100
+        # Only count boolean values to avoid type errors
+        bool_successes = [s for s in successes if isinstance(s, bool)]
+        if not bool_successes:
+            return None
+        return sum(bool_successes) / len(bool_successes) * 100
     
     @property
     def failures(self) -> "ExperimentResults":
@@ -702,9 +709,10 @@ class Experiment:
         
         duration = time.time() - start_time
         
-        # Run evaluators
+        # Run evaluators (only if run succeeded - error is None)
+        # Note: output can legitimately be None, so we check error instead
         evaluations = []
-        if output is not None:
+        if error is None:
             for evaluator in self.evaluators:
                 try:
                     evals = evaluator.evaluate(output, task=task, config=config)
@@ -791,123 +799,4 @@ def to_dataframe(results: ExperimentResults):
         rows.append(row)
     
     return pd.DataFrame(rows)
-
-
-# %% ../nbs/01_evaluation.ipynb 38
-def plot_success_rates(results: ExperimentResults, by: str = "config", figsize: tuple = (10, 6)):
-    """Plot success rates as a bar chart.
-    
-    Args:
-        results: ExperimentResults to plot
-        by: Group by "config" or "task"
-        figsize: Figure size tuple (width, height)
-    
-    Returns:
-        matplotlib Figure object
-    """
-    import matplotlib.pyplot as plt
-    
-    if by == "config":
-        names = sorted(results.config_names)
-        rates = [results.by_config(n).success_rate or 0 for n in names]
-        xlabel = "Config"
-    else:
-        names = sorted(results.task_names)
-        rates = [results.by_task(n).success_rate or 0 for n in names]
-        xlabel = "Task"
-    
-    fig, ax = plt.subplots(figsize=figsize)
-    bars = ax.bar(range(len(names)), rates, color='steelblue', edgecolor='black')
-    
-    ax.set_xticks(range(len(names)))
-    ax.set_xticklabels(names, rotation=45, ha='right')
-    ax.set_ylabel("Success Rate (%)")
-    ax.set_xlabel(xlabel)
-    ax.set_ylim(0, 100)
-    ax.set_title(f"Success Rate by {xlabel}")
-    
-    # Add value labels on bars
-    for bar, rate in zip(bars, rates):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 2,
-               f'{rate:.1f}%', ha='center', va='bottom', fontsize=9)
-    
-    plt.tight_layout()
-    return fig
-
-
-# %% ../nbs/01_evaluation.ipynb 39
-def plot_heatmap(results: ExperimentResults, metric: str = "success", figsize: tuple = None):
-    """Plot a heatmap of task x config results.
-    
-    Args:
-        results: ExperimentResults to plot
-        metric: Name of evaluation to plot (default "success")
-        figsize: Figure size, auto-calculated if None
-    
-    Returns:
-        matplotlib Figure object
-    """
-    import matplotlib.pyplot as plt
-    import numpy as np
-    
-    tasks = sorted(results.task_names)
-    configs = sorted(results.config_names)
-    
-    if len(tasks) <= 1 or len(configs) <= 1:
-        raise ValueError("Heatmap requires at least 2 tasks and 2 configs")
-    
-    # Build matrix
-    matrix = np.zeros((len(tasks), len(configs)))
-    for i, task in enumerate(tasks):
-        for j, config in enumerate(configs):
-            subset = results.by_task(task).by_config(config)
-            if metric == "success":
-                val = subset.success_rate or 0
-            else:
-                vals = subset.get_evaluation_values(metric)
-                val = np.mean(vals) if vals else 0
-            matrix[i, j] = val
-    
-    # Auto figure size
-    if figsize is None:
-        figsize = (max(6, len(configs) * 1.5), max(4, len(tasks) * 0.8))
-    
-    fig, ax = plt.subplots(figsize=figsize)
-    
-    if metric == "success":
-        im = ax.imshow(matrix, cmap='RdYlGn', vmin=0, vmax=100)
-    else:
-        im = ax.imshow(matrix, cmap='viridis')
-    
-    ax.set_xticks(range(len(configs)))
-    ax.set_yticks(range(len(tasks)))
-    ax.set_xticklabels(configs, rotation=45, ha='right')
-    ax.set_yticklabels(tasks)
-    ax.set_xlabel("Config")
-    ax.set_ylabel("Task")
-    
-    # Add text annotations
-    for i in range(len(tasks)):
-        for j in range(len(configs)):
-            val = matrix[i, j]
-            text = f'{val:.1f}%' if metric == "success" else f'{val:.2f}'
-            ax.text(j, i, text, ha='center', va='center', fontsize=9)
-    
-    plt.colorbar(im, label=metric.capitalize())
-    ax.set_title(f"{metric.capitalize()} by Task × Config")
-    plt.tight_layout()
-    return fig
-
-
-# %% ../nbs/01_evaluation.ipynb 40
-def to_csv(results: ExperimentResults, path: str):
-    """Export ExperimentResults to a CSV file.
-    
-    Args:
-        results: ExperimentResults to export
-        path: Path to save the CSV file
-    """
-    df = to_dataframe(results)
-    df.to_csv(path, index=False)
-    return path
 
