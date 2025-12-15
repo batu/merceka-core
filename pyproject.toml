@@ -1,0 +1,44 @@
+[project]
+name="merceka_core"
+version = "0.1.0"
+description = "Core utilities for merceka projects"
+readme = "README.md"
+requires-python=">=3.11"
+dependencies = [
+    "ollama>=0.6.1",
+    "litellm>=1.80.5",
+    "pydantic>=2.12.4",
+    "tqdm>=4.0.0",
+    "python-dotenv>=1.0.0",
+    "nbdev>=2.4.6",
+    "jupyterlab>=4.5.0",
+    "jupyter-collaboration>=3.0.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["merceka_core*"]
+
+[tool.basedpyright]
+reportMissingImports = false
+
+[tool.ruff]
+line-length = 100
+indent-width = 2
+exclude = ["setup.py"]
+
+[tool.ruff.lint]
+ignore = [
+    "F403", # Star imports
+    "F405", # Star imports
+    "E402", # Module import not at the top of file.
+    "E701", # Multiple statements on one line    
+    "E702", # Multiple statements on one line    
+    "F811", # Redefinition of unused function (used for routes)
+] 
+
+[tool.ruff.lint.per-file-ignores]
+"*.ipynb" = []
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+

@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# nbdev
+_proc/
+.nbdev.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# START Ruler Generated Files
+/.cursor/mcp.json
+/.cursor/mcp.json.bak
+/.mcp.json
+/.mcp.json.bak
+/AGENTS.md
+/AGENTS.md.bak
+/CLAUDE.md
+/CLAUDE.md.bak
+# END Ruler Generated Files
+
