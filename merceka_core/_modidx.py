@@ -99,4 +99,9 @@ d = { 'settings': { 'branch': 'main',
                                   'merceka_core.llm._chat_one': ('llm.html#_chat_one', 'merceka_core/llm.py'),
                                   'merceka_core.llm._download_model': ('llm.html#_download_model', 'merceka_core/llm.py'),
                                   'merceka_core.llm.create_message': ('llm.html#create_message', 'merceka_core/llm.py'),
-                                  'merceka_core.llm.list_local_models': ('llm.html#list_local_models', 'merceka_core/llm.py')}}}
+                                  'merceka_core.llm.list_local_models': ('llm.html#list_local_models', 'merceka_core/llm.py')},
+            'merceka_core.wa_bot.client': {},
+            'merceka_core.wa_bot.config': {},
+            'merceka_core.wa_bot.models': {},
+            'merceka_core.wa_bot.utils': {},
+            'merceka_core.wa_bot.webhook': {}}}

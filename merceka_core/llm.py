@@ -84,6 +84,8 @@ class OutputSchema(BaseModel):
 
 # %% ../nbs/00_llm.ipynb 21
 from ollama import ChatResponse
+import litellm
+litellm.suppress_debug_info = True  # Stop printing "Provider List" spam
 from litellm import completion as litellm_completion
 
 
