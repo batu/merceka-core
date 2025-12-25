@@ -45,49 +45,52 @@ def parse_webhook_payload(payload: dict) -> list[Message]:
     """Extract Message objects from a WhatsApp webhook payload.
     
     WhatsApp webhook payloads have a deeply nested structure. This function
-    navigates that structure and extracts text messages into Message objects.
+    navigates that structure and extracts text and image messages.
     
-    Payload structure (simplified):
+    Payload structure for text messages:
     {
-        "object": "whatsapp_business_account",
-        "entry": [{
-            "changes": [{
-                "value": {
-                    "messages": [{
-                        "from": "905551234567",
-                        "id": "wamid.abc123",
-                        "timestamp": "1702656000",
-                        "type": "text",
-                        "text": {"body": "Hello!"}
-                    }]
-                }
-            }]
-        }]
+        "entry": [{"changes": [{"value": {"messages": [{
+            "from": "905551234567",
+            "id": "wamid.abc123",
+            "timestamp": "1702656000",
+            "type": "text",
+            "text": {"body": "Hello!"}
+        }]}}]}]
+    }
+    
+    Payload structure for image messages:
+    {
+        "entry": [{"changes": [{"value": {"messages": [{
+            "from": "905551234567",
+            "id": "wamid.abc123",
+            "timestamp": "1702656000",
+            "type": "image",
+            "image": {"id": "media123", "mime_type": "image/jpeg", "caption": "optional"}
+        }]}}]}]
     }
     
     Args:
         payload: The raw webhook payload as a dict (already parsed from JSON)
     
     Returns:
-        List of Message objects. May be empty if:
+        List of Message objects for text and image messages. May be empty if:
         - Payload has unexpected structure
-        - No text messages in the payload (e.g., only status updates)
-        - Messages are non-text types (images, audio, etc.)
+        - No messages in the payload (e.g., only status updates)
+        - Messages are unsupported types (audio, document, etc.)
     
     Example:
-        payload = await request.json()
         messages = parse_webhook_payload(payload)
         for msg in messages:
-            print(f"From {msg.sender}: {msg.text}")
+            if msg.image_id:
+                print(f"Image from {msg.sender}")
+            else:
+                print(f"Text from {msg.sender}: {msg.text}")
     """
     messages: list[Message] = []
     
-    # Navigate the nested structure safely
-    # We use .get() with defaults to handle missing keys gracefully
     entries = payload.get("entry", [])
     
     for entry in entries:
-        # Skip if entry is not a dict (defensive programming)
         if not isinstance(entry, dict):
             continue
             
@@ -108,27 +111,47 @@ def parse_webhook_payload(payload: dict) -> list[Message]:
                 if not isinstance(msg, dict):
                     continue
                 
-                # Only process text messages for now
-                # Other types: image, audio, document, sticker, location, contacts, etc.
-                if msg.get("type") != "text":
-                    continue
-                
-                # Extract the sender's WhatsApp ID
+                msg_type = msg.get("type")
                 sender = msg.get("from")
+                
                 if not sender:
                     continue
                 
-                # Extract message text from nested structure
-                text_obj = msg.get("text", {})
-                text = text_obj.get("body", "") if isinstance(text_obj, dict) else ""
+                # Handle text messages
+                if msg_type == "text":
+                    text_obj = msg.get("text", {})
+                    text = text_obj.get("body", "") if isinstance(text_obj, dict) else ""
+                    
+                    messages.append(Message(
+                        sender=sender,
+                        text=text,
+                        message_id=msg.get("id", ""),
+                        timestamp=msg.get("timestamp", ""),
+                    ))
                 
-                # Create Message object
-                messages.append(Message(
-                    sender=sender,
-                    text=text,
-                    message_id=msg.get("id", ""),
-                    timestamp=msg.get("timestamp", ""),
-                ))
+                # Handle image messages
+                elif msg_type == "image":
+                    image_obj = msg.get("image", {})
+                    if not isinstance(image_obj, dict):
+                        continue
+                    
+                    image_id = image_obj.get("id")
+                    if not image_id:
+                        continue
+                    
+                    # Caption is optional text that comes with an image
+                    caption = image_obj.get("caption", "")
+                    
+                    messages.append(Message(
+                        sender=sender,
+                        text=caption,
+                        message_id=msg.get("id", ""),
+                        timestamp=msg.get("timestamp", ""),
+                        image_id=image_id,
+                        image_mime_type=image_obj.get("mime_type"),
+                    ))
+                
+                # Other types (audio, document, sticker, etc.) are silently skipped
     
     return messages
 

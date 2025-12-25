@@ -188,6 +188,111 @@ class TestSendTemplate:
         assert payload["template"]["components"] == components
 
 
+class TestGetMediaUrl:
+    """Tests for the get_media_url() method."""
+
+    @pytest.fixture
+    def media_url(self, sample_config: WhatsAppConfig) -> str:
+        """Build the expected media API URL."""
+        return f"https://graph.facebook.com/{sample_config.graph_version}/media123"
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_get_media_url_success(self, client: WhatsAppClient, sample_config: WhatsAppConfig):
+        """Successful get should return the download URL."""
+        media_id = "media123"
+        api_url = f"https://graph.facebook.com/{sample_config.graph_version}/{media_id}"
+        download_url = "https://lookaside.fbsbx.com/whatsapp_business/attachments/..."
+        
+        respx.get(api_url).mock(return_value=httpx.Response(200, json={"url": download_url}))
+        
+        result = await client.get_media_url(media_id)
+        
+        assert result == download_url
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_get_media_url_api_error(self, client: WhatsAppClient, sample_config: WhatsAppConfig, capsys):
+        """API errors should return None."""
+        media_id = "bad_media"
+        api_url = f"https://graph.facebook.com/{sample_config.graph_version}/{media_id}"
+        
+        respx.get(api_url).mock(return_value=httpx.Response(404, json={"error": "Not found"}))
+        
+        result = await client.get_media_url(media_id)
+        
+        assert result is None
+        captured = capsys.readouterr()
+        assert "WARN" in captured.out
+
+    @pytest.mark.asyncio
+    async def test_get_media_url_missing_credentials(self, capsys):
+        """Missing credentials should return None."""
+        config = WhatsAppConfig(
+            phone_number_id="123",
+            whatsapp_token="",  # Empty!
+            verify_token="verify",
+            waba_id="waba",
+        )
+        client = WhatsAppClient(config)
+        
+        result = await client.get_media_url("media123")
+        
+        assert result is None
+        captured = capsys.readouterr()
+        assert "Missing" in captured.out or "WARN" in captured.out
+
+
+class TestDownloadMedia:
+    """Tests for the download_media() method."""
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_download_media_success(self, client: WhatsAppClient, sample_config: WhatsAppConfig):
+        """Successful download should return bytes."""
+        media_id = "media123"
+        api_url = f"https://graph.facebook.com/{sample_config.graph_version}/{media_id}"
+        download_url = "https://lookaside.fbsbx.com/whatsapp_business/attachments/test.jpg"
+        image_bytes = b"\x89PNG\r\n\x1a\n..."
+        
+        # Mock the get_media_url call
+        respx.get(api_url).mock(return_value=httpx.Response(200, json={"url": download_url}))
+        # Mock the actual download
+        respx.get(download_url).mock(return_value=httpx.Response(200, content=image_bytes))
+        
+        result = await client.download_media(media_id)
+        
+        assert result == image_bytes
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_download_media_url_fails(self, client: WhatsAppClient, sample_config: WhatsAppConfig):
+        """If get_media_url fails, download should return None."""
+        media_id = "bad_media"
+        api_url = f"https://graph.facebook.com/{sample_config.graph_version}/{media_id}"
+        
+        respx.get(api_url).mock(return_value=httpx.Response(404, json={"error": "Not found"}))
+        
+        result = await client.download_media(media_id)
+        
+        assert result is None
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_download_media_download_fails(self, client: WhatsAppClient, sample_config: WhatsAppConfig):
+        """If download fails, should return None."""
+        media_id = "media123"
+        api_url = f"https://graph.facebook.com/{sample_config.graph_version}/{media_id}"
+        download_url = "https://lookaside.fbsbx.com/whatsapp_business/attachments/expired.jpg"
+        
+        respx.get(api_url).mock(return_value=httpx.Response(200, json={"url": download_url}))
+        respx.get(download_url).mock(return_value=httpx.Response(403, text="Expired"))
+        
+        result = await client.download_media(media_id)
+        
+        assert result is None
+
+
 class TestClientClose:
     """Tests for the close() method."""
 

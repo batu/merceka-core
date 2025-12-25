@@ -56,14 +56,36 @@ class TestParseWebhookPayload:
         assert messages[2].sender == "905559876543"
         assert messages[2].text == "Third from different user"
 
-    def test_parse_non_text_skipped(self, mixed_type_payload: dict):
-        """Non-text messages (images, audio) should be skipped."""
+    def test_parse_mixed_types(self, mixed_type_payload: dict):
+        """Text and image messages should be parsed, audio should be skipped."""
         messages = parse_webhook_payload(mixed_type_payload)
         
-        # Only the text message should be extracted
-        assert len(messages) == 1
+        # Text and image should be extracted, audio skipped
+        assert len(messages) == 2
+        
+        # First: text message
         assert messages[0].text == "Text message"
         assert messages[0].message_id == "wamid.text1"
+        assert messages[0].image_id is None
+        
+        # Second: image message
+        assert messages[1].message_id == "wamid.image1"
+        assert messages[1].image_id == "img123"
+        assert messages[1].image_mime_type == "image/jpeg"
+        assert messages[1].text == ""  # No caption
+
+    def test_parse_image_with_caption(self, image_with_caption_payload: dict):
+        """Image messages with captions should have caption in text field."""
+        messages = parse_webhook_payload(image_with_caption_payload)
+        
+        assert len(messages) == 1
+        msg = messages[0]
+        
+        assert msg.sender == "905551234567"
+        assert msg.message_id == "wamid.captioned_image"
+        assert msg.image_id == "img456"
+        assert msg.image_mime_type == "image/png"
+        assert msg.text == "Check out this event poster!"
 
     def test_parse_malformed_payload_empty(self):
         """Malformed payloads should return empty list, not crash."""

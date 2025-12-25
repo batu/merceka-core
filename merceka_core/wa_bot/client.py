@@ -253,6 +253,87 @@ class WhatsAppClient:
             print(f"WARN: send_template network error: {e}")
             return None
     
+    async def get_media_url(self, media_id: str) -> str | None:
+        """Get the download URL for a WhatsApp media item.
+        
+        When you receive an image/video/document message, you get a media ID.
+        Call this method to get the actual download URL.
+        
+        Args:
+            media_id: The media ID from the incoming message (e.g., msg.image_id)
+        
+        Returns:
+            The download URL if successful, None on failure.
+            The URL is temporary and expires after a few minutes.
+        
+        Example:
+            if msg.image_id:
+                url = await client.get_media_url(msg.image_id)
+                if url:
+                    # Download the image from url
+        
+        Note:
+            The returned URL requires the same Authorization header to download.
+            Use download_media() for a simpler experience.
+        """
+        if not self.config.whatsapp_token:
+            print("WARN: Missing WHATSAPP_TOKEN, cannot get media URL")
+            return None
+        
+        url = f"https://graph.facebook.com/{self.config.graph_version}/{media_id}"
+        
+        try:
+            client = self._get_client()
+            resp = await client.get(url, headers=self._get_headers())
+            
+            if resp.status_code >= 400:
+                print(f"WARN: get_media_url failed {resp.status_code}: {resp.text}")
+                return None
+            
+            data = resp.json()
+            return data.get("url")
+            
+        except httpx.RequestError as e:
+            print(f"WARN: get_media_url network error: {e}")
+            return None
+    
+    async def download_media(self, media_id: str) -> bytes | None:
+        """Download media content by ID.
+        
+        This is a convenience method that gets the media URL and downloads
+        the content in one step.
+        
+        Args:
+            media_id: The media ID from the incoming message (e.g., msg.image_id)
+        
+        Returns:
+            The raw bytes of the media file, or None on failure.
+        
+        Example:
+            if msg.image_id:
+                image_bytes = await client.download_media(msg.image_id)
+                if image_bytes:
+                    # Process the image
+        """
+        media_url = await self.get_media_url(media_id)
+        if not media_url:
+            return None
+        
+        try:
+            client = self._get_client()
+            # WhatsApp media URLs require the same auth header
+            resp = await client.get(media_url, headers=self._get_headers())
+            
+            if resp.status_code >= 400:
+                print(f"WARN: download_media failed {resp.status_code}")
+                return None
+            
+            return resp.content
+            
+        except httpx.RequestError as e:
+            print(f"WARN: download_media network error: {e}")
+            return None
+    
     async def close(self) -> None:
         """Close the HTTP client and release resources.
         

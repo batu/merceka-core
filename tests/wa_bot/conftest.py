@@ -185,3 +185,42 @@ def mixed_type_payload() -> dict:
         ],
     }
 
+
+@pytest.fixture
+def image_with_caption_payload() -> dict:
+    """Webhook payload with an image message that has a caption."""
+    return {
+        "object": "whatsapp_business_account",
+        "entry": [
+            {
+                "id": "987654321098765",
+                "changes": [
+                    {
+                        "field": "messages",
+                        "value": {
+                            "messaging_product": "whatsapp",
+                            "metadata": {
+                                "display_phone_number": "15551234567",
+                                "phone_number_id": "123456789012345",
+                            },
+                            "messages": [
+                                {
+                                    "from": "905551234567",
+                                    "id": "wamid.captioned_image",
+                                    "timestamp": "1702656000",
+                                    "type": "image",
+                                    "image": {
+                                        "mime_type": "image/png",
+                                        "sha256": "xyz789",
+                                        "id": "img456",
+                                        "caption": "Check out this event poster!",
+                                    },
+                                },
+                            ],
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
