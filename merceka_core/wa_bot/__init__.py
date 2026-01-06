@@ -3,6 +3,7 @@
 This package provides everything you need to build WhatsApp bots with FastHTML:
 - WhatsAppClient: Send text and template messages
 - Webhook routes: Handle Meta's verification and incoming messages
+- Deduplication: Automatically prevents duplicate message handling (Meta retries)
 - Configuration: MODE-based test/prod environment switching
 - Utilities: Safe logging, command normalization
 

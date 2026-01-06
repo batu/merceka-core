@@ -46,31 +46,173 @@ create_webhook_routes(app, client, handle_message, config.verify_token)
 # Run with: uvicorn main:app --port 8000
 ```
 
-## Meta Developer Console Setup
+---
 
-### Step 1: Create a Meta App
+# Meta Developer Console Setup
+
+> **Last Updated**: January 2026
+> 
+> The Meta Developer Console UI changes frequently. This guide documents the current navigation paths.
+
+## Overview: Two Setup Paths
+
+| Path | Use Case | Phone Number |
+|------|----------|--------------|
+| **Test Mode** | Development & testing | Meta provides a temporary test number |
+| **Production Mode** | Real users | Your own verified phone number |
+
+Both paths require the same steps, but credentials differ.
+
+---
+
+## Step 1: Create a Meta App
 
 1. Go to [Meta Developer Console](https://developers.facebook.com/)
-2. Click "My Apps" → "Create App"
-3. Select "Business" type
-4. Fill in app name and contact email
-5. On the dashboard, find "WhatsApp" and click "Set Up"
+2. Click **"My Apps"** → **"Create App"**
+3. Select use case: **"Other"** → App type: **"Business"**
+4. Fill in:
+   - App name (e.g., "My WhatsApp Bot")
+   - Contact email
+   - Business portfolio (select or create one)
+5. Click **"Create App"**
 
-### Step 2: Get Your Credentials
+After creation, you'll land on the app dashboard.
 
-Go to **WhatsApp** → **API Setup** in the left sidebar.
+### Add WhatsApp Product
 
-You'll find:
+1. On the dashboard, find **"Add products to your app"**
+2. Find **"WhatsApp"** and click **"Set up"**
+3. This creates a test WhatsApp Business Account automatically
 
-| Value | Where to Find It | Env Variable |
-|-------|------------------|--------------|
-| **Phone Number ID** | Under "From" dropdown, the number in parentheses | `TEST_PHONE_NUMBER_ID` |
-| **WhatsApp Token** | "Temporary access token" section, click "Generate" | `WHATSAPP_TOKEN` |
-| **WABA ID** | In webhook payloads, or Business Settings | `TEST_WABA_ID` |
+---
 
-**Note**: Temporary tokens expire in ~24 hours. For production, create a System User token.
+## Step 2: Navigate the WhatsApp Section
 
-### Step 3: Create Your .env File
+After adding WhatsApp, you'll see a new navigation structure:
+
+```
+Use cases → Customize
+└── Connect on WhatsApp (dropdown)
+    ├── Permissions and features
+    ├── Quickstart          ← Overview, links to phone management
+    ├── API Testing         ← Test credentials, send test messages
+    ├── Configuration       ← Webhook setup
+    ├── Resources
+    └── Tech Provider onboarding
+```
+
+### Key Pages
+
+| Page | What's There |
+|------|--------------|
+| **Quickstart** | Links to WhatsApp Manager, phone numbers, permanent token setup |
+| **API Testing** | Test WABA ID, Phone Number ID, temporary token, send test messages |
+| **Configuration** | Webhook URL, verify token, subscribe to message fields |
+
+---
+
+## Step 3: Get Test Credentials (Quick Start)
+
+For initial development, use the test credentials:
+
+1. Go to **API Testing** tab
+2. Find **"2. Select a 'From' phone number"**
+3. You'll see:
+   - **WhatsApp Business Account ID**: `1234567890123456` (TEST_WABA_ID)
+   - **Phone number ID**: `9876543210987654` (TEST_PHONE_NUMBER_ID)
+
+4. Under **"1. Generate a temporary access token"**, click **"Generate access token"**
+   - This token expires in ~60 minutes
+   - Use for testing only
+
+---
+
+## Step 4: Create a Permanent Access Token (Production)
+
+Temporary tokens expire. For production, create a System User token:
+
+### 4a. Access Business Settings
+
+1. In **Quickstart**, find **"Create a permanent access token"**
+2. Click **"Business Settings"** button
+3. Or go directly to: [business.facebook.com/settings](https://business.facebook.com/settings)
+
+### 4b. Create a System User
+
+1. Navigate to **Users** → **System users** (left sidebar)
+2. Click **"+ Add"** button
+3. Enter:
+   - **Name**: e.g., "WhatsApp Bot"
+   - **Role**: **Admin**
+4. Click **"Create system user"**
+
+### 4c. Assign Assets to System User
+
+This is critical! The system user needs access to both the App AND the WhatsApp Account.
+
+1. Click on your system user
+2. Click **"⋯"** (three dots) → **"Assign assets"**
+
+**Assign App:**
+1. Select asset type: **Apps**
+2. Check your app (e.g., "My WhatsApp Bot")
+3. Enable: **Full control** → **Manage app**
+4. Click **"Assign assets"**
+
+**Assign WhatsApp Account:**
+1. Click **"Assign assets"** again
+2. Select asset type: **WhatsApp accounts**
+3. Check your production WABA (e.g., "Your Business Name")
+4. Enable: **Full control** → **Everything**
+5. Click **"Assign assets"**
+
+> ⚠️ **Gotcha**: You may need to **refresh the page** after assigning assets before the token generation shows correct permissions.
+
+### 4d. Generate the Token
+
+1. Click **"Generate token"** button on the system user
+2. Select your app
+3. Set expiration: **Never** (for production)
+4. Select permissions:
+   - ✅ `whatsapp_business_messaging` (Required - send/receive messages)
+   - ✅ `whatsapp_business_management` (Required - manage account)
+   - ⬜ `whatsapp_business_manage_events` (Optional - webhook management)
+   - ⬜ `manage_app_solution` (Not needed - for BSPs only)
+5. Click **"Generate token"**
+6. **Copy and save the token securely** - you won't see it again!
+
+---
+
+## Step 5: Add Your Production Phone Number
+
+For production, you need your own phone number (not the test number).
+
+### Prerequisites
+
+- Phone number must **NOT** be registered with any WhatsApp account (personal or business app)
+- If it is, delete that WhatsApp account first
+- Number must be able to receive SMS or voice calls for verification
+
+### Add the Number
+
+1. Go to **Quickstart** tab
+2. Scroll down to **"WhatsApp Business"** section
+3. Click **"Manage phone numbers"**
+4. In WhatsApp Manager, select your production WABA from the dropdown (not "Test WhatsApp Business Account")
+5. Click **"Add phone number"** (top right)
+6. Fill in:
+   - **Display name**: What users see (e.g., "My Business")
+   - **Category**: Select appropriate business category
+   - **Phone number**: Your number in international format
+7. Verify via **SMS** or **Voice call**
+
+After verification, note your:
+- **Phone Number ID**: Shown in the phone number details
+- **WABA ID**: Shown in the account selector dropdown
+
+---
+
+## Step 6: Create Your .env File
 
 ```bash
 # .env
@@ -83,64 +225,111 @@ MODE=test
 # ============================================
 # SHARED CONFIG (same for both environments)
 # ============================================
-VERIFY_TOKEN=your_secret_verify_token
-WHATSAPP_TOKEN=EAAG...your_token_here
+VERIFY_TOKEN=your_secret_verify_token_here
+WHATSAPP_TOKEN=EAAxxxx...your_permanent_token
 GRAPH_VERSION=v24.0
 
 # ============================================
-# TEST ENVIRONMENT
+# TEST ENVIRONMENT (from API Testing page)
 # ============================================
-TEST_PHONE_NUMBER_ID=123456789012345
-TEST_WABA_ID=123456789012345
+TEST_PHONE_NUMBER_ID=980482958475149
+TEST_WABA_ID=1207742824654086
 
 # ============================================
-# PRODUCTION ENVIRONMENT (fill in later)
+# PRODUCTION ENVIRONMENT (from WhatsApp Manager)
 # ============================================
-PROD_PHONE_NUMBER_ID=
-PROD_WABA_ID=
+PROD_PHONE_NUMBER_ID=935995412929932
+PROD_WABA_ID=807310585618264
 ```
 
-### Step 4: Set Up Public URL with Tailscale Funnel
+---
 
-Meta needs to reach your webhook from the internet. Tailscale Funnel creates a public URL for your local server.
+## Step 7: Set Up Public URL with Tailscale Funnel
 
-1. Install Tailscale: https://tailscale.com/download
+Meta's webhooks need to reach your server from the internet. Tailscale Funnel creates a secure public URL.
 
-2. Enable Funnel (one-time):
-   ```bash
-   tailscale up
-   tailscale funnel 8000
-   ```
+### Install Tailscale
 
-3. Note your public URL (e.g., `https://your-machine.your-tailnet.ts.net`)
+```bash
+# Linux
+curl -fsSL https://tailscale.com/install.sh | sh
 
-4. Verify it works:
-   ```bash
-   # Start your server first
-   uvicorn main:app --port 8000
-   
-   # In another terminal, test the public URL
-   curl https://your-machine.your-tailnet.ts.net/webhook?hub.mode=subscribe&hub.verify_token=your_secret_verify_token&hub.challenge=TEST
-   # Should return: TEST
-   ```
+# macOS
+brew install tailscale
 
-### Step 5: Configure Webhook in Meta Console
+# Or download from: https://tailscale.com/download
+```
 
-1. Go to **WhatsApp** → **Configuration** in Meta Developer Console
-2. Under "Webhook", click **Edit**
+### Enable Funnel
+
+```bash
+# Connect to Tailscale
+tailscale up
+
+# Enable funnel on port 8000
+tailscale funnel 8000
+```
+
+### Get Your Public URL
+
+```bash
+tailscale funnel status
+```
+
+Output shows your URL, e.g.: `https://your-machine.tail12345.ts.net`
+
+Your webhook URL will be: `https://your-machine.tail12345.ts.net/webhook`
+
+### Verify It Works
+
+```bash
+# Start your server first
+uvicorn main:app --port 8000
+
+# In another terminal, test through the public URL
+curl "https://your-machine.tail12345.ts.net/webhook?hub.mode=subscribe&hub.verify_token=your_secret_verify_token_here&hub.challenge=TEST"
+# Should return: TEST
+```
+
+---
+
+## Step 8: Configure Webhook in Meta Console
+
+1. Go to your app → **WhatsApp** → **Configuration** tab
+2. Scroll to **"Subscribe to webhooks"**
 3. Enter:
-   - **Callback URL**: `https://your-machine.your-tailnet.ts.net/webhook`
-   - **Verify Token**: Same value as `VERIFY_TOKEN` in your .env
-4. Click **Verify and Save**
-5. Subscribe to **messages** field
+   - **Callback URL**: `https://your-machine.tail12345.ts.net/webhook`
+   - **Verify token**: Same as `VERIFY_TOKEN` in your .env
+4. Leave **"Attach a client certificate"** OFF
+5. Click **"Verify and save"**
 
-### Step 6: Subscribe App to WABA (Critical!)
+### Subscribe to Webhook Fields
 
-This step is often missed. Without it, test payloads work but real messages don't arrive.
+After verification, you'll see a list of webhook fields:
+
+| Field | Subscribe? | Purpose |
+|-------|-----------|---------|
+| `messages` | ✅ **Yes** | Receive incoming messages |
+| `message_template_status_update` | Optional | Template approval notifications |
+| `messaging_handovers` | Optional | Multi-bot handover |
+
+Toggle **"messages"** to **Subscribed**.
+
+---
+
+## Step 9: Subscribe App to WABA (Critical!)
+
+> ⚠️ **This step is often missed!** Without it, webhook verification works but real messages never arrive.
 
 ```bash
 source .env
+
+# For test environment
 curl -X POST "https://graph.facebook.com/$GRAPH_VERSION/$TEST_WABA_ID/subscribed_apps" \
+  -H "Authorization: Bearer $WHATSAPP_TOKEN"
+
+# For production environment
+curl -X POST "https://graph.facebook.com/$GRAPH_VERSION/$PROD_WABA_ID/subscribed_apps" \
   -H "Authorization: Bearer $WHATSAPP_TOKEN"
 ```
 
@@ -149,15 +338,22 @@ Expected response:
 {"success": true}
 ```
 
-### Step 7: Add Test Phone Numbers
+### Verify Subscription
 
-With a test account, you can only message phone numbers you've added.
+```bash
+curl "https://graph.facebook.com/$GRAPH_VERSION/$PROD_WABA_ID/subscribed_apps" \
+  -H "Authorization: Bearer $WHATSAPP_TOKEN"
+```
 
-1. Go to **WhatsApp** → **API Setup**
-2. Under "To", click **Manage phone number list**
-3. Add phone numbers you want to message
+---
 
-## Environment Switching
+## Step 10: Test Your Bot
+
+Send a WhatsApp message to your bot's phone number. You should receive an echo response!
+
+---
+
+# Environment Switching
 
 Switch between test and production by changing `MODE`:
 
@@ -169,7 +365,59 @@ MODE=prod   # Uses PROD_PHONE_NUMBER_ID, PROD_WABA_ID
 
 Then restart your server.
 
-## Template Messages
+---
+
+# Credentials Reference
+
+## Where to Find Each Credential
+
+| Credential | Location | Notes |
+|------------|----------|-------|
+| **Test Phone Number ID** | API Testing → "2. Select a 'From' phone number" | Under the dropdown |
+| **Test WABA ID** | API Testing → "2. Select a 'From' phone number" | "WhatsApp Business Account ID" |
+| **Prod Phone Number ID** | WhatsApp Manager → Phone numbers → Click number | In the details panel |
+| **Prod WABA ID** | WhatsApp Manager → Account dropdown | The ID shown under account name |
+| **Temporary Token** | API Testing → "1. Generate a temporary access token" | Expires in ~60 min |
+| **Permanent Token** | Business Settings → System Users → Generate token | Never expires |
+| **Verify Token** | You create this | Any secret string you choose |
+
+---
+
+# Common Errors
+
+### "Webhook verified but real messages don't arrive"
+
+**Cause**: App not subscribed to WABA.
+
+**Fix**: Run the subscription curl command from Step 9.
+
+### "No permissions available" when generating token
+
+**Cause**: System user doesn't have assets assigned.
+
+**Fix**: Assign both the App AND the WhatsApp Account to the system user (Step 4c). Refresh the page after assigning.
+
+### "Recipient phone number not in allowed list"
+
+**Cause**: Test mode only allows pre-approved recipient numbers.
+
+**Fix**: In API Testing, under "3. Add a recipient phone number", add the recipient. Or switch to production mode.
+
+### "Invalid OAuth access token"
+
+**Cause**: Token expired (temporary tokens last ~60 minutes).
+
+**Fix**: Generate a new token, or use a permanent System User token.
+
+### "Message failed to send" / Error 131030
+
+**Cause**: 24-hour messaging window expired.
+
+**Fix**: User must message you first, or use an approved template message.
+
+---
+
+# Template Messages
 
 Template messages can be sent outside the 24-hour messaging window. They must be pre-approved in Meta Business Manager.
 
@@ -197,13 +445,15 @@ await client.send_template(
 )
 ```
 
-## Testing
+---
+
+# Testing Locally
 
 ### Test 1: Server Health
 
 ```bash
 curl http://127.0.0.1:8000/health
-# Should return: ok (if you have a /health route)
+# Should return: ok
 ```
 
 ### Test 2: Webhook Verification
@@ -241,41 +491,9 @@ curl -X POST http://127.0.0.1:8000/webhook \
 # Check your terminal for handler output
 ```
 
-### Test 4: Check WABA Subscription
+---
 
-```bash
-source .env
-curl "https://graph.facebook.com/$GRAPH_VERSION/$TEST_WABA_ID/subscribed_apps" \
-  -H "Authorization: Bearer $WHATSAPP_TOKEN"
-```
-
-## Common Errors
-
-### "Webhook verified but real messages don't arrive"
-
-**Cause**: App not subscribed to WABA.
-
-**Fix**: Run the subscription curl command from Step 6.
-
-### "Recipient phone number not in allowed list"
-
-**Cause**: Using test phone number, can only message pre-approved numbers.
-
-**Fix**: Add recipient to allowed list in Meta Console, or upgrade to production.
-
-### "Invalid OAuth access token"
-
-**Cause**: Token expired (temporary tokens last ~24 hours).
-
-**Fix**: Generate a new token in Meta Developer Console.
-
-### "Missing WHATSAPP_TOKEN or PHONE_NUMBER_ID"
-
-**Cause**: Environment variables not loaded.
-
-**Fix**: Make sure .env file exists and contains the values. Check that `python-dotenv` is installed.
-
-## API Reference
+# API Reference
 
 ### WhatsAppConfig
 
@@ -345,7 +563,9 @@ if normalize_command(msg.text) == "help":
     await send_help()
 ```
 
-## Full Example: Command Bot
+---
+
+# Full Example: Command Bot
 
 ```python
 # main.py - A bot with multiple commands
@@ -413,3 +633,29 @@ async def shutdown():
 # Run with: uvicorn main:app --port 8000
 ```
 
+---
+
+# Important Notes
+
+### One Phone Number = One Bot
+
+Each WhatsApp phone number can only be connected to one webhook. If you need multiple bots:
+- Use separate phone numbers, OR
+- Build multiple features into one bot with command routing
+
+### Phone Number Requirements
+
+- Cannot be registered with WhatsApp (personal) or WhatsApp Business App
+- Must be able to receive SMS or voice calls
+- One number per WhatsApp Business Account webhook
+
+### Rate Limits & Messaging Tiers
+
+- New accounts start with limited messaging (1,000 business-initiated conversations/day)
+- Tier increases with quality rating and volume
+- User-initiated messages (replies within 24h) have higher limits
+
+### Business Verification
+
+- Required for: higher messaging limits, official business account badge
+- Complete in Meta Business Suite → Business Settings → Business Info

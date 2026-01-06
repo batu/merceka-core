@@ -29,12 +29,52 @@ Dependencies:
 """
 
 import json
+import time
 from collections.abc import Awaitable, Callable
 
 from fasthtml.common import FastHTML, Request, Response
 
 from .client import WhatsAppClient
 from .models import Message
+
+
+# Deduplication cache: (sender, message_id) -> timestamp
+# Meta's distributed webhook infrastructure can send the same message multiple times
+# from different servers. We keep a short window to catch these retries.
+# Keyed by (sender, message_id) to avoid any cross-user collisions.
+_seen_messages: dict[tuple[str, str], float] = {}
+DEDUP_WINDOW_SECONDS = 15
+
+
+def _is_duplicate(sender: str, message_id: str) -> bool:
+    """Check if message was already processed within the dedup window.
+    
+    Meta can send the same webhook event multiple times from their distributed
+    infrastructure. This function maintains a short-term cache to detect and
+    skip duplicate messages.
+    
+    Args:
+        sender: The sender's phone number (e.g., "905551234567")
+        message_id: The unique WhatsApp message ID (e.g., "wamid.abc123")
+    
+    Returns:
+        True if this message was seen in the last DEDUP_WINDOW_SECONDS, False otherwise
+    """
+    now = time.time()
+    key = (sender, message_id)
+    
+    # Clean expired entries to prevent memory growth
+    expired = [k for k, v in _seen_messages.items() if now - v > DEDUP_WINDOW_SECONDS]
+    for k in expired:
+        del _seen_messages[k]
+    
+    # Check if duplicate
+    if key in _seen_messages:
+        return True
+    
+    # Mark as seen
+    _seen_messages[key] = now
+    return False
 
 # Type alias for message handler functions
 # Handler receives the client (to send replies) and the parsed message
@@ -258,6 +298,11 @@ def create_webhook_routes(
         
         # Process each message
         for msg in messages:
+            # Skip duplicate messages (Meta can retry webhooks from different servers)
+            if _is_duplicate(msg.sender, msg.message_id):
+                print(f"WEBHOOK: Skipping duplicate message {msg.message_id} from {msg.sender}")
+                continue
+            
             try:
                 # Call the user's handler
                 await handler(client, msg)

@@ -21,6 +21,7 @@ from merceka_core.wa_bot import (
     create_webhook_routes,
     parse_webhook_payload,
 )
+from merceka_core.wa_bot.webhook import _is_duplicate, _seen_messages
 
 
 class TestParseWebhookPayload:
@@ -341,4 +342,101 @@ class TestCreateWebhookRoutes:
         
         assert response.status_code == 200
         assert response.text == "custom_challenge"
+
+
+class TestDeduplication:
+    """Tests for the message deduplication feature."""
+
+    @pytest.fixture(autouse=True)
+    def clear_dedup_cache(self):
+        """Clear the deduplication cache before each test."""
+        _seen_messages.clear()
+        yield
+        _seen_messages.clear()
+
+    def test_first_message_not_duplicate(self):
+        """First occurrence of a message should not be marked as duplicate."""
+        assert _is_duplicate("user123", "wamid.abc") is False
+
+    def test_same_message_is_duplicate(self):
+        """Same message_id from same sender should be duplicate."""
+        assert _is_duplicate("user123", "wamid.abc") is False
+        assert _is_duplicate("user123", "wamid.abc") is True
+
+    def test_different_message_ids_not_duplicate(self):
+        """Different message_ids from same sender should not be duplicates."""
+        assert _is_duplicate("user123", "wamid.abc") is False
+        assert _is_duplicate("user123", "wamid.def") is False
+
+    def test_same_message_id_different_senders_not_duplicate(self):
+        """Same message_id from different senders should NOT be duplicate."""
+        assert _is_duplicate("user123", "wamid.abc") is False
+        assert _is_duplicate("user456", "wamid.abc") is False  # Different sender!
+
+    def test_dedup_scoped_by_sender(self):
+        """Deduplication should be scoped by (sender, message_id) pair."""
+        # User A sends message
+        assert _is_duplicate("userA", "wamid.123") is False
+        
+        # User B sends different message
+        assert _is_duplicate("userB", "wamid.456") is False
+        
+        # User A's message retried - should be duplicate
+        assert _is_duplicate("userA", "wamid.123") is True
+        
+        # User B's message retried - should be duplicate
+        assert _is_duplicate("userB", "wamid.456") is True
+        
+        # User A sends NEW message - should NOT be duplicate
+        assert _is_duplicate("userA", "wamid.789") is False
+
+    def test_webhook_deduplication_integration(self, sample_config: WhatsAppConfig):
+        """Webhook should skip duplicate messages."""
+        app = FastHTML()
+        client = WhatsAppClient(sample_config)
+        
+        handler_calls: list[Message] = []
+        
+        async def tracking_handler(client: WhatsAppClient, msg: Message):
+            handler_calls.append(msg)
+        
+        create_webhook_routes(
+            app=app,
+            client=client,
+            handler=tracking_handler,
+            verify_token="test",
+        )
+        
+        payload = {
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "905551234567",
+                            "id": "wamid.unique123",
+                            "timestamp": "1702656000",
+                            "type": "text",
+                            "text": {"body": "Hello!"}
+                        }]
+                    }
+                }]
+            }]
+        }
+        
+        with TestClient(app) as test_client:
+            # First request - should call handler
+            response1 = test_client.post("/webhook", json=payload)
+            assert response1.status_code == 200
+            
+            # Second request (retry) - should NOT call handler
+            response2 = test_client.post("/webhook", json=payload)
+            assert response2.status_code == 200
+            
+            # Third request (another retry) - should NOT call handler
+            response3 = test_client.post("/webhook", json=payload)
+            assert response3.status_code == 200
+        
+        # Handler should only have been called ONCE
+        assert len(handler_calls) == 1
+        assert handler_calls[0].message_id == "wamid.unique123"
 
