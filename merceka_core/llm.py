@@ -7,6 +7,8 @@ __all__ = ['list_local_models', 'create_message', 'OutputSchema', 'LLM']
 
 # %% ../nbs/00_llm.ipynb 2
 import dotenv
+import json
+import os
 
 
 # %% ../nbs/00_llm.ipynb 3
@@ -77,9 +79,9 @@ from pydantic import BaseModel
 class OutputSchema(BaseModel):
   """Base class for structured LLM outputs. Subclass this to define your schema.
 
-  The `content` field is required and will be used for chat history."""
+  The optional `content` field will be used for chat history when present."""
 
-  content: str
+  content: str | None = None
 
 
 # %% ../nbs/00_llm.ipynb 21
@@ -87,6 +89,23 @@ from ollama import ChatResponse
 import litellm
 litellm.suppress_debug_info = True  # Stop printing "Provider List" spam
 from litellm import completion as litellm_completion
+from urllib.request import Request, urlopen
+
+
+def _schema_name(schema: type[BaseModel]) -> str:
+  name = getattr(schema, "__name__", "structured_response")
+  return "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in name) or "structured_response"
+
+
+def _openrouter_response_format(schema: type[BaseModel]) -> dict:
+  return {
+    "type": "json_schema",
+    "json_schema": {
+      "name": _schema_name(schema),
+      "strict": True,
+      "schema": schema.model_json_schema(),
+    },
+  }
 
 
 # %% ../nbs/00_llm.ipynb 26
@@ -99,8 +118,8 @@ class LLM:
     system_prompt: str = "",  # The system prompt to use.
     think: Optional[bool] = None,  # Whether to enable thinking mode
     output_schema: Optional[
-      type[OutputSchema]
-    ] = None,  # Schema for structured output (must subclass OutputSchema)
+      type[BaseModel]
+    ] = None,  # Schema for structured output
   ):
     self.model_name = model_name
     self.system_prompt = system_prompt
@@ -129,8 +148,8 @@ class LLM:
       response = self._local_call(self.messages, **kwargs)
 
     # Extract content for history: schema responses have .content, plain responses are strings
-    if isinstance(response, OutputSchema):
-      self.messages.append(create_message(response.content, "assistant"))
+    if isinstance(response, BaseModel):
+      self.messages.append(create_message(self._response_to_history_content(response), "assistant"))
     else:
       self.messages.append(create_message(response, "assistant"))
     return response
@@ -147,23 +166,73 @@ class LLM:
     return self._parse_response(response.message.content)
 
   def _cloud_call(self, messages: list[dict], **kwargs) -> str | OutputSchema:
-    """Call cloud model via litellm."""
-    if self.think is True:
-      kwargs["reasoning_effort"] = "low"
-    response = litellm_completion(
-      model=self.model_name,
-      messages=messages,
-      response_format=self.output_schema if self.output_schema else None,
-      **kwargs,
-    )
-    return self._parse_response(response.choices[0].message.content)
+    """Call cloud model."""
+    return self._openrouter_call(messages, **kwargs)
 
-  def _parse_response(self, content: Optional[str]) -> str | OutputSchema:
+  def _openrouter_call(self, messages: list[dict], **kwargs) -> str | OutputSchema:
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+      raise RuntimeError("OPENROUTER_API_KEY is not configured")
+
+    headers = {
+      "Authorization": f"Bearer {api_key}",
+      "Content-Type": "application/json",
+    }
+    http_referer = kwargs.pop("http_referer", None) or os.getenv("OPENROUTER_HTTP_REFERER")
+    x_title = kwargs.pop("x_title", None) or os.getenv("OPENROUTER_X_TITLE")
+    if http_referer:
+      headers["HTTP-Referer"] = http_referer
+    if x_title:
+      headers["X-Title"] = x_title
+
+    provider = dict(kwargs.pop("provider", {}) or {})
+    if self.output_schema:
+      provider.setdefault("require_parameters", True)
+
+    payload = {
+      "model": self.model_name.removeprefix("openrouter/"),
+      "messages": messages,
+      **kwargs,
+    }
+    if provider:
+      payload["provider"] = provider
+
+    if self.think is True and "reasoning" not in payload:
+      payload["reasoning"] = {"effort": "low"}
+    if self.output_schema:
+      payload["response_format"] = _openrouter_response_format(self.output_schema)
+      if not payload.get("stream"):
+        plugins = list(payload.get("plugins") or [])
+        if not any(plugin.get("id") == "response-healing" for plugin in plugins if isinstance(plugin, dict)):
+          plugins.append({"id": "response-healing"})
+        payload["plugins"] = plugins
+
+    request = Request(
+      "https://openrouter.ai/api/v1/chat/completions",
+      data=json.dumps(payload).encode("utf-8"),
+      headers=headers,
+      method="POST",
+    )
+    with urlopen(request, timeout=120) as response:
+      body = json.load(response)
+    return self._parse_response(body["choices"][0]["message"]["content"])
+
+  def _parse_response(self, content) -> str | OutputSchema:
     """Parse raw response content, validating against schema if set."""
     assert content is not None, "No content was returned"
     if self.output_schema:
-      return self.output_schema.model_validate_json(content)
-    return content
+      if isinstance(content, str):
+        return self.output_schema.model_validate_json(content)
+      return self.output_schema.model_validate(content)
+    if isinstance(content, str):
+      return content
+    return json.dumps(content, ensure_ascii=False)
+
+  def _response_to_history_content(self, response: BaseModel) -> str:
+    content = getattr(response, "content", None)
+    if isinstance(content, str) and content:
+      return content
+    return response.model_dump_json()
 
   async def agenerate_batch(
     self,
