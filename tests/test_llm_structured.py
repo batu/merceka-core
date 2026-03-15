@@ -1,5 +1,6 @@
 """Tests for structured LLM responses."""
 
+import asyncio
 import json
 
 from pydantic import BaseModel, ConfigDict
@@ -33,6 +34,17 @@ class _FakeHttpResponse:
 
   def read(self):
     return json.dumps(self._body).encode("utf-8")
+
+
+class _FakeAsyncHttpResponse:
+  def __init__(self, body: dict):
+    self._body = body
+
+  def raise_for_status(self):
+    return None
+
+  def json(self):
+    return self._body
 
 
 def test_parse_response_accepts_dict_for_structured_schema():
@@ -91,6 +103,55 @@ def test_openrouter_structured_requests_send_json_schema(monkeypatch):
   parsed = llm.generate("hello", max_tokens=120)
 
   assert parsed.summary == "ok"
+  assert captured["payload"]["model"] == "google/gemini-3-flash-preview"
+  assert captured["payload"]["provider"]["require_parameters"] is True
+  assert captured["payload"]["response_format"]["type"] == "json_schema"
+  assert captured["payload"]["response_format"]["json_schema"]["strict"] is True
+  assert captured["payload"]["plugins"] == [{"id": "response-healing"}]
+
+
+def test_openrouter_async_structured_requests_send_json_schema(monkeypatch):
+  captured: dict = {}
+
+  class FakeAsyncClient:
+    def __init__(self, timeout=120.0):
+      captured["timeout"] = timeout
+
+    async def __aenter__(self):
+      return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+      return False
+
+    async def post(self, url, headers=None, json=None):
+      captured["url"] = url
+      captured["headers"] = dict(headers or {})
+      captured["payload"] = json
+      return _FakeAsyncHttpResponse(
+        {
+          "choices": [
+            {
+              "message": {
+                "content": {
+                  "summary": "ok",
+                  "commands": [],
+                }
+              }
+            }
+          ]
+        }
+      )
+
+  monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+  monkeypatch.setenv("OPENROUTER_HTTP_REFERER", "http://localhost:5188")
+  monkeypatch.setenv("OPENROUTER_X_TITLE", "Contexto Test")
+  monkeypatch.setattr(llm_module.httpx, "AsyncClient", FakeAsyncClient)
+
+  llm = LLM("openrouter/google/gemini-3-flash-preview", output_schema=PlainStructuredResponse)
+  parsed = asyncio.run(llm.agenerate("hello", max_tokens=120))
+
+  assert parsed.summary == "ok"
+  assert captured["url"] == "https://openrouter.ai/api/v1/chat/completions"
   assert captured["payload"]["model"] == "google/gemini-3-flash-preview"
   assert captured["payload"]["provider"]["require_parameters"] is True
   assert captured["payload"]["response_format"]["type"] == "json_schema"

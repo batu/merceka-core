@@ -9,6 +9,7 @@ __all__ = ['list_local_models', 'create_message', 'OutputSchema', 'LLM']
 import dotenv
 import json
 import os
+import httpx
 
 
 # %% ../nbs/00_llm.ipynb 3
@@ -169,7 +170,11 @@ class LLM:
     """Call cloud model."""
     return self._openrouter_call(messages, **kwargs)
 
-  def _openrouter_call(self, messages: list[dict], **kwargs) -> str | OutputSchema:
+  async def _acloud_call(self, messages: list[dict], **kwargs) -> str | OutputSchema:
+    """Async cloud call."""
+    return await self._aopenrouter_call(messages, **kwargs)
+
+  def _build_openrouter_request(self, messages: list[dict], **kwargs) -> tuple[dict, dict]:
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
       raise RuntimeError("OPENROUTER_API_KEY is not configured")
@@ -207,6 +212,14 @@ class LLM:
           plugins.append({"id": "response-healing"})
         payload["plugins"] = plugins
 
+    return headers, payload
+
+  def _parse_openrouter_body(self, body: dict) -> str | OutputSchema:
+    return self._parse_response(body["choices"][0]["message"]["content"])
+
+  def _openrouter_call(self, messages: list[dict], **kwargs) -> str | OutputSchema:
+    headers, payload = self._build_openrouter_request(messages, **kwargs)
+
     request = Request(
       "https://openrouter.ai/api/v1/chat/completions",
       data=json.dumps(payload).encode("utf-8"),
@@ -215,7 +228,28 @@ class LLM:
     )
     with urlopen(request, timeout=120) as response:
       body = json.load(response)
-    return self._parse_response(body["choices"][0]["message"]["content"])
+    return self._parse_openrouter_body(body)
+
+  async def _aopenrouter_call(self, messages: list[dict], **kwargs) -> str | OutputSchema:
+    headers, payload = self._build_openrouter_request(messages, **kwargs)
+    async with httpx.AsyncClient(timeout=120.0) as client:
+      response = await client.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers=headers,
+        json=payload,
+      )
+      response.raise_for_status()
+      body = response.json()
+    return self._parse_openrouter_body(body)
+
+  async def agenerate(self, message: str, **kwargs) -> str | OutputSchema:
+    """Async one-shot generation. Does not maintain conversation history."""
+    import asyncio
+
+    messages = [create_message(self.system_prompt, "system"), create_message(message, "user")]
+    if self.use_openrouter:
+      return await self._acloud_call(messages, **kwargs)
+    return await asyncio.to_thread(self._local_call, messages, **kwargs)
 
   def _parse_response(self, content) -> str | OutputSchema:
     """Parse raw response content, validating against schema if set."""
@@ -257,33 +291,9 @@ class LLM:
 
     semaphore = asyncio.Semaphore(concurrency)
 
-    if self.use_openrouter:
-      from litellm import acompletion
-
-      async def process_one(message: str) -> str | OutputSchema:
-        async with semaphore:
-          msgs = [create_message(self.system_prompt, "system"), create_message(message, "user")]
-          response = await acompletion(
-            model=self.model_name,
-            messages=msgs,
-            response_format=self.output_schema if self.output_schema else None,
-            **kwargs,
-          )
-          return self._parse_response(response.choices[0].message.content)
-    else:
-      from ollama import AsyncClient
-
-      async def process_one(message: str) -> str | OutputSchema:
-        async with semaphore:
-          msgs = [create_message(self.system_prompt, "system"), create_message(message, "user")]
-          client = AsyncClient()
-          response = await client.chat(
-            model=self.model_name,
-            messages=msgs,
-            format=self.output_schema.model_json_schema() if self.output_schema else None,
-            **kwargs,
-          )
-          return self._parse_response(response.message.content)
+    async def process_one(message: str) -> str | OutputSchema:
+      async with semaphore:
+        return await self.agenerate(message, **kwargs)
 
     tasks = [process_one(msg) for msg in messages]
     if show_progress:
