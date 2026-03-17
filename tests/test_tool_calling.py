@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import json as json_module
 
 import pytest
 
@@ -416,3 +417,360 @@ def test_tool_sends_schemas_in_payload(monkeypatch):
   assert len(tools) == 1
   assert tools[0]["function"]["name"] == "my_tool"
   assert tools[0]["function"]["parameters"]["properties"]["query"]["type"] == "string"
+
+
+# --- Async tool loop tests ---
+
+
+@pytest.mark.asyncio
+async def test_agenerate_with_tools(monkeypatch):
+  """agenerate routes through async tool loop when tools are set."""
+  call_count = 0
+
+  class FakeAsyncClient:
+    def __init__(self, timeout=120.0):
+      pass
+
+    async def __aenter__(self):
+      return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+      return False
+
+    async def post(self, url, headers=None, json=None):
+      nonlocal call_count
+      call_count += 1
+      if call_count == 1:
+        body = _make_api_response(
+          tool_calls=[{
+            "id": "call_0",
+            "type": "function",
+            "function": {"name": "fetch", "arguments": json_module.dumps({"url": "test"})},
+          }],
+        )
+      else:
+        body = _make_api_response(content="Fetched result")
+      return _FakeAsyncHttpResponse(body)
+
+  monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+  monkeypatch.setattr(llm_module.httpx, "AsyncClient", FakeAsyncClient)
+
+  def fetch(url: str) -> str:
+    """Fetch a URL."""
+    return f"content_from_{url}"
+
+  llm = LLM("openrouter/test", tools=[fetch])
+  result = await llm.agenerate("get test")
+  assert result == "Fetched result"
+  assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_agenerate_with_async_tool_handler(monkeypatch):
+  """Async tool handlers are awaited directly, not wrapped in to_thread."""
+  call_count = 0
+  handler_was_awaited = False
+
+  class FakeAsyncClient:
+    def __init__(self, timeout=120.0):
+      pass
+
+    async def __aenter__(self):
+      return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+      return False
+
+    async def post(self, url, headers=None, json=None):
+      nonlocal call_count
+      call_count += 1
+      if call_count == 1:
+        body = _make_api_response(
+          tool_calls=[{
+            "id": "call_0",
+            "type": "function",
+            "function": {"name": "async_search", "arguments": json_module.dumps({"q": "test"})},
+          }],
+        )
+      else:
+        body = _make_api_response(content="Async result")
+      return _FakeAsyncHttpResponse(body)
+
+  monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+  monkeypatch.setattr(llm_module.httpx, "AsyncClient", FakeAsyncClient)
+
+  async def async_search(q: str) -> str:
+    """Async search."""
+    nonlocal handler_was_awaited
+    handler_was_awaited = True
+    return f"found_{q}"
+
+  llm = LLM("openrouter/test", tools=[async_search])
+  result = await llm.agenerate("search for test")
+  assert result == "Async result"
+  assert handler_was_awaited
+
+
+@pytest.mark.asyncio
+async def test_agenerate_max_rounds_async(monkeypatch):
+  """Async tool loop raises RuntimeError on max rounds exceeded."""
+
+  class FakeAsyncClient:
+    def __init__(self, timeout=120.0):
+      pass
+
+    async def __aenter__(self):
+      return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+      return False
+
+    async def post(self, url, headers=None, json=None):
+      return _FakeAsyncHttpResponse(_make_api_response(
+        tool_calls=[{
+          "id": "call_0",
+          "type": "function",
+          "function": {"name": "loop_tool", "arguments": json_module.dumps({"x": "y"})},
+        }],
+      ))
+
+  monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+  monkeypatch.setattr(llm_module.httpx, "AsyncClient", FakeAsyncClient)
+
+  def loop_tool(x: str) -> str:
+    """Loops forever."""
+    return "again"
+
+  llm = LLM("openrouter/test", tools=[loop_tool], max_tool_rounds=2)
+  with pytest.raises(RuntimeError, match="exceeded 2 rounds"):
+    await llm.agenerate("go")
+
+
+# --- Edge case tests ---
+
+
+def test_tool_from_callable_multiline_docstring():
+  """First paragraph of docstring is used as description, not the whole thing."""
+  def complex_fn(a: str, b: int = 0) -> str:
+    """Do the first thing.
+
+    This is a longer explanation that should not
+    be included in the description.
+
+    Args:
+      a: The first argument
+      b: The second argument
+    """
+    return ""
+
+  schema = tool_from_callable(complex_fn)
+  assert schema["function"]["description"] == "Do the first thing."
+  assert schema["function"]["parameters"]["properties"]["a"]["description"] == "The first argument"
+  assert schema["function"]["parameters"]["properties"]["b"]["description"] == "The second argument"
+
+
+def test_tool_from_callable_no_params():
+  """Function with no parameters produces empty properties."""
+  def noop() -> str:
+    """Do nothing."""
+    return ""
+
+  schema = tool_from_callable(noop)
+  assert schema["function"]["parameters"]["properties"] == {}
+  assert "required" not in schema["function"]["parameters"]
+
+
+def test_execute_tool_call_string_arguments():
+  """Arguments passed as JSON string (OpenRouter format) are deserialized."""
+  def echo(msg: str) -> str:
+    """Echo."""
+    return msg
+
+  llm = LLM("openrouter/test", tools=[echo])
+  result = llm._execute_tool_call({
+    "id": "call_0",
+    "type": "function",
+    "function": {"name": "echo", "arguments": '{"msg": "hello"}'},
+  })
+  assert result == "hello"
+
+
+def test_multiple_tools_registered():
+  """Multiple tools are all registered and dispatchable."""
+  def tool_a(x: str) -> str:
+    """Tool A."""
+    return f"a:{x}"
+
+  def tool_b(y: int) -> str:
+    """Tool B."""
+    return f"b:{y}"
+
+  llm = LLM("openrouter/test", tools=[tool_a, tool_b])
+  assert len(llm._tool_schemas) == 2
+  assert {s["function"]["name"] for s in llm._tool_schemas} == {"tool_a", "tool_b"}
+
+  assert llm._execute_tool_call({
+    "id": "c1", "type": "function",
+    "function": {"name": "tool_a", "arguments": {"x": "test"}},
+  }) == "a:test"
+
+  assert llm._execute_tool_call({
+    "id": "c2", "type": "function",
+    "function": {"name": "tool_b", "arguments": {"y": 42}},
+  }) == "b:42"
+
+
+def test_tool_loop_multiple_tool_calls_in_single_response(monkeypatch):
+  """LLM returns multiple tool_calls in one response — all are executed."""
+  call_count = 0
+
+  def fake_urlopen(request, timeout=120):
+    nonlocal call_count
+    call_count += 1
+    if call_count == 1:
+      return _FakeHttpResponse(_make_api_response(
+        tool_calls=[
+          {"id": "call_0", "type": "function", "function": {"name": "lookup", "arguments": json.dumps({"key": "a"})}},
+          {"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": json.dumps({"key": "b"})}},
+        ],
+      ))
+    else:
+      return _FakeHttpResponse(_make_api_response(content="Combined answer"))
+
+  monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+  monkeypatch.setattr(llm_module, "urlopen", fake_urlopen)
+
+  results_seen = []
+
+  def lookup(key: str) -> str:
+    """Look up."""
+    results_seen.append(key)
+    return f"val_{key}"
+
+  llm = LLM("openrouter/test", tools=[lookup])
+  result = llm.generate("find a and b")
+  assert result == "Combined answer"
+  assert results_seen == ["a", "b"]
+  assert call_count == 2
+
+
+def test_chat_multi_turn_preserves_tool_context(monkeypatch):
+  """Second chat() call sees the full history from the first including tool traces."""
+  call_count = 0
+
+  def fake_urlopen(request, timeout=120):
+    nonlocal call_count
+    call_count += 1
+    payload = json.loads(request.data.decode("utf-8"))
+    if call_count == 1:
+      # First call: tool call
+      return _FakeHttpResponse(_make_api_response(
+        tool_calls=[{
+          "id": "call_0", "type": "function",
+          "function": {"name": "get_info", "arguments": json.dumps({"topic": "x"})},
+        }],
+      ))
+    elif call_count == 2:
+      # Second call: final answer for first chat()
+      return _FakeHttpResponse(_make_api_response(content="First answer"))
+    else:
+      # Third call: second chat() — verify it has the full history
+      messages = payload["messages"]
+      roles = [m["role"] for m in messages]
+      # system, user1, assistant(tool_call), tool, assistant(answer), user2
+      assert "tool" in roles, f"Expected 'tool' in message roles, got {roles}"
+      return _FakeHttpResponse(_make_api_response(content="Second answer"))
+
+  monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+  monkeypatch.setattr(llm_module, "urlopen", fake_urlopen)
+
+  def get_info(topic: str) -> str:
+    """Get info."""
+    return f"info_about_{topic}"
+
+  llm = LLM("openrouter/test", tools=[get_info])
+  first = llm.chat("tell me about x")
+  assert first == "First answer"
+
+  second = llm.chat("follow up question")
+  assert second == "Second answer"
+  assert call_count == 3
+
+
+def test_tool_loop_empty_content_returns_empty_string(monkeypatch):
+  """When final response has no content (None), return empty string."""
+  def fake_urlopen(request, timeout=120):
+    return _FakeHttpResponse(_make_api_response(content=None))
+
+  monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+  monkeypatch.setattr(llm_module, "urlopen", fake_urlopen)
+
+  def tool(x: str) -> str:
+    """A tool."""
+    return x
+
+  llm = LLM("openrouter/test", tools=[tool])
+  result = llm.generate("test")
+  assert result == ""
+
+
+def test_cloud_call_raw_normalizes_string_arguments(monkeypatch):
+  """_cloud_call_raw deserializes JSON string arguments into dicts."""
+  def fake_urlopen(request, timeout=120):
+    return _FakeHttpResponse({
+      "choices": [{
+        "message": {
+          "role": "assistant",
+          "content": None,
+          "tool_calls": [{
+            "id": "call_0",
+            "type": "function",
+            "function": {
+              "name": "test_fn",
+              "arguments": '{"key": "value"}',
+            },
+          }],
+        },
+      }],
+    })
+
+  monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+  monkeypatch.setattr(llm_module, "urlopen", fake_urlopen)
+
+  def test_fn(key: str) -> str:
+    """Test."""
+    return key
+
+  llm = LLM("openrouter/test", tools=[test_fn])
+  msg = llm._cloud_call_raw([{"role": "user", "content": "test"}])
+  assert msg["tool_calls"][0]["function"]["arguments"] == {"key": "value"}
+
+
+def test_no_tools_generate_still_works(monkeypatch):
+  """LLM without tools uses the normal non-tool code path."""
+  def fake_urlopen(request, timeout=120):
+    payload = json.loads(request.data.decode("utf-8"))
+    assert "tools" not in payload
+    return _FakeHttpResponse(_make_api_response(content="plain response"))
+
+  monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+  monkeypatch.setattr(llm_module, "urlopen", fake_urlopen)
+
+  llm = LLM("openrouter/test")
+  result = llm.generate("hello")
+  assert result == "plain response"
+
+
+def test_parse_param_docs_multiline_description():
+  """Param description that spans multiple lines is joined."""
+  doc = """Do stuff.
+
+  Args:
+    name: This is a very long description
+      that continues on the next line
+    count: Simple description
+  """
+  result = _parse_param_docs(doc)
+  assert "very long description" in result["name"]
+  assert "continues on the next line" in result["name"]
+  assert result["count"] == "Simple description"
