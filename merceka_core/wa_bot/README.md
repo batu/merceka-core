@@ -262,13 +262,13 @@ brew install tailscale
 
 ### Enable Funnel
 
-```bash
+   ```bash
 # Connect to Tailscale
-tailscale up
+   tailscale up
 
 # Enable funnel on port 8000
-tailscale funnel 8000
-```
+   tailscale funnel 8000
+   ```
 
 ### Get Your Public URL
 
@@ -282,14 +282,14 @@ Your webhook URL will be: `https://your-machine.tail12345.ts.net/webhook`
 
 ### Verify It Works
 
-```bash
-# Start your server first
-uvicorn main:app --port 8000
-
+   ```bash
+   # Start your server first
+   uvicorn main:app --port 8000
+   
 # In another terminal, test through the public URL
 curl "https://your-machine.tail12345.ts.net/webhook?hub.mode=subscribe&hub.verify_token=your_secret_verify_token_here&hub.challenge=TEST"
-# Should return: TEST
-```
+   # Should return: TEST
+   ```
 
 ---
 
