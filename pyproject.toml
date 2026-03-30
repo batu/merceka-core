@@ -13,6 +13,8 @@ dependencies = [
     "nbdev>=2.4.6",
     "jupyterlab>=4.5.0",
     "jupyter-collaboration>=3.0.0",
+    "Pillow>=10.0.0",
+    "httpx>=0.28.1",
 ]
 
 [tool.setuptools.packages.find]
