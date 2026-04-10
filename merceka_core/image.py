@@ -1,6 +1,6 @@
 """Image generation and editing via AI APIs."""
 
-__all__ = ["generate_image", "inpaint"]
+__all__ = ["generate_image", "edit_image", "inpaint"]
 
 import base64
 import io
@@ -81,6 +81,83 @@ def generate_image(
   return _base64_to_image(image_url).convert("RGB")
 
 
+def edit_image(
+  image: Image.Image,
+  prompt: str,
+  *,
+  model: str = "google/gemini-3.1-flash-image-preview",
+) -> Image.Image:
+  """Send one image + text prompt, get back a modified image.
+
+  Unlike inpaint(), this sends a single image as context — no mask.
+  The model sees the image and follows the text instructions.
+
+  Args:
+    image: Reference image (RGB).
+    prompt: Instructions for what to do with the image.
+    model: OpenRouter model ID.
+
+  Returns:
+    PIL Image in RGB mode.
+  """
+  api_key = os.environ.get("OPENROUTER_API_KEY")
+  if not api_key:
+    raise RuntimeError("OPENROUTER_API_KEY not set in environment")
+
+  image_uri = _image_to_base64_uri(image.convert("RGB"))
+  original_size = image.size
+
+  w, h = image.size
+  if w == h:
+    ar = "1:1"
+  elif w > h:
+    ar = "16:9" if w / h > 1.5 else "4:3"
+  else:
+    ar = "9:16" if h / w > 1.5 else "3:4"
+  img_size = "1K" if max(w, h) <= 1024 else "2K"
+
+  payload = {
+    "model": model,
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": image_uri}},
+      ],
+    }],
+    "modalities": ["image", "text"],
+    "image_config": {
+      "aspect_ratio": ar,
+      "image_size": img_size,
+    },
+  }
+
+  with httpx.Client(timeout=300) as client:
+    response = client.post(
+      "https://openrouter.ai/api/v1/chat/completions",
+      json=payload,
+      headers={
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+      },
+    )
+    if response.status_code != 200:
+      raise RuntimeError(f"OpenRouter API error {response.status_code}: {response.text[:500]}")
+    data = response.json()
+
+  try:
+    result_url = data["choices"][0]["message"]["images"][0]["image_url"]["url"]
+  except (KeyError, IndexError) as e:
+    raise RuntimeError(
+      f"No image in OpenRouter response: {e}\nResponse: {json.dumps(data, indent=2)[:500]}"
+    ) from e
+
+  result = _base64_to_image(result_url).convert("RGB")
+  if result.size != original_size:
+    result = result.resize(original_size, Image.Resampling.LANCZOS)
+  return result
+
+
 def inpaint(
   image: Image.Image,
   mask: Image.Image,
@@ -159,7 +236,11 @@ def _inpaint_fal(
     img_response = client.get(result_image_url)
     img_response.raise_for_status()
 
-  return Image.open(io.BytesIO(img_response.content)).convert("RGB")
+  result = Image.open(io.BytesIO(img_response.content)).convert("RGB")
+  # Resize to match input dimensions (fal.ai may return different size)
+  if result.size != image.size:
+    result = result.resize(image.size, Image.Resampling.LANCZOS)
+  return result
 
 
 def _inpaint_openrouter(
@@ -174,6 +255,17 @@ def _inpaint_openrouter(
   mask_uri = _image_to_base64_uri(
     mask.convert("L").point(lambda x: 255 if x > 128 else 0).convert("RGB")
   )
+
+  # Derive aspect ratio and size from input image
+  w, h = image.size
+  if w == h:
+    ar = "1:1"
+  elif w > h:
+    ar = "16:9" if w / h > 1.5 else "4:3"
+  else:
+    ar = "9:16" if h / w > 1.5 else "3:4"
+  img_size = "1K" if max(w, h) <= 1024 else "2K"
+  original_size = image.size
 
   edit_prompt = (
     f"I am providing two images. The first is a scene. The second is a black and white mask — "
@@ -196,8 +288,8 @@ def _inpaint_openrouter(
     }],
     "modalities": ["image", "text"],
     "image_config": {
-      "aspect_ratio": "1:1",
-      "image_size": "1K",
+      "aspect_ratio": ar,
+      "image_size": img_size,
     },
   }
 
@@ -221,4 +313,8 @@ def _inpaint_openrouter(
       f"No image in OpenRouter response: {e}\nResponse: {json.dumps(data, indent=2)[:500]}"
     ) from e
 
-  return _base64_to_image(result_url).convert("RGB")
+  result = _base64_to_image(result_url).convert("RGB")
+  # Resize to match input dimensions (OpenRouter may return different size)
+  if result.size != original_size:
+    result = result.resize(original_size, Image.Resampling.LANCZOS)
+  return result
