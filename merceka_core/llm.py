@@ -863,6 +863,111 @@ class LLM:
     content = result.stdout.strip()
     return self._parse_response(content)
 
+  def _claude_stream(self, message: str, **kwargs):
+    """Stream tokens from Claude CLI via Popen + stream-json.
+
+    Yields text chunks as Claude generates them. Tool use happens
+    internally (Claude Code handles Read/Grep/Glob) — only text
+    deltas are yielded.
+    """
+    model_alias = self.model_name.removeprefix("claude/")
+    cmd = ["claude", "-p", "--model", model_alias,
+           "--output-format", "stream-json", "--verbose",
+           "--include-partial-messages"]
+    if self.system_prompt:
+      cmd.extend(["--system-prompt", self.system_prompt])
+    for d in self.add_dirs:
+      cmd.extend(["--add-dir", d])
+    if self.allowed_tools:
+      cmd.extend(["--allowedTools", ",".join(self.allowed_tools)])
+
+    env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+    process = subprocess.Popen(
+      cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+      stderr=subprocess.PIPE, text=True, bufsize=1, env=env,
+    )
+    # Send message and close stdin so Claude starts processing
+    process.stdin.write(message)
+    process.stdin.close()
+
+    try:
+      for line in process.stdout:
+        line = line.strip()
+        if not line:
+          continue
+        try:
+          obj = json.loads(line)
+        except json.JSONDecodeError:
+          continue
+
+        evt_type = obj.get("type")
+        if evt_type == "stream_event":
+          event = obj.get("event", {})
+          if event.get("type") == "content_block_delta":
+            delta = event.get("delta", {})
+            if delta.get("type") == "text_delta":
+              yield delta.get("text", "")
+        elif evt_type == "result":
+          break
+    finally:
+      process.stdout.close()
+      process.stderr.close()
+      process.wait()
+
+  def stream_generate(self, message: str, **kwargs):
+    """Stream tokens from the primary model. Sync generator.
+
+    Falls back to yielding the full response as one chunk for
+    non-Claude models.
+    """
+    if self.use_claude:
+      try:
+        yield from self._claude_stream(message, **kwargs)
+        return
+      except (FileNotFoundError, OSError) as e:
+        if self.fallback:
+          _logger.warning("Claude stream failed (%s), falling back", type(e).__name__)
+        else:
+          raise
+
+    # Fallback: generate full response and yield as one chunk
+    fb = LLM(self.fallback or self.model_name,
+             system_prompt=self.system_prompt, think=self.think,
+             output_schema=self.output_schema,
+             add_dirs=self.add_dirs, allowed_tools=self.allowed_tools)
+    yield fb.generate(message, **kwargs)
+
+  async def astream_generate(self, message: str, **kwargs):
+    """Async streaming generator. Wraps sync stream in a thread."""
+    import asyncio
+    import queue
+
+    q = queue.Queue()
+    sentinel = object()
+
+    def _run():
+      try:
+        for chunk in self.stream_generate(message, **kwargs):
+          q.put(chunk)
+      except Exception as e:
+        q.put(e)
+      finally:
+        q.put(sentinel)
+
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, _run)
+
+    while True:
+      # Poll queue with short sleep to avoid blocking event loop
+      while q.empty():
+        await asyncio.sleep(0.02)
+      item = q.get()
+      if item is sentinel:
+        break
+      if isinstance(item, Exception):
+        raise item
+      yield item
+
   def _verify(self):
     """Verify the model is available, download if missing."""
     if self.model_name not in list_local_models():
