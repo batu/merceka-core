@@ -333,6 +333,8 @@ class LLM:
     tools: list[Tool] | None = None,  # Tool functions for agentic calling
     max_tool_rounds: int = 10,  # Max iterations of the tool loop
     fallback: Optional[str] = None,  # Fallback model if primary fails
+    add_dirs: list[str] | None = None,  # Directories Claude Code can access (--add-dir)
+    allowed_tools: list[str] | None = None,  # Claude Code native tools (--allowedTools)
   ):
     if tools and output_schema:
       raise ValueError("Cannot use both tools and output_schema at the same time")
@@ -346,6 +348,8 @@ class LLM:
     self.fallback = fallback
     self.use_claude = model_name.startswith("claude/")
     self.use_openrouter = not self.use_claude and "openrouter" in model_name
+    self.add_dirs = add_dirs or []
+    self.allowed_tools = allowed_tools or []
 
     # Process tools into schemas and handlers
     self._original_tools = tools
@@ -382,10 +386,10 @@ class LLM:
   def _generate_primary(self, message: str, **kwargs) -> str | OutputSchema:
     """Primary generation dispatch."""
     messages = [create_message(self.system_prompt, "system"), create_message(message, "user")]
-    # Claude CLI doesn't support native tool calling — when tools are needed,
-    # skip Claude and use the fallback model (ollama) which supports tools natively.
-    if self.use_claude and self._tool_schemas and self.fallback:
-      _logger.info("Claude CLI can't do tool calling, using fallback %s for tools", self.fallback)
+    # Claude with allowed_tools/add_dirs uses native tool calling (Claude Code handles it).
+    # Claude with Python callable tools but no allowed_tools falls back to ollama.
+    if self.use_claude and self._tool_schemas and not self.allowed_tools and self.fallback:
+      _logger.info("Claude CLI can't run Python tool callables, using fallback %s", self.fallback)
       fb = LLM(self.fallback, system_prompt=self.system_prompt, think=self.think,
                output_schema=self.output_schema, tools=self._original_tools,
                max_tool_rounds=self.max_tool_rounds)
@@ -759,10 +763,9 @@ class LLM:
     import asyncio
 
     messages = [create_message(self.system_prompt, "system"), create_message(message, "user")]
-    # Claude CLI doesn't support native tool calling — when tools are needed,
-    # skip Claude and use the fallback model which supports tools natively.
-    if self.use_claude and self._tool_schemas and self.fallback:
-      _logger.info("Claude CLI can't do tool calling, using fallback %s for tools", self.fallback)
+    # Claude with allowed_tools uses native tool calling; Python callables fall back.
+    if self.use_claude and self._tool_schemas and not self.allowed_tools and self.fallback:
+      _logger.info("Claude CLI can't run Python tool callables, using fallback %s", self.fallback)
       fb = LLM(self.fallback, system_prompt=self.system_prompt, think=self.think,
                output_schema=self.output_schema, tools=self._original_tools,
                max_tool_rounds=self.max_tool_rounds)
@@ -826,11 +829,22 @@ class LLM:
     return await asyncio.gather(*tasks)
 
   def _claude_call(self, message: str, **kwargs) -> str | OutputSchema:
-    """Call Claude CLI via subprocess."""
+    """Call Claude CLI via subprocess.
+
+    Supports Claude Code native tool calling via --allowedTools and
+    --add-dir flags. When these are set, Claude Code handles file
+    access (Read, Grep, Glob) internally — no Python tool loop needed.
+    """
     model_alias = self.model_name.removeprefix("claude/")
     cmd = ["claude", "-p", "--model", model_alias]
     if self.system_prompt:
       cmd.extend(["--system-prompt", self.system_prompt])
+
+    # Claude Code native tool access
+    for d in self.add_dirs:
+      cmd.extend(["--add-dir", d])
+    if self.allowed_tools:
+      cmd.extend(["--allowedTools", ",".join(self.allowed_tools)])
 
     timeout = kwargs.get("timeout", CLAUDE_CLI_TIMEOUT)
     env = {**os.environ, "ANTHROPIC_API_KEY": ""}
