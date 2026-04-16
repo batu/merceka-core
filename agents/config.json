@@ -1,0 +1,18 @@
+{
+  "trello": {
+    "board_id": "4rg2w7G0",
+    "lists": {
+      "todo": "69e0c3a5f385734799bef50e",
+      "brainstormed": "69e0c3a5f385734799bef50f",
+      "planned": "69e0c3a5f385734799bef510",
+      "worked": "69e0c3a5f385734799bef511",
+      "tested_insitu": "69e0c3a5f385734799bef517",
+      "reviewed": "69e0c3a5f385734799bef512",
+      "video_sent": "69e0c3a5f385734799bef519",
+      "compounded": "69e0c3a5f385734799bef513",
+      "merged": "69e0c3a5f385734799bef514",
+      "blocked_on_batu": "69e0c3a5f385734799bef518",
+      "archive": "69e0c3a5f385734799bef516"
+    }
+  }
+}
