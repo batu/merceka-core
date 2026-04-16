@@ -1063,6 +1063,14 @@ class LLM:
     failure), then calls ``generate_content``. Deletes uploaded
     files afterwards as hygiene.
 
+    The model is set at ``LLM`` construction time. The recommended
+    default for video is ``LLM("gemini/gemini-flash-latest")`` — the
+    ``gemini-flash-latest`` alias resolves to the newest full-fat Flash
+    (currently ``gemini-3-flash-preview``, Dec 2025) and auto-upgrades
+    as new Flash models ship. Use ``LLM("gemini/gemini-pro-latest")``
+    when you need the Pro tier's deeper reasoning on a curated clip and
+    are willing to pay for it.
+
     Args:
       message: The text prompt that accompanies the video(s).
       video_paths: A single path or a list of paths. Always

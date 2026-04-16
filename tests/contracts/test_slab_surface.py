@@ -63,7 +63,7 @@ def test_generate_with_resource_signature_openrouter_claude():
 
 def test_generate_with_video_signature():
   """generate_with_video exists on LLM with the documented signature."""
-  llm = LLM("gemini/2.5-pro")
+  llm = LLM("gemini/gemini-flash-latest")
   assert llm.use_gemini is True
   sig = inspect.signature(llm.generate_with_video)
   params = sig.parameters
@@ -83,13 +83,13 @@ def test_generate_with_video_rejects_non_gemini():
 
 def test_agenerate_with_video_is_async():
   """agenerate_with_video is a coroutine function."""
-  llm = LLM("gemini/2.5-pro")
+  llm = LLM("gemini/gemini-flash-latest")
   assert inspect.iscoroutinefunction(llm.agenerate_with_video)
 
 
 def test_video_not_found_raised_eagerly(tmp_path):
   """generate_with_video raises VideoNotFoundError before touching the SDK."""
-  llm = LLM("gemini/2.5-pro")
+  llm = LLM("gemini/gemini-flash-latest")
   missing = tmp_path / "does_not_exist.mp4"
   with pytest.raises(VideoNotFoundError):
     llm.generate_with_video("prompt", missing)

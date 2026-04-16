@@ -39,7 +39,7 @@ class TestGeminiVideoRoundtrip:
     _require_env()
     _require_fixture()
 
-    llm = LLM("gemini/2.5-pro")
+    llm = LLM("gemini/gemini-flash-latest")
     result = llm.generate_with_video(
       "Describe what happens in this short video in one sentence.",
       FIXTURE_PATH,
@@ -54,7 +54,7 @@ class TestGeminiVideoRoundtrip:
     _require_env()
     _require_fixture()
 
-    llm = LLM("gemini/2.5-pro")
+    llm = LLM("gemini/gemini-flash-latest")
     result = await llm.agenerate_with_video(
       "Describe this video.",
       FIXTURE_PATH,

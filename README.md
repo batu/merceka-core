@@ -26,7 +26,11 @@ llm = LLM("openrouter/anthropic/claude-sonnet-4-5")
 description = llm.generate_with_resource("What's in this image?", "frame.png")
 
 # Gemini long-context video (needs GOOGLE_API_KEY)
-llm = LLM("gemini/2.5-pro")
+# `gemini-flash-latest` is the recommended default for video: it aliases
+# the newest full-fat Flash (currently gemini-3-flash-preview, Dec 2025)
+# and auto-upgrades as newer Flash models ship. Use `gemini-pro-latest`
+# when you need Pro-tier reasoning on a curated clip.
+llm = LLM("gemini/gemini-flash-latest")
 summary = llm.generate_with_video(
     "Summarize the mechanic shown in this gameplay footage.",
     "playthrough.mp4",
