@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import random
 
-import pytest
 
 from merceka_core.llm import (
   _RETRY_BASE_DELAY,

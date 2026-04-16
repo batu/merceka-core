@@ -5,7 +5,6 @@ These tests assert the exact shape mindweaver imports and uses.
 """
 from __future__ import annotations
 
-import asyncio
 import inspect
 
 import pytest
