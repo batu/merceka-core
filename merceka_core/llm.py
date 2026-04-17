@@ -4,7 +4,7 @@
 
 # %% auto 0
 __all__ = ['Tool', 'list_local_models', 'create_message', 'create_message_with_resource', 'create_ollama_vision_message',
-           'tool_from_callable', 'OutputSchema', 'LLM']
+           'tool_from_callable', 'OutputSchema', 'LLM', 'generate_with_search_grounding']
 
 # %% ../nbs/00_llm.ipynb 2
 import dotenv
@@ -1223,3 +1223,127 @@ def _gemini_video_call(
       except Exception:  # pragma: no cover — hygiene, not critical.
         _logger.debug("Gemini file delete failed for %s", getattr(f, "name", "?"))
 
+
+# %% ../nbs/00_llm.ipynb 35
+def _extract_grounding(response) -> dict:
+  """Pull grounding metadata from a google-genai response into a plain dict.
+
+  Schema:
+    {"queries": list[str],
+     "citations": list[{"uri": str, "title": str}],
+     "search_entry_point_html": str | None}
+
+  Handles python-genai #802: ``grounding_metadata`` may be absent on the
+  first candidate even when searches were performed. Returns empty
+  queries/citations so the caller can decide to degrade.
+  """
+  out: dict = {"queries": [], "citations": [], "search_entry_point_html": None}
+  candidates = getattr(response, "candidates", None) or []
+  if not candidates:
+    return out
+  gm = getattr(candidates[0], "grounding_metadata", None)
+  if gm is None:
+    return out
+  queries = getattr(gm, "web_search_queries", None) or []
+  out["queries"] = [str(q) for q in queries]
+  chunks = getattr(gm, "grounding_chunks", None) or []
+  citations = []
+  for chunk in chunks:
+    web = getattr(chunk, "web", None)
+    if web is not None:
+      citations.append({
+        "uri": str(getattr(web, "uri", "") or ""),
+        "title": str(getattr(web, "title", "") or ""),
+      })
+  out["citations"] = citations
+  sep = getattr(gm, "search_entry_point", None)
+  if sep is not None:
+    out["search_entry_point_html"] = getattr(sep, "rendered_content", None)
+  return out
+
+
+def _generate_with_search_grounding_sync(
+  *,
+  prompt: str,
+  system_prompt: str,
+  model: str,
+  max_tokens: int,
+  timeout_s: float,
+) -> tuple[str, dict]:
+  """Blocking impl; ``generate_with_search_grounding`` wraps this in a thread."""
+  from google.genai import types
+
+  client = _gemini_client()
+  tools = [types.Tool(google_search=types.GoogleSearch())]
+  config_kwargs: dict = {"tools": tools}
+  if max_tokens:
+    config_kwargs["max_output_tokens"] = max_tokens
+  if system_prompt:
+    config_kwargs["system_instruction"] = system_prompt
+  config = types.GenerateContentConfig(**config_kwargs)
+
+  response = None
+  for attempt in range(_RETRY_MAX_ATTEMPTS):
+    try:
+      response = client.models.generate_content(
+        model=model, contents=prompt, config=config,
+      )
+      break
+    except Exception as exc:  # noqa: BLE001 — bridge to our taxonomy.
+      status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+      is_retryable = status in _RETRY_STATUS_CODES or isinstance(
+        exc, (ConnectionResetError, ConnectionRefusedError)
+      )
+      if not is_retryable or attempt == _RETRY_MAX_ATTEMPTS - 1:
+        raise VideoBackendError(
+          f"Gemini search-grounded generate_content failed: {exc}"
+        ) from exc
+      delay = _retry_delay(attempt)
+      _logger.warning(
+        "Gemini search-grounded %s, retrying in %.2fs", type(exc).__name__, delay,
+      )
+      time.sleep(delay)
+
+  text = getattr(response, "text", None) or ""
+  try:
+    grounding = _extract_grounding(response)
+  except Exception as exc:  # noqa: BLE001 — never fail the call on metadata parse.
+    _logger.warning("Failed to extract grounding metadata: %s", exc)
+    grounding = {"queries": [], "citations": [], "search_entry_point_html": None}
+  return text, grounding
+
+
+async def generate_with_search_grounding(
+  *,
+  prompt: str,
+  system_prompt: str = "",
+  model: str = "gemini-2.5-pro",
+  max_tokens: int = 6000,
+  timeout_s: float = 120.0,
+) -> tuple[str, dict]:
+  """Gemini generate_content with Google-Search grounding.
+
+  Returns ``(raw_text, grounding_dict)`` where ``grounding_dict`` has
+  keys ``queries``, ``citations``, ``search_entry_point_html``.
+  When the python-genai SDK omits ``grounding_metadata`` (issue #802),
+  the returned lists are empty — the caller is expected to degrade.
+
+  Args:
+    prompt: User prompt.
+    system_prompt: Optional system instruction.
+    model: Gemini model ID (without ``gemini/`` prefix).
+    max_tokens: Output cap. ``0`` disables the cap.
+    timeout_s: Reserved; the underlying client uses its own timeout.
+
+  Raises:
+    VideoBackendError: On non-retryable 5xx / persistent transport errors.
+  """
+  import asyncio
+  return await asyncio.to_thread(
+    _generate_with_search_grounding_sync,
+    prompt=prompt,
+    system_prompt=system_prompt,
+    model=model,
+    max_tokens=max_tokens,
+    timeout_s=timeout_s,
+  )
