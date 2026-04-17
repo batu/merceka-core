@@ -1161,6 +1161,34 @@ def _gemini_poll_until_active(client, file_obj, timeout_s: float, poll_interval_
     current = client.files.get(name=current.name)
 
 
+def _build_video_config(max_tokens=None, system_prompt: str = "", **extra):
+  """Translate common slab kwargs into a google-genai GenerateContentConfig.
+
+  google-genai rejects unknown top-level kwargs on ``generate_content``
+  (e.g. ``max_tokens``) — they have to ride on ``config``. This helper
+  keeps callers in merceka-land portable to both the litellm-style
+  argument names they already use and the SDK-native shape.
+  """
+  from google.genai import types
+
+  cfg: dict = {}
+  if max_tokens:
+    cfg["max_output_tokens"] = int(max_tokens)
+  if system_prompt:
+    cfg["system_instruction"] = system_prompt
+  # Passthrough known config fields the caller may want to set directly.
+  for key in (
+    "temperature", "top_p", "top_k",
+    "stop_sequences", "response_mime_type", "response_schema",
+    "safety_settings",
+  ):
+    if key in extra:
+      cfg[key] = extra.pop(key)
+  if not cfg:
+    return None, extra
+  return types.GenerateContentConfig(**cfg), extra
+
+
 def _gemini_video_call(
   llm,  # LLM instance (forward-decl to avoid circular self-ref in helper)
   message: str,
@@ -1184,6 +1212,13 @@ def _gemini_video_call(
   client = _gemini_client()
   model_alias = llm.model_name.removeprefix("gemini/")
 
+  # Extract caller kwargs that google-genai doesn't accept as top-level.
+  config, remaining_kwargs = _build_video_config(
+    max_tokens=kwargs.pop("max_tokens", None),
+    system_prompt=llm.system_prompt,
+    **kwargs,
+  )
+
   uploaded = []
   try:
     for p in paths:
@@ -1199,9 +1234,10 @@ def _gemini_video_call(
     # Apply retry around generate_content for transient 5xx/429.
     for attempt in range(_RETRY_MAX_ATTEMPTS):
       try:
-        response = client.models.generate_content(
-          model=model_alias, contents=contents, **kwargs
-        )
+        gc_kwargs: dict = {"model": model_alias, "contents": contents, **remaining_kwargs}
+        if config is not None:
+          gc_kwargs["config"] = config
+        response = client.models.generate_content(**gc_kwargs)
         break
       except Exception as exc:  # noqa: BLE001 — bridge to our taxonomy.
         status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
@@ -1222,7 +1258,6 @@ def _gemini_video_call(
         client.files.delete(name=f.name)
       except Exception:  # pragma: no cover — hygiene, not critical.
         _logger.debug("Gemini file delete failed for %s", getattr(f, "name", "?"))
-
 
 # %% ../nbs/00_llm.ipynb 35
 def _extract_grounding(response) -> dict:
