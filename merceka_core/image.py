@@ -25,6 +25,135 @@ def _base64_to_image(data_uri: str) -> Image.Image:
   return Image.open(io.BytesIO(base64.b64decode(encoded)))
 
 
+_OPENAI_SIZES = {
+  "1:1": "1024x1024",
+  "9:16": "1024x1536",
+  "16:9": "1536x1024",
+  "3:4": "1024x1536",   # closest OpenAI-supported size
+  "4:3": "1536x1024",
+}
+
+
+def _openai_size(aspect_ratio: str, image_size: str) -> str:
+  """Map our (aspect_ratio, image_size) pair onto OpenAI's single `size`
+  parameter. The OpenAI image API accepts a fixed set of WxH strings."""
+  return _OPENAI_SIZES.get(aspect_ratio, "1024x1024")
+
+
+def _generate_openai(prompt: str, model: str, aspect_ratio: str, image_size: str) -> Image.Image:
+  """Generate an image via OpenAI's direct image API (e.g. gpt-image-2).
+
+  OpenAI-side model id has no `openai/` prefix. The caller strips it
+  before dispatching here.
+  """
+  api_key = os.environ.get("OPENAI_API_KEY")
+  if not api_key:
+    raise RuntimeError("OPENAI_API_KEY not set in environment")
+
+  size = _openai_size(aspect_ratio, image_size)
+  payload = {
+    "model": model,
+    "prompt": prompt,
+    "size": size,
+    "n": 1,
+  }
+
+  with httpx.Client(timeout=300) as client:
+    response = client.post(
+      "https://api.openai.com/v1/images/generations",
+      json=payload,
+      headers={
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+      },
+    )
+    if response.status_code != 200:
+      raise RuntimeError(f"OpenAI API error {response.status_code}: {response.text[:500]}")
+    data = response.json()
+
+  try:
+    item = data["data"][0]
+    if "b64_json" in item:
+      raw = base64.b64decode(item["b64_json"])
+      return Image.open(io.BytesIO(raw)).convert("RGB")
+    # Some responses use a URL instead of b64_json.
+    url = item["url"]
+    with httpx.Client(timeout=120) as client:
+      r = client.get(url)
+      r.raise_for_status()
+      return Image.open(io.BytesIO(r.content)).convert("RGB")
+  except (KeyError, IndexError) as e:
+    raise RuntimeError(
+      f"No image in OpenAI response: {e}\nResponse: {json.dumps(data, indent=2)[:500]}"
+    ) from e
+
+
+def _edit_openai(image: Image.Image, prompt: str, model: str) -> Image.Image:
+  """Edit one image via OpenAI's image edits endpoint.
+
+  Sends multipart/form-data with the image file + prompt. The returned
+  image is resized back to the input's dimensions so downstream
+  compositing (which assumes identical crop sizes) keeps working.
+  """
+  api_key = os.environ.get("OPENAI_API_KEY")
+  if not api_key:
+    raise RuntimeError("OPENAI_API_KEY not set in environment")
+
+  original_size = image.size
+  # Encode input as PNG bytes for the multipart upload.
+  buf = io.BytesIO()
+  image.convert("RGBA").save(buf, format="PNG")
+  buf.seek(0)
+
+  w, h = original_size
+  if w == h:
+    ar = "1:1"
+  elif w > h:
+    ar = "16:9" if w / h > 1.5 else "4:3"
+  else:
+    ar = "9:16" if h / w > 1.5 else "3:4"
+  size = _openai_size(ar, "1K")
+
+  files = {"image": ("input.png", buf.getvalue(), "image/png")}
+  form = {
+    "model": model,
+    "prompt": prompt,
+    "size": size,
+    "n": "1",
+  }
+
+  with httpx.Client(timeout=300) as client:
+    response = client.post(
+      "https://api.openai.com/v1/images/edits",
+      files=files,
+      data=form,
+      headers={"Authorization": f"Bearer {api_key}"},
+    )
+    if response.status_code != 200:
+      raise RuntimeError(f"OpenAI edit API error {response.status_code}: {response.text[:500]}")
+    data = response.json()
+
+  try:
+    item = data["data"][0]
+    if "b64_json" in item:
+      raw = base64.b64decode(item["b64_json"])
+      result = Image.open(io.BytesIO(raw)).convert("RGB")
+    else:
+      url = item["url"]
+      with httpx.Client(timeout=120) as client:
+        r = client.get(url)
+        r.raise_for_status()
+        result = Image.open(io.BytesIO(r.content)).convert("RGB")
+  except (KeyError, IndexError) as e:
+    raise RuntimeError(
+      f"No image in OpenAI edit response: {e}\nResponse: {json.dumps(data, indent=2)[:500]}"
+    ) from e
+
+  if result.size != original_size:
+    result = result.resize(original_size, Image.Resampling.LANCZOS)
+  return result
+
+
 def generate_image(
   prompt: str,
   *,
@@ -32,17 +161,24 @@ def generate_image(
   aspect_ratio: str = "1:1",
   image_size: str = "1K",
 ) -> Image.Image:
-  """Generate an image from a text prompt via OpenRouter.
+  """Generate an image from a text prompt.
+
+  Dispatches by model prefix:
+  - `openai/...` → OpenAI's direct image API (gpt-image-2, etc).
+  - Anything else → OpenRouter chat-completions with image modality.
 
   Args:
     prompt: Text description of the image to generate.
-    model: OpenRouter model ID.
-    aspect_ratio: Aspect ratio string (e.g., "1:1", "1:2", "16:9").
-    image_size: Resolution tier ("1K", "2K", "4K").
+    model: OpenRouter model id OR `openai/<openai-model>`.
+    aspect_ratio: Aspect ratio string (e.g., "1:1", "9:16", "16:9").
+    image_size: Resolution tier ("1K", "2K", "4K") — OpenAI maps to WxH.
 
   Returns:
     PIL Image in RGB mode.
   """
+  if model.startswith("openai/"):
+    return _generate_openai(prompt, model.removeprefix("openai/"), aspect_ratio, image_size)
+
   api_key = os.environ.get("OPENROUTER_API_KEY")
   if not api_key:
     raise RuntimeError("OPENROUTER_API_KEY not set in environment")
@@ -90,16 +226,21 @@ def edit_image(
   """Send one image + text prompt, get back a modified image.
 
   Unlike inpaint(), this sends a single image as context — no mask.
-  The model sees the image and follows the text instructions.
+  Dispatches by model prefix:
+  - `openai/...` → OpenAI's `/v1/images/edits` multipart endpoint.
+  - Anything else → OpenRouter chat-completions with image modality.
 
   Args:
     image: Reference image (RGB).
     prompt: Instructions for what to do with the image.
-    model: OpenRouter model ID.
+    model: OpenRouter model id OR `openai/<openai-model>`.
 
   Returns:
-    PIL Image in RGB mode.
+    PIL Image in RGB mode, resized to the input's original dimensions.
   """
+  if model.startswith("openai/"):
+    return _edit_openai(image, prompt, model.removeprefix("openai/"))
+
   api_key = os.environ.get("OPENROUTER_API_KEY")
   if not api_key:
     raise RuntimeError("OPENROUTER_API_KEY not set in environment")
