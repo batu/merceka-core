@@ -5,7 +5,15 @@ Core utilities for merceka projects.
 ## Installation
 
 ```bash
-pip install merceka_core
+pip install merceka-core
+```
+
+Optional notebook and WhatsApp bot tooling is split into extras so base
+consumers do not install Jupyter or FastHTML unless they need them:
+
+```bash
+pip install "merceka-core[notebooks]"
+pip install "merceka-core[wa-bot]"
 ```
 
 ## Usage
@@ -78,4 +86,3 @@ uv run jupyter lab
 # Export notebooks to Python modules
 uv run nbdev_export
 ```
-
