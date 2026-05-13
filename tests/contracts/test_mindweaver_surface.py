@@ -9,7 +9,20 @@ import inspect
 
 import pytest
 
-from merceka_core import GpuLockTimeout, gpu_lock
+from merceka_core import (
+  Agent,
+  AgentComplete,
+  AgentProfile,
+  AgentRawProviderEvent,
+  AgentRequest,
+  AgentResult,
+  AgentTextDelta,
+  GpuLockTimeout,
+  ProviderFailure,
+  RawProviderEvent,
+  gpu_lock,
+)
+from merceka_core.agents import ClaudeCodeAgentProvider
 from merceka_core.llm import LLM
 
 
@@ -67,3 +80,21 @@ def test_openrouter_claude_does_not_raise_at_init():
   # Just constructing should not raise.
   llm = LLM("openrouter/anthropic/claude-sonnet-4-5")
   assert llm.model_name == "openrouter/anthropic/claude-sonnet-4-5"
+
+
+def test_agent_surface_exports_mindweaver_imports():
+  assert Agent is not None
+  assert AgentProfile.READ_ONLY == "read_only"
+  assert AgentRequest is not None
+  assert AgentResult is not None
+  assert AgentTextDelta is not None
+  assert AgentRawProviderEvent is not None
+  assert AgentComplete is not None
+  assert RawProviderEvent is not None
+  assert ProviderFailure is not None
+
+
+def test_claude_code_agent_provider_is_public_for_mindweaver():
+  provider = ClaudeCodeAgentProvider(model="sonnet")
+
+  assert provider.model == "sonnet"
