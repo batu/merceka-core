@@ -1,11 +1,19 @@
 """Image generation and editing via AI APIs."""
 
-__all__ = ["generate_image", "edit_image", "inpaint"]
+__all__ = [
+  "generate_image",
+  "edit_image",
+  "inpaint",
+  "upscale_image",
+  "generate_image_stream",
+  "edit_image_stream",
+]
 
 import base64
 import io
 import json
 import os
+import re
 
 import httpx
 from PIL import Image
@@ -25,7 +33,83 @@ def _base64_to_image(data_uri: str) -> Image.Image:
   return Image.open(io.BytesIO(base64.b64decode(encoded)))
 
 
-_OPENAI_SIZES = {
+def _load_image_ref(image_ref: str) -> Image.Image:
+  """Load an image from a data URI or an HTTPS URL."""
+  if image_ref.startswith("data:image/"):
+    return _base64_to_image(image_ref)
+  if image_ref.startswith("http://") or image_ref.startswith("https://"):
+    with httpx.Client(timeout=120) as client:
+      response = client.get(image_ref)
+      response.raise_for_status()
+      return Image.open(io.BytesIO(response.content))
+  raise ValueError(f"unsupported image reference: {image_ref[:80]}")
+
+
+def _extract_openrouter_image_ref(data: dict) -> str:
+  """Extract the first image reference from known OpenRouter response shapes.
+
+  OpenRouter's image-capable chat endpoint has returned generated images both
+  in `message.images[].image_url.url` and in content parts. Keep the parser
+  tolerant so model/provider format drift doesn't turn a valid image response
+  into a failed edit.
+  """
+  choices = data.get("choices")
+  if not isinstance(choices, list) or not choices:
+    raise KeyError("choices")
+  message = choices[0].get("message") if isinstance(choices[0], dict) else None
+  if not isinstance(message, dict):
+    raise KeyError("message")
+
+  for item in message.get("images") or []:
+    if not isinstance(item, dict):
+      continue
+    image_url = item.get("image_url")
+    if isinstance(image_url, dict) and isinstance(image_url.get("url"), str):
+      return image_url["url"]
+    if isinstance(item.get("url"), str):
+      return item["url"]
+
+  content = message.get("content")
+  if isinstance(content, list):
+    for part in content:
+      if not isinstance(part, dict):
+        continue
+      image_url = part.get("image_url")
+      if isinstance(image_url, dict) and isinstance(image_url.get("url"), str):
+        return image_url["url"]
+      if isinstance(part.get("url"), str):
+        return part["url"]
+      source = part.get("source")
+      if isinstance(source, dict):
+        data_b64 = source.get("data")
+        media_type = source.get("media_type", "image/png")
+        if isinstance(data_b64, str):
+          return f"data:{media_type};base64,{data_b64}"
+
+  if isinstance(content, str):
+    match = re.search(r"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=\n\r]+", content)
+    if match:
+      return match.group(0).replace("\n", "").replace("\r", "")
+
+  raise KeyError("images")
+
+
+def _openrouter_image_or_raise(data: dict) -> Image.Image:
+  try:
+    image_ref = _extract_openrouter_image_ref(data)
+  except (KeyError, IndexError, TypeError) as e:
+    raise RuntimeError(
+      f"No image in OpenRouter response: {e}\nResponse: {json.dumps(data, indent=2)[:500]}"
+    ) from e
+  return _load_image_ref(image_ref).convert("RGB")
+
+
+_IMAGE_ONLY_SUFFIX = (
+  "\n\nReturn an image using the image modality. Do not respond with text only."
+)
+
+
+_OPENAI_1K_SIZES = {
   "1:1": "1024x1024",
   "9:16": "1024x1536",
   "16:9": "1536x1024",
@@ -33,11 +117,41 @@ _OPENAI_SIZES = {
   "4:3": "1536x1024",
 }
 
+_OPENAI_GPT_IMAGE_2_2K_SIZES = {
+  "1:1": "2048x2048",
+  "9:16": "1440x2560",
+  "16:9": "2560x1440",
+  "3:4": "1536x2048",
+  "4:3": "2048x1536",
+}
 
-def _openai_size(aspect_ratio: str, image_size: str) -> str:
+_OPENAI_GPT_IMAGE_2_4K_SIZES = {
+  "1:1": "2880x2880",
+  "9:16": "2160x3840",
+  "16:9": "3840x2160",
+  "3:4": "2160x2880",
+  "4:3": "2880x2160",
+}
+
+
+def _openai_size(aspect_ratio: str, image_size: str, model: str = "") -> str:
   """Map our (aspect_ratio, image_size) pair onto OpenAI's single `size`
-  parameter. The OpenAI image API accepts a fixed set of WxH strings."""
-  return _OPENAI_SIZES.get(aspect_ratio, "1024x1024")
+  parameter.
+
+  GPT Image 2 accepts explicit larger dimensions within its max-edge and
+  total-pixel budget. Older OpenAI image models stay on the conservative
+  fixed 1K-ish sizes plus `auto` path.
+  """
+  normalized_size = image_size.strip().upper()
+  normalized_model = model.strip().lower()
+  if normalized_model == "gpt-image-2":
+    if normalized_size == "2K":
+      return _OPENAI_GPT_IMAGE_2_2K_SIZES.get(aspect_ratio, "2048x2048")
+    if normalized_size == "4K":
+      return _OPENAI_GPT_IMAGE_2_4K_SIZES.get(aspect_ratio, "2880x2880")
+  if normalized_size in {"2K", "4K", "AUTO"}:
+    return "auto"
+  return _OPENAI_1K_SIZES.get(aspect_ratio, "1024x1024")
 
 
 def _generate_openai(prompt: str, model: str, aspect_ratio: str, image_size: str) -> Image.Image:
@@ -50,7 +164,7 @@ def _generate_openai(prompt: str, model: str, aspect_ratio: str, image_size: str
   if not api_key:
     raise RuntimeError("OPENAI_API_KEY not set in environment")
 
-  size = _openai_size(aspect_ratio, image_size)
+  size = _openai_size(aspect_ratio, image_size, model)
   payload = {
     "model": model,
     "prompt": prompt,
@@ -112,13 +226,92 @@ def _edit_openai(image: Image.Image, prompt: str, model: str) -> Image.Image:
     ar = "16:9" if w / h > 1.5 else "4:3"
   else:
     ar = "9:16" if h / w > 1.5 else "3:4"
-  size = _openai_size(ar, "1K")
+  size = _openai_size(ar, "1K", model)
 
   files = {"image": ("input.png", buf.getvalue(), "image/png")}
   form = {
     "model": model,
     "prompt": prompt,
     "size": size,
+    "n": "1",
+  }
+
+  with httpx.Client(timeout=300) as client:
+    response = client.post(
+      "https://api.openai.com/v1/images/edits",
+      files=files,
+      data=form,
+      headers={"Authorization": f"Bearer {api_key}"},
+    )
+    if response.status_code != 200:
+      raise RuntimeError(f"OpenAI edit API error {response.status_code}: {response.text[:500]}")
+    data = response.json()
+
+  try:
+    item = data["data"][0]
+    if "b64_json" in item:
+      raw = base64.b64decode(item["b64_json"])
+      result = Image.open(io.BytesIO(raw)).convert("RGB")
+    else:
+      url = item["url"]
+      with httpx.Client(timeout=120) as client:
+        r = client.get(url)
+        r.raise_for_status()
+        result = Image.open(io.BytesIO(r.content)).convert("RGB")
+  except (KeyError, IndexError) as e:
+    raise RuntimeError(
+      f"No image in OpenAI edit response: {e}\nResponse: {json.dumps(data, indent=2)[:500]}"
+    ) from e
+
+  if result.size != original_size:
+    result = result.resize(original_size, Image.Resampling.LANCZOS)
+  return result
+
+
+def _mask_to_openai_alpha(mask: Image.Image) -> bytes:
+  """Encode a grayscale edit mask as an RGBA PNG for OpenAI image edits.
+
+  OpenAI edits use the alpha channel as the editable area: transparent pixels
+  are changed, opaque pixels are preserved. Our internal masks use white for
+  "edit this", so invert the alpha when building the API mask.
+  """
+  alpha = mask.convert("L").point(lambda x: 0 if x > 128 else 255)
+  rgba = Image.new("RGBA", alpha.size, (255, 255, 255, 255))
+  rgba.putalpha(alpha)
+  buf = io.BytesIO()
+  rgba.save(buf, format="PNG")
+  return buf.getvalue()
+
+
+def _inpaint_openai(
+  image: Image.Image,
+  mask: Image.Image,
+  prompt: str,
+  model: str,
+) -> Image.Image:
+  """Masked edit via OpenAI's Images API.
+
+  This is the right path for localized edits. It sends an alpha mask instead
+  of asking the model to infer the editable region from prose, and uses low
+  quality + JPEG output because level-editor dog previews are latency-sensitive.
+  """
+  api_key = os.environ.get("OPENAI_API_KEY")
+  if not api_key:
+    raise RuntimeError("OPENAI_API_KEY not set in environment")
+
+  original_size = image.size
+  image_buf = io.BytesIO()
+  image.convert("RGBA").save(image_buf, format="PNG")
+
+  files = {
+    "image[]": ("input.png", image_buf.getvalue(), "image/png"),
+    "mask": ("mask.png", _mask_to_openai_alpha(mask), "image/png"),
+  }
+  form = {
+    "model": model.removeprefix("openai/"),
+    "prompt": prompt,
+    "quality": "low",
+    "output_format": "jpeg",
     "n": "1",
   }
 
@@ -185,7 +378,7 @@ def generate_image(
 
   payload = {
     "model": model,
-    "messages": [{"role": "user", "content": prompt}],
+    "messages": [{"role": "user", "content": prompt + _IMAGE_ONLY_SUFFIX}],
     "modalities": ["image", "text"],
     "image_config": {
       "aspect_ratio": aspect_ratio,
@@ -207,14 +400,7 @@ def generate_image(
 
     data = response.json()
 
-  try:
-    image_url = data["choices"][0]["message"]["images"][0]["image_url"]["url"]
-  except (KeyError, IndexError) as e:
-    raise RuntimeError(
-      f"No image in OpenRouter response: {e}\nResponse: {json.dumps(data, indent=2)[:500]}"
-    ) from e
-
-  return _base64_to_image(image_url).convert("RGB")
+  return _openrouter_image_or_raise(data)
 
 
 def edit_image(
@@ -262,7 +448,7 @@ def edit_image(
     "messages": [{
       "role": "user",
       "content": [
-        {"type": "text", "text": prompt},
+        {"type": "text", "text": prompt + _IMAGE_ONLY_SUFFIX},
         {"type": "image_url", "image_url": {"url": image_uri}},
       ],
     }],
@@ -286,17 +472,89 @@ def edit_image(
       raise RuntimeError(f"OpenRouter API error {response.status_code}: {response.text[:500]}")
     data = response.json()
 
-  try:
-    result_url = data["choices"][0]["message"]["images"][0]["image_url"]["url"]
-  except (KeyError, IndexError) as e:
-    raise RuntimeError(
-      f"No image in OpenRouter response: {e}\nResponse: {json.dumps(data, indent=2)[:500]}"
-    ) from e
-
-  result = _base64_to_image(result_url).convert("RGB")
+  result = _openrouter_image_or_raise(data)
   if result.size != original_size:
     result = result.resize(original_size, Image.Resampling.LANCZOS)
   return result
+
+
+def _fal_upscale_payload(model: str, image_uri: str, scale: float) -> dict:
+  """Build a fal.ai upscaler payload for the supported background models."""
+  if scale < 1 or scale > 8:
+    raise ValueError(f"scale must be between 1 and 8, got {scale}")
+
+  if model == "fal-ai/esrgan":
+    return {
+      "image_url": image_uri,
+      "scale": scale,
+      "model": "RealESRGAN_x4plus",
+      "output_format": "png",
+    }
+
+  if model == "fal-ai/aura-sr":
+    return {
+      "image_url": image_uri,
+      "upscale_factor": 4,
+      "overlapping_tiles": False,
+      "checkpoint": "v2",
+    }
+
+  raise ValueError(f"unsupported upscaler model: {model}")
+
+
+def _image_from_fal_response(result_data: dict) -> Image.Image:
+  """Load the first image from fal.ai's common response shapes."""
+  image_info = result_data.get("image")
+  if isinstance(image_info, dict) and isinstance(image_info.get("url"), str):
+    result_image_url = image_info["url"]
+  else:
+    try:
+      result_image_url = result_data["images"][0]["url"]
+    except (KeyError, IndexError, TypeError) as e:
+      raise RuntimeError(
+        f"No image in fal.ai response: {e}\nResponse: {json.dumps(result_data, indent=2)[:500]}"
+      ) from e
+
+  with httpx.Client(timeout=120) as client:
+    img_response = client.get(result_image_url)
+    img_response.raise_for_status()
+
+  return Image.open(io.BytesIO(img_response.content)).convert("RGB")
+
+
+def upscale_image(
+  image: Image.Image,
+  *,
+  model: str = "fal-ai/esrgan",
+  scale: float = 2.0,
+) -> Image.Image:
+  """Upscale an image via a dedicated fal.ai upscaler.
+
+  This is intended for background masters, not dog insertion crops. It returns
+  whatever resolution the provider produces; callers that need an exact long
+  edge should resize the returned image after the model pass.
+  """
+  api_key = os.environ.get("FAL_KEY")
+  if not api_key:
+    raise RuntimeError("FAL_KEY not set in environment")
+
+  image_uri = _image_to_base64_uri(image.convert("RGB"))
+  payload = _fal_upscale_payload(model, image_uri, scale)
+
+  with httpx.Client(timeout=600) as client:
+    response = client.post(
+      f"https://fal.run/{model}",
+      json=payload,
+      headers={
+        "Authorization": f"Key {api_key}",
+        "Content-Type": "application/json",
+      },
+    )
+    if response.status_code != 200:
+      raise RuntimeError(f"fal.ai API error {response.status_code}: {response.text[:500]}")
+    result_data = response.json()
+
+  return _image_from_fal_response(result_data)
 
 
 def inpaint(
@@ -327,6 +585,8 @@ def inpaint(
 
   if model.startswith("fal-ai/"):
     return _inpaint_fal(image, mask, prompt, model)
+  if model.startswith("openai/"):
+    return _inpaint_openai(image, mask, prompt, model)
   else:
     return _inpaint_openrouter(image, mask, prompt, model)
 
@@ -414,7 +674,7 @@ def _inpaint_openrouter(
     f"Edit the scene by adding the following in the white masked area, "
     f"keeping everything in the black area completely unchanged:\n\n{prompt}\n\n"
     f"The result must look natural and match the style of the original scene. "
-    f"Return only the edited image."
+    f"Return only the edited image using the image modality. Do not respond with text only."
   )
 
   payload = {
@@ -447,14 +707,7 @@ def _inpaint_openrouter(
       raise RuntimeError(f"OpenRouter API error {response.status_code}: {response.text[:500]}")
     data = response.json()
 
-  try:
-    result_url = data["choices"][0]["message"]["images"][0]["image_url"]["url"]
-  except (KeyError, IndexError) as e:
-    raise RuntimeError(
-      f"No image in OpenRouter response: {e}\nResponse: {json.dumps(data, indent=2)[:500]}"
-    ) from e
-
-  result = _base64_to_image(result_url).convert("RGB")
+  result = _openrouter_image_or_raise(data)
   # Resize to match input dimensions (OpenRouter may return different size)
   if result.size != original_size:
     result = result.resize(original_size, Image.Resampling.LANCZOS)
