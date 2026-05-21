@@ -22,11 +22,12 @@ from merceka_core.agent import (
 
 CODEX_PROVIDER = "codex"
 CODEX_TIMEOUT_SECONDS = 300
+DEFAULT_CODEX_MODEL_ALIASES = {"", "default", "codex-default", "codex-default-high", "gpt-5.5-high"}
 
 
 @dataclass(frozen=True)
 class CodexAgentProvider:
-  model: str
+  model: str = "codex-default-high"
   codex_binary: str = "codex"
   timeout_seconds: int = CODEX_TIMEOUT_SECONDS
 
@@ -128,8 +129,12 @@ class CodexAgentProvider:
     cmd = [
       self.codex_binary,
       "exec",
-      "--model",
-      self.model,
+    ]
+    if self.model in DEFAULT_CODEX_MODEL_ALIASES:
+      cmd.extend(["-c", 'model_reasoning_effort="high"'])
+    else:
+      cmd.extend(["--model", self.model])
+    cmd.extend([
       "--sandbox",
       "read-only",
       "--cd",
@@ -138,7 +143,7 @@ class CodexAgentProvider:
       "--color",
       "never",
       "-",
-    ]
+    ])
     if json_output:
       cmd.insert(-1, "--json")
     for root in request.roots[1:]:

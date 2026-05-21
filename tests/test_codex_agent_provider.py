@@ -21,13 +21,13 @@ async def test_run_invokes_codex_exec_read_only_with_output_file(tmp_path: Path)
     output_path.write_text("final answer", encoding="utf-8")
     return subprocess.CompletedProcess(cmd, 0, stdout='{"type":"done"}\n', stderr="")
 
-  provider = CodexAgentProvider(model="gpt-5.5-high")
+  provider = CodexAgentProvider(model="openai/gpt-test")
   with patch("subprocess.run", side_effect=fake_run) as mock_run:
     result = await provider.run(_request(tmp_path))
 
   cmd = mock_run.call_args.args[0]
   assert cmd[:2] == ["codex", "exec"]
-  assert ["--model", "gpt-5.5-high"] == cmd[2:4]
+  assert ["--model", "openai/gpt-test"] == cmd[2:4]
   assert "--json" in cmd
   assert ["--sandbox", "read-only"] == cmd[cmd.index("--sandbox"):cmd.index("--sandbox") + 2]
   assert ["--cd", str(tmp_path.resolve())] == cmd[cmd.index("--cd"):cmd.index("--cd") + 2]
@@ -35,6 +35,21 @@ async def test_run_invokes_codex_exec_read_only_with_output_file(tmp_path: Path)
   assert "Find the thesis" in mock_run.call_args.kwargs["input"]
   assert result.text == "final answer"
   assert result.raw_events[0].provider == "codex"
+
+
+@pytest.mark.asyncio
+async def test_default_high_alias_uses_account_default_model_with_high_effort(tmp_path: Path):
+  def fake_run(cmd, *, input, capture_output, text, timeout, cwd):
+    Path(cmd[cmd.index("--output-last-message") + 1]).write_text("ok", encoding="utf-8")
+    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+  provider = CodexAgentProvider(model="gpt-5.5-high")
+  with patch("subprocess.run", side_effect=fake_run) as mock_run:
+    await provider.run(_request(tmp_path))
+
+  cmd = mock_run.call_args.args[0]
+  assert "--model" not in cmd
+  assert ["-c", 'model_reasoning_effort="high"'] == cmd[2:4]
 
 
 @pytest.mark.asyncio
