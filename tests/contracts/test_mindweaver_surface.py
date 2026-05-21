@@ -22,7 +22,7 @@ from merceka_core import (
   RawProviderEvent,
   gpu_lock,
 )
-from merceka_core.agents import ClaudeCodeAgentProvider
+from merceka_core.agents import ClaudeCodeAgentProvider, CodexAgentProvider
 from merceka_core.llm import LLM
 
 
@@ -98,3 +98,9 @@ def test_claude_code_agent_provider_is_public_for_mindweaver():
   provider = ClaudeCodeAgentProvider(model="sonnet")
 
   assert provider.model == "sonnet"
+
+
+def test_codex_agent_provider_is_public_for_mindweaver():
+  provider = CodexAgentProvider(model="gpt-5.5-high")
+
+  assert provider.model == "gpt-5.5-high"
