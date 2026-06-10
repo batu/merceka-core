@@ -384,8 +384,10 @@ class LLM:
     self.max_tool_rounds = max_tool_rounds
     self.fallback = fallback
     self.use_claude = model_name.startswith("claude/")
+    self.use_codex = model_name.startswith("codex/")
     self.use_gemini = model_name.startswith("gemini/")
-    self.use_openrouter = not self.use_claude and not self.use_gemini and "openrouter" in model_name
+    self.use_openrouter = (not self.use_claude and not self.use_codex
+                           and not self.use_gemini and "openrouter" in model_name)
     self.add_dirs = add_dirs or []
     self.allowed_tools = allowed_tools or []
 
@@ -404,7 +406,8 @@ class LLM:
           self._tool_schemas.append(schema)
           self._tool_handlers[tool.__name__] = tool
 
-    if not self.use_openrouter and not self.use_claude and not self.use_gemini:
+    if (not self.use_openrouter and not self.use_claude and not self.use_codex
+        and not self.use_gemini):
       self._verify()
 
   def generate(self, message: str, **kwargs) -> str | OutputSchema:
@@ -436,6 +439,8 @@ class LLM:
       return fb.generate(message, **kwargs)
     if self.use_claude:
       return self._claude_call(message, **kwargs)
+    if self.use_codex:
+      return self._codex_call(message, **kwargs)
     if self._tool_schemas:
       text, _ = self._run_tool_loop(messages, **kwargs)
       return text
@@ -941,6 +946,42 @@ class LLM:
 
     content = result.stdout.strip()
     return self._parse_response(content)
+
+  def _codex_call(self, message: str, **kwargs) -> str | OutputSchema:
+    """Call OpenAI Codex CLI via subprocess (`codex exec`).
+
+    Runs on the Codex subscription (ChatGPT auth), not API billing.
+    Supports vision via kwargs["images"] (list of file paths, passed as
+    -i flags). The model alias after "codex/" is passed as -m; use
+    "codex/default" to use the user's configured default model.
+    No structured-output support — ask for JSON in the prompt and parse
+    the response yourself (same approach as the Claude CLI provider).
+    """
+    model_alias = self.model_name.removeprefix("codex/")
+    cmd = ["codex", "exec", "--ephemeral", "-s", "read-only",
+           "--skip-git-repo-check", "--color", "never"]
+    if model_alias and model_alias != "default":
+      cmd.extend(["-m", model_alias])
+    for img in kwargs.get("images", []) or []:
+      cmd.extend(["-i", str(img)])
+    cmd.append("-")  # prompt from stdin
+
+    # codex exec has no --system-prompt flag; prepend it to the message
+    prompt = f"{self.system_prompt}\n\n{message}" if self.system_prompt else message
+
+    timeout = kwargs.get("timeout", CLAUDE_CLI_TIMEOUT)
+    result = subprocess.run(
+      cmd,
+      input=prompt,
+      capture_output=True,
+      text=True,
+      timeout=timeout,
+    )
+    if result.returncode != 0:
+      raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
+
+    # codex exec writes log/session lines to stderr; stdout is the final message
+    return self._parse_response(result.stdout.strip())
 
   def _claude_stream(self, message: str, **kwargs):
     """Stream tokens from Claude CLI via Popen + stream-json.
