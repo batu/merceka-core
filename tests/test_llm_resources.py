@@ -104,7 +104,7 @@ class TestLLMGenerateWithResource:
     test_file = tmp_path / "test.png"
     test_file.write_bytes(b"fake")
     
-    llm = LLM("gemma3:27b")
+    llm = LLM("gemma4:26b")
     
     with pytest.raises(ValueError, match="only works with cloud models"):
       llm.generate_with_resource("test", test_file)
