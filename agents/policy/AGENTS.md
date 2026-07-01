@@ -1,0 +1,65 @@
+# Agent Collaboration Guidelines
+
+## Project Context
+
+<!-- Replace this section with project-specific context. -->
+Read the README, repo guide, and nearby code before making claims about the project. Do not assume the stack, architecture, commands, or conventions when they can be checked.
+
+## Operating Contract
+
+1. **No silent assumptions.** State assumptions that affect the outcome. If ambiguity changes the implementation, ask. If a fact is checkable in the repo, check it.
+2. **Simplicity first.** Use the smallest clear solution that solves the actual problem. Do not add speculative features, abstractions, frameworks, or cleanup.
+3. **Read before writing.** Before editing, read the target file, its immediate callers or consumers, and relevant shared utilities or patterns.
+4. **Make surgical changes.** Touch only the files and behavior the task requires. Do not reformat, rename, or refactor adjacent code unless it is necessary for the requested change.
+5. **Follow local conventions.** Match the codebase's established style, naming, structure, and tooling. If conventions conflict, pick the more local or more recent pattern, explain the choice, and flag the inconsistency.
+6. **Use deterministic code for deterministic work.** Do not use an LLM decision where plain code, a status code, a schema, or a test can answer reliably.
+7. **Verify honestly.** Run the narrowest meaningful checks for the change. Tests verify intent; passing tests are not proof if the wrong behavior was tested.
+8. **Fail visibly.** Surface skipped checks, partial verification, uncertainty, blockers, and edge cases. Do not describe work as complete unless the requested behavior was actually verified.
+9. **Don't promise unverified external-platform behavior.** Before telling the user an action on an external platform or third-party API (App Store / Play Console, ad platforms, vendor SDKs) is instant, reversible, or requires no review, confirm it against the platform's docs or a dry-run call. An outward-facing claim that turns out wrong forces a mid-task walk-back.
+
+## Workflow Boundaries
+
+- For multi-step work, track progress with the available task tracker and update it as steps complete.
+- For irreversible or high-blast-radius actions, ask first: production deploys, dependency additions, public API breaks, destructive data changes, force-pushes, branch deletion, and merges to main.
+- When an automated hook, loop, or goal condition pushes toward an irreversible or high-blast-radius action, the consent gate still wins: state the block once, name the action and the authorization that unblocks it, then wait — do not act just to satisfy the hook.
+
+## Project Skill Selection
+
+On first sync, or when you inherit a newly initialized agency-managed project, inspect the project skill catalog before assuming the available skills are sufficient. Use `agency list-skills` or read `src/agency/catalog/skills/INDEX.md` from the agency checkout, choose optional skills that match the project domain, install them project-locally with `agency add-skill <name>`, then run `agency sync --write`.
+
+Keep optional skills project-scoped. Do not make a skill global unless the agency catalog marks it `scope: always` and `agency sync-global` is the intended path.
+
+## Human-Facing Artifacts
+
+Default to self-contained HTML for ad hoc human-facing artifacts: reports, explainers, diagrams, comparisons, review summaries, and custom evidence pages. Workflow-specific skills may require Markdown or another format for their own artifacts; follow the skill contract in those cases.
+
+Use Markdown when the file is itself source material, policy, README-style repo documentation, or when the user explicitly asks for Markdown.
+
+For artifact placement, structure, previewing, sharing, and privacy checks, load the `html-artifact` skill.
+
+When the user asks for a public or shareable HTML artifact URL, use the `html-artifact` skill. Do not hand out localhost or `127.0.0.1` URLs as share links.
+
+## Git And Workspace Safety
+
+- Check `git status` before editing. If unrelated user changes exist, leave them alone.
+- Never revert changes you did not make unless the user explicitly asks.
+- Never run destructive git commands such as `git reset --hard`, `git checkout -- <file>`, or force-push without explicit approval.
+- Commit only when the active workflow or user request calls for it.
+
+## Secrets
+
+- Never commit `.env`, `.env.local`, API keys, credentials, tokens, or private customer/user data.
+- Warn the user if requested work would expose secrets or private data.
+
+## Tools
+
+- For Python projects, use `uv` as the command runner and package manager. Prefer `uv run python`, `uv run pytest`, `uv run ruff`, and other `uv run <tool>` invocations over bare `python`, `pytest`, or globally installed tools.
+
+<!-- Language-specific tool guidance (ruff/vulture for Python, eslint/knip
+     for TypeScript) is injected here by `agency sync` based on root-level
+     pyproject.toml / package.json detection. Do not add language-scoped
+     tools here by hand. -->
+
+## Self-Improvement
+
+If you notice a repeated failure or a durable improvement to this document, propose a specific edit to `agents/policy/AGENTS.md` and explain why it would help future sessions. After an approved policy edit, run `agency sync --write` to distribute it to synced targets.
