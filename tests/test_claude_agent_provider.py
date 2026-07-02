@@ -7,7 +7,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from merceka_core.agent import AgentComplete, AgentRawProviderEvent, AgentRequest, AgentTextDelta, ProviderFailure
+from merceka_core.agent import (
+  AgentComplete,
+  AgentProfile,
+  AgentRawProviderEvent,
+  AgentRequest,
+  AgentTextDelta,
+  ProviderFailure,
+)
 from merceka_core.agents.claude_code import ClaudeCodeAgentProvider
 
 
@@ -45,6 +52,62 @@ async def test_claude_agent_run_builds_read_only_command(tmp_path: Path):
   assert mock_run.call_args.kwargs["env"]["ANTHROPIC_API_KEY"] == ""
   assert result.text == "Answer"
   assert result.raw_events[0].provider == "claude_code"
+
+
+@pytest.mark.asyncio
+async def test_claude_agent_run_builds_write_command(tmp_path: Path):
+  provider = ClaudeCodeAgentProvider(model="sonnet")
+  request = AgentRequest(
+    message="Edit the file",
+    system_prompt="You may write.",
+    roots=(tmp_path,),
+    profile=AgentProfile.WRITE,
+  )
+
+  with patch("subprocess.run") as mock_run:
+    mock_run.return_value = MagicMock(returncode=0, stdout="Done\n", stderr="")
+    await provider.run(request)
+
+  cmd = mock_run.call_args.args[0]
+  assert cmd == [
+    "claude",
+    "-p",
+    "--model",
+    "sonnet",
+    "--permission-mode",
+    "acceptEdits",
+    "--system-prompt",
+    "You may write.",
+    "--add-dir",
+    str(tmp_path),
+    "--allowedTools",
+    "Read,Grep,Glob,Edit,Write,Bash",
+  ]
+
+
+@pytest.mark.asyncio
+async def test_claude_read_only_command_is_unchanged(tmp_path: Path):
+  """Regression guard: READ_ONLY must assemble the exact historical command line."""
+  provider = ClaudeCodeAgentProvider(model="sonnet")
+
+  with patch("subprocess.run") as mock_run:
+    mock_run.return_value = MagicMock(returncode=0, stdout="Answer\n", stderr="")
+    await provider.run(_request(tmp_path))
+
+  cmd = mock_run.call_args.args[0]
+  assert "--permission-mode" not in cmd
+  assert cmd == [
+    "claude",
+    "-p",
+    "--model",
+    "sonnet",
+    "--system-prompt",
+    "Read before answering.",
+    "--add-dir",
+    str(tmp_path),
+    "--allowedTools",
+    "Read,Grep,Glob",
+  ]
 
 
 @pytest.mark.asyncio

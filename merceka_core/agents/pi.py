@@ -3,10 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
-import tempfile
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from merceka_core.agent import (
@@ -21,16 +19,18 @@ from merceka_core.agent import (
   RawProviderEvent,
 )
 
-CODEX_PROVIDER = "codex"
-CODEX_TIMEOUT_SECONDS = 300
-DEFAULT_CODEX_MODEL_ALIASES = {"", "default", "codex-default", "codex-default-high", "gpt-5.5-high"}
+PI_PROVIDER = "pi"
+PI_TIMEOUT_SECONDS = 300
+READ_ONLY_TOOLS = ("read", "grep", "find", "ls")
+WRITE_TOOLS = ("read", "grep", "find", "ls", "bash", "edit", "write")
 
 
 @dataclass(frozen=True)
-class CodexAgentProvider:
-  model: str = "codex-default-high"
-  codex_binary: str = "codex"
-  timeout_seconds: int = CODEX_TIMEOUT_SECONDS
+class PiAgentProvider:
+  model: str = "gemini-flash-latest"
+  provider: str | None = None
+  pi_binary: str = "pi"
+  timeout_seconds: int = PI_TIMEOUT_SECONDS
 
   async def run(self, request: AgentRequest) -> AgentResult:
     return await asyncio.to_thread(self._run_sync, request)
@@ -39,38 +39,32 @@ class CodexAgentProvider:
     return self._stream(request)
 
   def _run_sync(self, request: AgentRequest) -> AgentResult:
-    with tempfile.NamedTemporaryFile("r", encoding="utf-8", delete=False) as output_file:
-      output_path = Path(output_file.name)
-    try:
-      cmd = self._command(request, json_output=True)
-      cmd.extend(["--output-last-message", str(output_path)])
-      result = subprocess.run(
-        cmd,
-        input=self._prompt(request),
-        capture_output=True,
-        text=True,
-        timeout=self.timeout_seconds,
-        cwd=str(request.roots[0]),
+    cmd = self._command(request)
+    result = subprocess.run(
+      cmd,
+      input=self._prompt(request),
+      capture_output=True,
+      text=True,
+      timeout=self.timeout_seconds,
+      cwd=str(request.roots[0]),
+    )
+    raw_events = tuple(self._raw_events_from_stdout(result.stdout))
+    if result.returncode != 0:
+      message = result.stderr.strip() or result.stdout.strip() or "unknown provider error"
+      raise ProviderFailure(f"Pi failed with exit {result.returncode}: {message}")
+    text = self._final_text(raw_events)
+    if not raw_events:
+      raw_events = (
+        RawProviderEvent(
+          provider=PI_PROVIDER,
+          event_type="result",
+          payload={"stdout": result.stdout, "stderr": result.stderr, "returncode": result.returncode},
+        ),
       )
-      raw_events = tuple(self._raw_events_from_stdout(result.stdout))
-      if result.returncode != 0:
-        message = result.stderr.strip() or result.stdout.strip() or "unknown provider error"
-        raise ProviderFailure(f"Codex failed with exit {result.returncode}: {message}")
-      text = output_path.read_text(encoding="utf-8").strip()
-      if not raw_events:
-        raw_events = (
-          RawProviderEvent(
-            provider=CODEX_PROVIDER,
-            event_type="result",
-            payload={"stdout": result.stdout, "stderr": result.stderr, "returncode": result.returncode},
-          ),
-        )
-      return AgentResult(text=text, raw_events=raw_events)
-    finally:
-      output_path.unlink(missing_ok=True)
+    return AgentResult(text=text, raw_events=raw_events)
 
   async def _stream(self, request: AgentRequest) -> AsyncIterator[AgentStreamEvent]:
-    cmd = self._command(request, json_output=True)
+    cmd = self._command(request)
     process = subprocess.Popen(
       cmd,
       stdin=subprocess.PIPE,
@@ -81,7 +75,7 @@ class CodexAgentProvider:
       cwd=str(request.roots[0]),
     )
     if process.stdin is None or process.stdout is None or process.stderr is None:
-      raise ProviderFailure("Codex stream did not expose stdio pipes")
+      raise ProviderFailure("Pi stream did not expose stdio pipes")
 
     process.stdin.write(self._prompt(request))
     process.stdin.close()
@@ -112,8 +106,9 @@ class CodexAgentProvider:
       stderr = await asyncio.to_thread(process.stderr.read)
       if returncode != 0:
         message = stderr.strip() or f"exit {returncode}"
-        raise ProviderFailure(f"Codex stream failed with exit {returncode}: {message}")
-      yield AgentComplete(result=AgentResult(text="".join(text_chunks), raw_events=tuple(raw_events)))
+        raise ProviderFailure(f"Pi stream failed with exit {returncode}: {message}")
+      text = self._final_text(tuple(raw_events)) or "".join(text_chunks)
+      yield AgentComplete(result=AgentResult(text=text, raw_events=tuple(raw_events)))
     except GeneratorExit:
       self._terminate_process(process)
       raise
@@ -126,31 +121,12 @@ class CodexAgentProvider:
       self._close_pipe(process.stdout)
       self._close_pipe(process.stderr)
 
-  def _command(self, request: AgentRequest, *, json_output: bool) -> list[str]:
-    cmd = [
-      self.codex_binary,
-      "exec",
-    ]
-    if self.model in DEFAULT_CODEX_MODEL_ALIASES:
-      cmd.extend(["-c", 'model_reasoning_effort="high"'])
-    else:
-      cmd.extend(["--model", self.model])
-    sandbox = "workspace-write" if request.profile == AgentProfile.WRITE else "read-only"
-    cmd.extend([
-      "--sandbox",
-      sandbox,
-      "--cd",
-      str(request.roots[0]),
-      "--skip-git-repo-check",
-      "--color",
-      "never",
-      "-",
-    ])
-    if json_output:
-      cmd.insert(-1, "--json")
-    for root in request.roots[1:]:
-      cmd.insert(-1, str(root))
-      cmd.insert(-2, "--add-dir")
+  def _command(self, request: AgentRequest) -> list[str]:
+    cmd = [self.pi_binary, "-p", "--mode", "json", "--no-session", "--model", self.model]
+    if self.provider:
+      cmd.extend(["--provider", self.provider])
+    tools = WRITE_TOOLS if request.profile == AgentProfile.WRITE else READ_ONLY_TOOLS
+    cmd.extend(["--tools", ",".join(tools)])
     return cmd
 
   def _prompt(self, request: AgentRequest) -> str:
@@ -178,24 +154,35 @@ class CodexAgentProvider:
       payload: Any = json.loads(line)
     except json.JSONDecodeError as exc:
       return RawProviderEvent(
-        provider=CODEX_PROVIDER,
+        provider=PI_PROVIDER,
         event_type="malformed_json",
         payload={"line": line, "error": str(exc)},
       )
     event_type = str(payload.get("type", "raw")) if isinstance(payload, dict) else "raw"
-    return RawProviderEvent(provider=CODEX_PROVIDER, event_type=event_type, payload=payload)
+    return RawProviderEvent(provider=PI_PROVIDER, event_type=event_type, payload=payload)
 
   def _text_delta_from_payload(self, payload: dict[str, Any]) -> str | None:
-    for key in ("delta", "text", "message", "content"):
-      value = payload.get(key)
-      if isinstance(value, str) and value:
-        return value
-    message = payload.get("message")
-    if isinstance(message, dict):
-      content = message.get("content")
-      if isinstance(content, str) and content:
-        return content
+    event_type = payload.get("type")
+    if isinstance(event_type, str) and event_type.endswith((".output_text.delta", "message_delta")):
+      delta = payload.get("delta")
+      if isinstance(delta, str) and delta:
+        return delta
     return None
+
+  def _final_text(self, raw_events: tuple[RawProviderEvent, ...]) -> str:
+    final = ""
+    chunks: list[str] = []
+    for event in raw_events:
+      payload = event.payload
+      if not isinstance(payload, dict):
+        continue
+      text = self._text_delta_from_payload(payload)
+      if text is not None:
+        chunks.append(text)
+      candidate = payload.get("final_text")
+      if isinstance(candidate, str) and candidate:
+        final = candidate
+    return final or "".join(chunks)
 
   def _terminate_process(self, process: subprocess.Popen[str]) -> None:
     process.terminate()
