@@ -59,3 +59,17 @@ class TestLazyImportStaysLight:
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "light"
+
+  def test_touching_agent_provider_stays_light(self):
+    """Lazy provider access must not pull the LLM stack either."""
+    code = (
+      "import sys; import merceka_core; merceka_core.PiAgentProvider; "
+      "heavy = [m for m in ('litellm', 'ollama', 'google.genai', "
+      "'merceka_core.llm') if m in sys.modules]; "
+      "assert not heavy, f'heavy modules loaded: {heavy}'; print('light')"
+    )
+    result = subprocess.run(
+      [sys.executable, "-c", code], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "light"
