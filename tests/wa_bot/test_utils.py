@@ -5,7 +5,6 @@ Tests:
 - normalize_command(): Text normalization for command matching
 """
 
-import pytest
 
 from merceka_core.wa_bot import redact, normalize_command
 

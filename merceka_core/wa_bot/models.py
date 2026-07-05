@@ -20,7 +20,7 @@ Usage:
         url = await client.get_media_url(msg.image_id)
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass

@@ -1,6 +1,5 @@
 """Tests for the Claude CLI provider and auto-cascade fallback."""
 
-import os
 import subprocess
 import pytest
 from unittest.mock import patch, MagicMock
@@ -10,7 +9,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from merceka_core.llm import LLM, CLAUDE_CLI_TIMEOUT, create_message
+from merceka_core.llm import LLM, CLAUDE_CLI_TIMEOUT
 
 
 # --- Provider Detection ---
@@ -175,7 +174,7 @@ class TestClaudeToolsDelegation:
                        system_prompt="test", tools=[search])
 
         # Should use fallback's tool loop, not Claude CLI
-        with patch.object(LLM, '_run_tool_loop', return_value=("searched", [])) as mock_loop:
+        with patch.object(LLM, '_run_tool_loop', return_value=("searched", [])):
             with patch.object(LLM, '_verify'):
                 result = llm.generate("find something")
 

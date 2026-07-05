@@ -8,7 +8,6 @@ These tests use monkeypatch to manipulate environment variables,
 ensuring isolation between tests.
 """
 
-import pytest
 
 
 class TestGetMode:

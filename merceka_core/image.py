@@ -5,8 +5,6 @@ __all__ = [
   "edit_image",
   "inpaint",
   "upscale_image",
-  "generate_image_stream",
-  "edit_image_stream",
 ]
 
 import base64
