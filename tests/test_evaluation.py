@@ -229,8 +229,13 @@ class TestSuccessRate:
     assert results.success_rate == pytest.approx(200 / 3)
 
   def test_non_bool_values_ignored(self):
+    # Mix of truthy AND falsy non-bools: a truthy-counting mutant would
+    # include 0 / "" in the denominator and fail this assertion.
     results = ExperimentResults(
-      results=[_result(success=True), _result(success="yes"), _result(success=0.5)],
+      results=[
+        _result(success=True), _result(success="yes"), _result(success=0.5),
+        _result(success=0), _result(success=""),
+      ],
       experiment_name="exp",
     )
     assert results.success_rate == 100.0
@@ -270,10 +275,12 @@ class TestRunExperiment:
     )
 
     assert len(results) == 4
-    assert calls == [
+    # Iteration order is not contract — assert the full grid was covered.
+    expected = [
       ("t1", {"lr": 0.1}), ("t1", {"lr": 0.01}),
       ("t2", {"lr": 0.1}), ("t2", {"lr": 0.01}),
     ]
+    assert sorted(calls, key=repr) == sorted(expected, key=repr)
     assert results.task_names == {"t1", "t2"}
     assert results.config_names == {"lr_0.1", "lr_0.01"}
     assert results.success_rate == 100.0

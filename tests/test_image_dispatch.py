@@ -37,21 +37,28 @@ def _openrouter_body():
 
 
 class FakeResponse:
-  def __init__(self, status_code=200, body=None, text=""):
+  def __init__(self, status_code=200, body=None, text="", content=b""):
     self.status_code = status_code
     self._body = body or {}
     self.text = text
+    self.content = content
 
   def json(self):
     return self._body
 
+  def raise_for_status(self):
+    if self.status_code != 200:
+      raise RuntimeError(f"HTTP {self.status_code}")
+
 
 class FakeHttpx:
-  """Stands in for httpx.Client; records every post."""
+  """Stands in for httpx.Client; records every post and get."""
 
-  def __init__(self, response: FakeResponse):
+  def __init__(self, response: FakeResponse, get_response: FakeResponse | None = None):
     self.response = response
+    self.get_response = get_response
     self.posts = []
+    self.gets = []
 
   def factory(self, **kwargs):
     return self
@@ -66,6 +73,11 @@ class FakeHttpx:
     self.posts.append((url, kwargs))
     return self.response
 
+  def get(self, url, **kwargs):
+    self.gets.append(url)
+    assert self.get_response is not None, f"unexpected GET {url}"
+    return self.get_response
+
 
 @pytest.fixture
 def api_keys(monkeypatch):
@@ -75,10 +87,10 @@ def api_keys(monkeypatch):
 
 @pytest.fixture
 def fake_post(monkeypatch, api_keys):
-  """Install a FakeHttpx serving `response` and return it."""
+  """Install a FakeHttpx serving `response` (and optionally GETs) and return it."""
 
-  def install(response: FakeResponse) -> FakeHttpx:
-    fake = FakeHttpx(response)
+  def install(response: FakeResponse, get_response: FakeResponse | None = None) -> FakeHttpx:
+    fake = FakeHttpx(response, get_response=get_response)
     monkeypatch.setattr(image_module.httpx, "Client", fake.factory)
     return fake
 
@@ -112,6 +124,27 @@ class TestGenerateImageDispatch:
     assert kwargs["json"]["model"] == "google/gemini-3.1-flash-image-preview"
     assert kwargs["json"]["modalities"] == ["image", "text"]
     assert kwargs["headers"]["Authorization"] == "Bearer sk-or-test"
+
+  def test_openai_url_response_fetched_via_get(self, fake_post):
+    # OpenAI sometimes returns a hosted URL instead of b64_json: the code
+    # must issue a second GET and decode those bytes into the image.
+    png_bytes = base64.b64decode(_png_b64())
+    fake = fake_post(
+      FakeResponse(body={"data": [{"url": "https://img.test/out.png"}]}),
+      get_response=FakeResponse(content=png_bytes),
+    )
+
+    result = generate_image("a red square", model="openai/gpt-image-2")
+
+    assert result.mode == "RGB"
+    assert result.size == (1, 1)
+    assert fake.gets == ["https://img.test/out.png"]
+
+  def test_openai_response_without_image_raises(self, fake_post):
+    fake_post(FakeResponse(body={"data": [{}]}))
+
+    with pytest.raises(RuntimeError, match="No image in OpenAI response"):
+      generate_image("x", model="openai/gpt-image-2")
 
   def test_openai_error_status_propagates(self, fake_post):
     fake_post(FakeResponse(status_code=500, text="server exploded"))

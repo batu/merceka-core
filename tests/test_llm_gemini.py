@@ -22,6 +22,7 @@ from merceka_core.llm_gemini import (
   _gemini_poll_until_active,
   _gemini_video_call,
 )
+from merceka_core.retry import _RETRY_MAX_ATTEMPTS
 
 
 def _file_obj(name="files/vid1", state="PROCESSING"):
@@ -189,6 +190,44 @@ class TestGeminiVideoCall:
     assert call["contents"][-1] == "what happens?"
     assert client.files.deleted == [f"files/{video}"]
 
+  def test_config_kwargs_forwarded_to_generate_content(self, clock, monkeypatch, video):
+    # Pins the `gc_kwargs["config"] = config` seam: with max_tokens and a
+    # system prompt set, _build_video_config yields a real config object
+    # that MUST ride on the generate_content call.
+    models = FakeModels([SimpleNamespace(text="configured")])
+    client = FakeClient(models=models)
+    monkeypatch.setattr(llm_gemini, "_gemini_client", lambda: client)
+    llm = FakeLLM()
+    llm.system_prompt = "answer tersely"
+
+    result = _gemini_video_call(
+      llm, "what happens?", video, timeout_s=10, poll_interval_s=1, max_tokens=256,
+    )
+
+    assert result == "parsed:configured"
+    config = models.calls[0]["config"]
+    assert config.max_output_tokens == 256
+    assert config.system_instruction == "answer tersely"
+
+  def test_multiple_videos_all_uploaded_and_deleted(self, clock, monkeypatch, tmp_path):
+    first = tmp_path / "a.mp4"
+    second = tmp_path / "b.mp4"
+    first.write_bytes(b"a")
+    second.write_bytes(b"b")
+    models = FakeModels([SimpleNamespace(text="two clips")])
+    client = FakeClient(models=models)
+    monkeypatch.setattr(llm_gemini, "_gemini_client", lambda: client)
+
+    result = _gemini_video_call(
+      FakeLLM(), "compare them", [first, second], timeout_s=10, poll_interval_s=1,
+    )
+
+    assert result == "parsed:two clips"
+    contents = models.calls[0]["contents"]
+    assert [f.name for f in contents[:-1]] == [f"files/{first}", f"files/{second}"]
+    assert contents[-1] == "compare them"
+    assert client.files.deleted == [f"files/{first}", f"files/{second}"]
+
   def test_missing_video_raises_eagerly_before_client(self, monkeypatch, tmp_path):
     def no_client():
       raise AssertionError("client must not be constructed for a missing file")
@@ -235,13 +274,15 @@ class TestGeminiVideoCall:
       exc.status_code = 503
       return exc
 
-    client = FakeClient(models=FakeModels([transient(), transient(), transient()]))
+    outcomes = [transient() for _ in range(_RETRY_MAX_ATTEMPTS)]
+    client = FakeClient(models=FakeModels(outcomes))
     monkeypatch.setattr(llm_gemini, "_gemini_client", lambda: client)
 
     with pytest.raises(VideoBackendError):
       _gemini_video_call(FakeLLM(), "hi", video, timeout_s=10, poll_interval_s=1)
 
-    assert len(clock.sleeps) == 2  # 3 attempts, 2 backoffs
+    # N attempts sleep N-1 backoffs before the final attempt raises.
+    assert len(clock.sleeps) == _RETRY_MAX_ATTEMPTS - 1
     assert client.files.deleted == [f"files/{video}"]
 
 
