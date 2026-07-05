@@ -70,7 +70,7 @@ class TestGeminiImageCall:
     assert part.inline_data.data == b"\x89PNG fakebytes"
     assert call["config"].system_instruction == "be terse"
 
-  def test_output_schema_parsed(self, monkeypatch, png):
+  def test_output_schema_parsed_and_enforced_at_api_level(self, monkeypatch, png):
     class Label(OutputSchema):
       label: str = Field(description="object label")
 
@@ -78,7 +78,24 @@ class TestGeminiImageCall:
     llm = LLM("gemini/gemini-flash-latest", output_schema=Label)
     out = llm.generate_with_resource("label it", png)
     assert isinstance(out, Label) and out.label == "arrow"
-    assert models.calls  # went through the fake, not a real network call
+    config = models.calls[0]["config"]
+    assert config.response_mime_type == "application/json"
+    assert config.response_schema is Label
+
+  def test_empty_response_with_schema_raises_backend_error(self, monkeypatch, png):
+    class Label(OutputSchema):
+      label: str = Field(description="object label")
+
+    install_client(monkeypatch, [FakeResponse(None)])
+    llm = LLM("gemini/gemini-flash-latest", output_schema=Label)
+    with pytest.raises(VideoBackendError, match="empty response"):
+      llm.generate_with_resource("label it", png)
+
+  def test_unknown_kwargs_forwarded_not_swallowed(self, monkeypatch, png):
+    """Video-path parity: unrecognized kwargs reach generate_content."""
+    models = install_client(monkeypatch, [FakeResponse("ok")])
+    LLM("gemini/gemini-flash-latest").generate_with_resource("hi", png, seed=42)
+    assert models.calls[0]["seed"] == 42
 
   def test_missing_file_raises_before_client(self, monkeypatch, tmp_path):
     def boom():

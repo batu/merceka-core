@@ -195,6 +195,11 @@ def _gemini_image_call(llm, message: str, resource_path, **kwargs):
     mime_type = _IMAGE_MIME_FALLBACK.get(path.suffix.lower(), "application/octet-stream")
 
   model = llm.model_name.removeprefix("gemini/")
+  # Enforce structured output at the API level (parity with the OpenRouter
+  # and Ollama branches of generate_with_resource, which send a JSON schema).
+  if llm.output_schema is not None:
+    kwargs.setdefault("response_mime_type", "application/json")
+    kwargs.setdefault("response_schema", llm.output_schema)
   config, remaining_kwargs = _build_video_config(system_prompt=llm.system_prompt, **kwargs)
   part = types.Part.from_bytes(data=path.read_bytes(), mime_type=mime_type)
 
@@ -202,7 +207,8 @@ def _gemini_image_call(llm, message: str, resource_path, **kwargs):
   response = None
   for attempt in range(_RETRY_MAX_ATTEMPTS):
     try:
-      gc_kwargs: dict = {"model": model, "contents": [part, message]}
+      # Unknown kwargs reach generate_content and fail loudly (video-path parity).
+      gc_kwargs: dict = {"model": model, "contents": [part, message], **remaining_kwargs}
       if config is not None:
         gc_kwargs["config"] = config
       response = client.models.generate_content(**gc_kwargs)
@@ -219,6 +225,11 @@ def _gemini_image_call(llm, message: str, resource_path, **kwargs):
       time.sleep(delay)
 
   text = getattr(response, "text", None) or ""
+  if not text and llm.output_schema is not None:
+    # Blocked/empty response would surface as a confusing ValidationError.
+    raise VideoBackendError(
+      "Gemini image call returned an empty response (safety-filtered or "
+      "truncated) — cannot parse into the requested output_schema.")
   return llm._parse_response(text)
 
 
