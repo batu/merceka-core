@@ -10,6 +10,7 @@ from typing import Any
 
 from merceka_core.agent import (
   AgentComplete,
+  AgentProfile,
   AgentRawProviderEvent,
   AgentRequest,
   AgentResult,
@@ -22,6 +23,7 @@ from merceka_core.agent import (
 CLAUDE_CODE_PROVIDER = "claude_code"
 CLAUDE_CODE_TIMEOUT_SECONDS = 120
 READ_ONLY_TOOLS = ("Read", "Grep", "Glob")
+WRITE_TOOLS = ("Read", "Grep", "Glob", "Edit", "Write", "Bash")
 
 
 @dataclass(frozen=True)
@@ -143,11 +145,14 @@ class ClaudeCodeAgentProvider:
         "--verbose",
         "--include-partial-messages",
       ])
+    if request.profile == AgentProfile.WRITE:
+      cmd.extend(["--permission-mode", "acceptEdits"])
     if request.system_prompt:
       cmd.extend(["--system-prompt", request.system_prompt])
     for root in request.roots:
       cmd.extend(["--add-dir", str(root)])
-    cmd.extend(["--allowedTools", ",".join(READ_ONLY_TOOLS)])
+    tools = WRITE_TOOLS if request.profile == AgentProfile.WRITE else READ_ONLY_TOOLS
+    cmd.extend(["--allowedTools", ",".join(tools)])
     return cmd
 
   def _raw_event_from_line(self, line: str) -> RawProviderEvent:

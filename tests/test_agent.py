@@ -85,6 +85,34 @@ async def test_agent_stream_yields_text_raw_events_and_completion(tmp_path: Path
   assert events == provider.stream_events
 
 
+def test_agent_request_accepts_write_profile(tmp_path: Path):
+  request = AgentRequest(
+    message="Edit the file",
+    system_prompt="You may write.",
+    roots=(tmp_path,),
+    profile=AgentProfile.WRITE,
+  )
+
+  assert request.profile is AgentProfile.WRITE
+
+
+def test_agent_request_accepts_write_profile_as_string(tmp_path: Path):
+  request = AgentRequest(
+    message="Edit the file",
+    system_prompt="You may write.",
+    roots=(tmp_path,),
+    profile="write",
+  )
+
+  assert request.profile is AgentProfile.WRITE
+
+
+def test_agent_request_defaults_to_read_only(tmp_path: Path):
+  request = AgentRequest(message="Q", system_prompt="P", roots=(tmp_path,))
+
+  assert request.profile is AgentProfile.READ_ONLY
+
+
 def test_agent_request_rejects_unsupported_profile(tmp_path: Path):
   with pytest.raises(ValueError, match="Unsupported agent profile"):
     AgentRequest(

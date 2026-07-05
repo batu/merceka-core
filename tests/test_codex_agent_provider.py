@@ -5,7 +5,14 @@ from unittest.mock import patch
 
 import pytest
 
-from merceka_core.agent import AgentComplete, AgentRawProviderEvent, AgentRequest, AgentTextDelta, ProviderFailure
+from merceka_core.agent import (
+  AgentComplete,
+  AgentProfile,
+  AgentRawProviderEvent,
+  AgentRequest,
+  AgentTextDelta,
+  ProviderFailure,
+)
 from merceka_core.agents.codex import CodexAgentProvider
 
 
@@ -14,8 +21,30 @@ def _request(root: Path) -> AgentRequest:
 
 
 @pytest.mark.asyncio
+async def test_run_maps_write_profile_to_workspace_write_sandbox(tmp_path: Path):
+  def fake_run(cmd, **kwargs):
+    Path(cmd[cmd.index("--output-last-message") + 1]).write_text("edited", encoding="utf-8")
+    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+  provider = CodexAgentProvider(model="openai/gpt-test")
+  request = AgentRequest(
+    message="Edit the file",
+    system_prompt="You may write.",
+    roots=(tmp_path,),
+    profile=AgentProfile.WRITE,
+  )
+  with patch("subprocess.run", side_effect=fake_run) as mock_run:
+    await provider.run(request)
+
+  cmd = mock_run.call_args.args[0]
+  assert ["--sandbox", "workspace-write"] == cmd[cmd.index("--sandbox"):cmd.index("--sandbox") + 2]
+  assert "read-only" not in cmd
+  assert "write profile" in mock_run.call_args.kwargs["input"]
+
+
+@pytest.mark.asyncio
 async def test_run_invokes_codex_exec_read_only_with_output_file(tmp_path: Path):
-  def fake_run(cmd, *, input, capture_output, text, timeout, cwd):
+  def fake_run(cmd, **kwargs):
     output_path = Path(cmd[cmd.index("--output-last-message") + 1])
     output_path.write_text("final answer", encoding="utf-8")
     return subprocess.CompletedProcess(cmd, 0, stdout='{"type":"done"}\n', stderr="")
@@ -38,7 +67,7 @@ async def test_run_invokes_codex_exec_read_only_with_output_file(tmp_path: Path)
 
 @pytest.mark.asyncio
 async def test_default_high_alias_uses_account_default_model_with_high_effort(tmp_path: Path):
-  def fake_run(cmd, *, input, capture_output, text, timeout, cwd):
+  def fake_run(cmd, **kwargs):
     Path(cmd[cmd.index("--output-last-message") + 1]).write_text("ok", encoding="utf-8")
     return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -58,7 +87,7 @@ async def test_run_adds_secondary_roots(tmp_path: Path):
   first.mkdir()
   second.mkdir()
 
-  def fake_run(cmd, *, input, capture_output, text, timeout, cwd):
+  def fake_run(cmd, **kwargs):
     Path(cmd[cmd.index("--output-last-message") + 1]).write_text("ok", encoding="utf-8")
     return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 

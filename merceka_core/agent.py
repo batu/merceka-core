@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 class AgentProfile(StrEnum):
   READ_ONLY = "read_only"
+  WRITE = "write"
 
 
 class ProviderFailure(RuntimeError):
@@ -37,8 +38,10 @@ class AgentRequest:
   profile: AgentProfile | str = AgentProfile.READ_ONLY
 
   def __post_init__(self) -> None:
-    if self.profile != AgentProfile.READ_ONLY:
-      raise ValueError(f"Unsupported agent profile: {self.profile}")
+    try:
+      profile = AgentProfile(self.profile)
+    except ValueError:
+      raise ValueError(f"Unsupported agent profile: {self.profile}") from None
     if not self.roots:
       raise ValueError("Agent requests require at least one declared root")
 
@@ -49,7 +52,7 @@ class AgentRequest:
       if not root.is_dir():
         raise ValueError(f"Declared agent root is not a directory: {root}")
 
-    object.__setattr__(self, "profile", AgentProfile.READ_ONLY)
+    object.__setattr__(self, "profile", profile)
     object.__setattr__(self, "roots", normalized_roots)
 
 
