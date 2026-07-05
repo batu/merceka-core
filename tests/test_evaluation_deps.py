@@ -2,6 +2,8 @@
 (no GitPython) and the pandas evaluation extra."""
 
 import subprocess
+
+import pytest
 from importlib.metadata import metadata, requires
 
 from merceka_core import evaluation
@@ -10,15 +12,27 @@ from merceka_core.evaluation import get_git_hash
 
 class TestGetGitHash:
   def test_returns_head_sha_in_a_repo(self):
-    expected = subprocess.run(
+    ref = subprocess.run(
       ["git", "rev-parse", "HEAD"], capture_output=True, text=True
-    ).stdout.strip()
+    )
+    if ref.returncode != 0:
+      pytest.skip("test process is not running inside a git repo")
+    expected = ref.stdout.strip()
     assert get_git_hash() == expected
-    assert len(get_git_hash()) == 40  # not "unknown" — the silent-dead bug
+    assert get_git_hash() != "unknown"  # the silent-dead bug
 
   def test_returns_unknown_outside_a_repo(self, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("GIT_DIR", raising=False)
+    monkeypatch.delenv("GIT_WORK_TREE", raising=False)
     assert get_git_hash() == "unknown"
+
+  def test_returns_unknown_on_unborn_head(self, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("GIT_DIR", raising=False)
+    monkeypatch.delenv("GIT_WORK_TREE", raising=False)
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    assert get_git_hash() == "unknown"  # rev-parse exits 128, no commits yet
 
   def test_returns_unknown_when_git_missing(self, monkeypatch):
     def no_git(*args, **kwargs):
@@ -55,7 +69,16 @@ class TestEvaluationExtra:
 
 
 class TestNoGitPython:
-  def test_gitpython_not_imported(self):
-    import merceka_core.evaluation as ev
-    src = open(ev.__file__).read()
-    assert "from git import" not in src and "import git\n" not in src
+  def test_get_git_hash_works_without_gitpython(self, monkeypatch):
+    """The real regression guard: the function must not need the git module."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def block_gitpython(name, *args, **kwargs):
+      if name == "git" or name.startswith("git."):
+        raise ImportError("No module named 'git'")
+      return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", block_gitpython)
+    assert get_git_hash()  # returns a SHA or "unknown", never raises
