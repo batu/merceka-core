@@ -1,111 +1,27 @@
-"""Vulture whitelist for public API symbols.
+"""Vulture whitelist — names that look unused but are consumed indirectly."""
 
-This package is a library, so some exported classes and helpers are intentionally
-referenced by downstream consumers rather than by this repository itself.
-"""
 
-from merceka_core import (
-  Agent,
-  AgentComplete,
-  AgentProfile,
-  AgentRawProviderEvent,
-  AgentRequest,
-  AgentResult,
-  AgentTextDelta,
-  GPU_LOCK_PATH,
-  GpuLockTimeout,
-  ProviderFailure,
-  RawProviderEvent,
-  VideoBackendError,
-  VideoNotFoundError,
-  VideoUploadError,
-  gpu_lock,
-)
-from merceka_core.agents import ClaudeCodeAgentProvider, CodexAgentProvider
-from merceka_core.evaluation import (
-  Evaluation,
-  Evaluator,
-  Experiment,
-  ExperimentResults,
-  Task,
-  TaskResult,
-  config_name,
-  get_git_hash,
-  run_experiment,
-  to_dataframe,
-)
-from merceka_core.image import edit_image, generate_image, inpaint, upscale_image
-from merceka_core.llm import (
-  LLM,
-  OutputSchema,
-  Tool,
-  create_message,
-  create_message_with_resource,
-  create_ollama_vision_message,
-  generate_with_search_grounding,
-  list_local_models,
-  tool_from_callable,
-)
-from merceka_core.wa_bot import (
-  Message,
-  WhatsAppClient,
-  WhatsAppConfig,
-  create_webhook_routes,
-  get_config,
-  get_mode,
-  normalize_command,
-  parse_webhook_payload,
-  redact,
-)
+class _Whitelist:
+  # pytest fixtures are "used" via parameter injection, invisible to vulture.
+  api_keys = None
+  # __exit__(self, *exc) / __exit__(self, exc_type, exc, tb) signatures —
+  # the parameters are required by the context-manager protocol.
+  exc = None
+  exc_type = None
+  tb = None
+  # Tool-function parameters in test_tool_calling.py: the params exist to
+  # exercise schema generation from signatures, not to be read in the body.
+  limit = None
+  verbose = None
+  items = None
+  value = None
 
-(
-  Agent,
-  AgentComplete,
-  AgentProfile,
-  AgentRawProviderEvent,
-  AgentRequest,
-  AgentResult,
-  AgentTextDelta,
-  GPU_LOCK_PATH,
-  GpuLockTimeout,
-  ProviderFailure,
-  RawProviderEvent,
-  VideoBackendError,
-  VideoNotFoundError,
-  VideoUploadError,
-  gpu_lock,
-  ClaudeCodeAgentProvider,
-  CodexAgentProvider,
-  Evaluation,
-  Evaluator,
-  Experiment,
-  ExperimentResults,
-  Task,
-  TaskResult,
-  config_name,
-  get_git_hash,
-  run_experiment,
-  to_dataframe,
-  edit_image,
-  generate_image,
-  inpaint,
-  upscale_image,
-  LLM,
-  OutputSchema,
-  Tool,
-  create_message,
-  create_message_with_resource,
-  create_ollama_vision_message,
-  generate_with_search_grounding,
-  list_local_models,
-  tool_from_callable,
-  Message,
-  WhatsAppClient,
-  WhatsAppConfig,
-  create_webhook_routes,
-  get_config,
-  get_mode,
-  normalize_command,
-  parse_webhook_payload,
-  redact,
-)
+
+_Whitelist.api_keys
+_Whitelist.exc
+_Whitelist.exc_type
+_Whitelist.tb
+_Whitelist.limit
+_Whitelist.verbose
+_Whitelist.items
+_Whitelist.value
