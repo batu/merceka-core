@@ -416,14 +416,15 @@ class LLM:
         "Use generate_with_video/agenerate_with_video or generate_with_search_grounding, "
         "or route text through an openrouter/ model.")
     if (self.use_claude or self.use_codex) and self._tool_schemas:
-      # CLI providers can't run Python tool callables in-process.
-      if self.use_claude and self.allowed_tools:
-        return _BACKEND_CLAUDE  # native Claude Code tools handle it
+      # CLI providers can't run Python tool callables in-process, but both
+      # forward allowed_tools to their native tool systems.
+      if self.allowed_tools:
+        return _BACKEND_CLAUDE if self.use_claude else _BACKEND_CODEX
       if self.fallback:
         return _BACKEND_TOOLS_FALLBACK
       raise ValueError(
         f"{self.model_name!r} cannot run Python tool callables. Either pass "
-        "allowed_tools= (native Claude Code tools), set fallback= to a "
+        "allowed_tools= (native CLI tools), set fallback= to a "
         "tool-capable model, or drop tools=.")
     if self.use_claude:
       return _BACKEND_CLAUDE
@@ -1075,19 +1076,29 @@ class LLM:
   async def astream_generate(self, message: str, **kwargs):
     """Async streaming generator. Runs the sync stream in a worker thread."""
     import asyncio
+    import threading
 
     loop = asyncio.get_running_loop()
     q: asyncio.Queue = asyncio.Queue()
     sentinel = object()
+    stop = threading.Event()  # set when the consumer abandons early
+
+    def _put(item):
+      try:
+        loop.call_soon_threadsafe(q.put_nowait, item)
+      except RuntimeError:
+        pass  # loop closed during teardown; nothing left to deliver to
 
     def _run():
       try:
         for chunk in self.stream_generate(message, **kwargs):
-          loop.call_soon_threadsafe(q.put_nowait, chunk)
+          if stop.is_set():
+            return
+          _put(chunk)
       except Exception as e:
-        loop.call_soon_threadsafe(q.put_nowait, e)
+        _put(e)
       finally:
-        loop.call_soon_threadsafe(q.put_nowait, sentinel)
+        _put(sentinel)
 
     producer = loop.run_in_executor(None, _run)
     try:
@@ -1099,7 +1110,8 @@ class LLM:
           raise item
         yield item
     finally:
-      await producer
+      stop.set()  # bounds the finalizer wait to at most one in-flight chunk
+      await asyncio.shield(producer)
 
   def generate_with_video(
     self,

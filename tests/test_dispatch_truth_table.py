@@ -84,6 +84,21 @@ class TestSelectBackend:
     llm = LLM("claude/sonnet", tools=TOOLS, allowed_tools=["WebSearch"])
     assert llm._select_backend() == llm_module._BACKEND_CLAUDE
 
+  def test_codex_native_tools_stay_on_codex(self):
+    """_codex_call forwards --allowedTools, so codex gets the same escape."""
+    llm = LLM("codex/gpt-5", tools=TOOLS, allowed_tools=["WebSearch"])
+    assert llm._select_backend() == llm_module._BACKEND_CODEX
+
+  @pytest.mark.parametrize("model,expected", [
+    ("claude/sonnet", llm_module._BACKEND_CLAUDE),
+    ("codex/gpt-5", llm_module._BACKEND_CODEX),
+  ])
+  def test_native_tools_win_over_fallback(self, model, expected):
+    """allowed_tools + fallback: native branch takes precedence."""
+    llm = LLM(model, tools=TOOLS, allowed_tools=["WebSearch"],
+              fallback="openrouter/fb")
+    assert llm._select_backend() == expected
+
   @pytest.mark.parametrize("model", ["claude/sonnet", "codex/gpt-5"])
   def test_cli_provider_tools_with_fallback(self, model):
     llm = LLM(model, tools=TOOLS, fallback="openrouter/fb")
@@ -206,6 +221,17 @@ class TestFallbackFidelity:
     assert llm.generate("hi") == "recovered"
     assert calls == ["openrouter/primary", "openrouter/fb"]
 
+  @pytest.mark.parametrize("model", ["codex/gpt-5", "gemini/gemini-flash-latest"])
+  def test_stream_raises_for_unsupported_configs(self, model):
+    """One-chunk stream path inherits _select_backend's eager errors.
+
+    Old behavior silently dropped tools (codex) or misrouted to Ollama
+    (gemini); the raise is the intended new invariant.
+    """
+    llm = LLM(model, tools=TOOLS if model.startswith("codex") else None)
+    with pytest.raises(ValueError):
+      list(llm.stream_generate("hi"))
+
   def test_stream_one_chunk_fallback_preserves_tools(self, monkeypatch):
     llm = LLM("openrouter/x", tools=TOOLS, max_tool_rounds=7)
     captured = {}
@@ -244,6 +270,26 @@ class TestAstream:
     with pytest.raises(RuntimeError, match="stream died"):
       async for _ in llm.astream_generate("hi"):
         pass
+
+  @pytest.mark.asyncio
+  async def test_early_break_does_not_wait_for_full_stream(self, monkeypatch):
+    """A consumer that breaks early must not block on stream exhaustion."""
+    import itertools
+    import time
+
+    def slow_infinite_stream(self, m, **k):
+      for i in itertools.count():
+        time.sleep(0.01)
+        yield f"chunk{i}"
+
+    monkeypatch.setattr(LLM, "stream_generate", slow_infinite_stream)
+    llm = LLM("claude/sonnet")
+    start = time.monotonic()
+    async for chunk in llm.astream_generate("hi"):
+      break  # abandon after first chunk
+    # generator finalization happens here on GC/aclose; force it:
+    elapsed = time.monotonic() - start
+    assert elapsed < 2.0  # infinite stream would hang forever without stop event
 
   @pytest.mark.asyncio
   async def test_no_busy_poll_sleep(self, monkeypatch):
