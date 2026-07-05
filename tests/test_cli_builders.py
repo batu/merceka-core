@@ -38,6 +38,12 @@ class TestCodexExecCommand:
     assert "--model" not in cmd
     assert ["-c", 'model_reasoning_effort="high"'] == cmd[2:4]
 
+  def test_explicit_model_drops_reasoning_effort(self):
+    """Matches old agents behavior: -c effort only applies to alias models."""
+    cmd = _cli.codex_exec_command("gpt-x", reasoning_effort="high")
+    assert ["--model", "gpt-x"] == cmd[2:4]
+    assert "-c" not in cmd
+
   def test_agent_rooted_shape(self):
     cmd = _cli.codex_exec_command(
       "gpt-x", sandbox="workspace-write", cd="/root1",
