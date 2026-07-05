@@ -307,6 +307,14 @@ from merceka_core.errors import (
 )
 
 # Retry policy for transient HTTP failures on the cloud path.
+# Backend decisions returned by LLM._select_backend().
+_BACKEND_CLAUDE = "claude"
+_BACKEND_CODEX = "codex"
+_BACKEND_TOOLS_FALLBACK = "tools_fallback"  # CLI provider + Python tools + fallback set
+_BACKEND_TOOL_LOOP = "tool_loop"
+_BACKEND_OPENROUTER = "openrouter"
+_BACKEND_LOCAL = "local"
+
 _RETRY_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504, 529})
 _RETRY_BASE_DELAY = 1.0
 _RETRY_MAX_DELAY = 30.0
@@ -388,6 +396,46 @@ class LLM:
         and not self.use_gemini):
       self._verify()
 
+  def _fallback_llm(self, model_name: Optional[str] = None) -> "LLM":
+    """Construct a fallback LLM preserving the full configuration of this one."""
+    return LLM(model_name or self.fallback, system_prompt=self.system_prompt,
+               think=self.think, output_schema=self.output_schema,
+               tools=self._original_tools, max_tool_rounds=self.max_tool_rounds,
+               add_dirs=self.add_dirs, allowed_tools=self.allowed_tools)
+
+  def _select_backend(self) -> str:
+    """Decide which backend serves plain generate/agenerate for this config.
+
+    Single source of truth for dispatch: both the sync and async ladders map
+    the returned constant to a transport call, so they cannot diverge.
+    Raises eagerly for configurations that have no working backend.
+    """
+    if self.use_gemini:
+      raise ValueError(
+        f"{self.model_name!r} is a Gemini model: plain generate/chat is not supported. "
+        "Use generate_with_video/agenerate_with_video or generate_with_search_grounding, "
+        "or route text through an openrouter/ model.")
+    if (self.use_claude or self.use_codex) and self._tool_schemas:
+      # CLI providers can't run Python tool callables in-process, but both
+      # forward allowed_tools to their native tool systems.
+      if self.allowed_tools:
+        return _BACKEND_CLAUDE if self.use_claude else _BACKEND_CODEX
+      if self.fallback:
+        return _BACKEND_TOOLS_FALLBACK
+      raise ValueError(
+        f"{self.model_name!r} cannot run Python tool callables. Either pass "
+        "allowed_tools= (native CLI tools), set fallback= to a "
+        "tool-capable model, or drop tools=.")
+    if self.use_claude:
+      return _BACKEND_CLAUDE
+    if self.use_codex:
+      return _BACKEND_CODEX
+    if self._tool_schemas:
+      return _BACKEND_TOOL_LOOP
+    if self.use_openrouter:
+      return _BACKEND_OPENROUTER
+    return _BACKEND_LOCAL
+
   def generate(self, message: str, **kwargs) -> str | OutputSchema:
     """One-shot generation. Does not maintain conversation history."""
     try:
@@ -398,36 +446,32 @@ class LLM:
             VideoBackendError) as e:
       if self.fallback:
         _logger.warning("Primary LLM failed (%s), falling back to %s", type(e).__name__, self.fallback)
-        fb = LLM(self.fallback, system_prompt=self.system_prompt, think=self.think,
-                 output_schema=self.output_schema, tools=self._original_tools,
-                 max_tool_rounds=self.max_tool_rounds)
-        return fb.generate(message, **kwargs)
+        return self._fallback_llm().generate(message, **kwargs)
       raise
 
   def _generate_primary(self, message: str, **kwargs) -> str | OutputSchema:
     """Primary generation dispatch."""
     messages = [create_message(self.system_prompt, "system"), create_message(message, "user")]
-    # Claude with allowed_tools/add_dirs uses native tool calling (Claude Code handles it).
-    # Claude with Python callable tools but no allowed_tools falls back to ollama.
-    if self.use_claude and self._tool_schemas and not self.allowed_tools and self.fallback:
-      _logger.info("Claude CLI can't run Python tool callables, using fallback %s", self.fallback)
-      fb = LLM(self.fallback, system_prompt=self.system_prompt, think=self.think,
-               output_schema=self.output_schema, tools=self._original_tools,
-               max_tool_rounds=self.max_tool_rounds)
-      return fb.generate(message, **kwargs)
-    if self.use_claude:
+    backend = self._select_backend()
+    if backend == _BACKEND_TOOLS_FALLBACK:
+      _logger.info("%s can't run Python tool callables, using fallback %s",
+                   self.model_name, self.fallback)
+      return self._fallback_llm().generate(message, **kwargs)
+    if backend == _BACKEND_CLAUDE:
       return self._claude_call(message, **kwargs)
-    if self.use_codex:
+    if backend == _BACKEND_CODEX:
       return self._codex_call(message, **kwargs)
-    if self._tool_schemas:
+    if backend == _BACKEND_TOOL_LOOP:
       text, _ = self._run_tool_loop(messages, **kwargs)
       return text
-    if self.use_openrouter:
+    if backend == _BACKEND_OPENROUTER:
       return self._cloud_call(messages, **kwargs)
     return self._local_call(messages, **kwargs)
 
   def chat(self, message: str, **kwargs) -> str | OutputSchema:
     """Multi-turn chat. Maintains conversation history."""
+    if self.use_gemini:
+      self._select_backend()  # raises with the Gemini guidance message
     self.messages.append(create_message(message, "user"))
 
     if self._tool_schemas:
@@ -814,30 +858,27 @@ class LLM:
             VideoBackendError) as e:
       if self.fallback:
         _logger.warning("Primary LLM failed (%s), falling back to %s", type(e).__name__, self.fallback)
-        fb = LLM(self.fallback, system_prompt=self.system_prompt, think=self.think,
-                 output_schema=self.output_schema, tools=self._original_tools,
-                 max_tool_rounds=self.max_tool_rounds)
-        return await fb.agenerate(message, **kwargs)
+        return await self._fallback_llm().agenerate(message, **kwargs)
       raise
 
   async def _agenerate_primary(self, message: str, **kwargs) -> str | OutputSchema:
-    """Async primary generation dispatch."""
+    """Async primary generation dispatch. Mirrors _generate_primary exactly."""
     import asyncio
 
     messages = [create_message(self.system_prompt, "system"), create_message(message, "user")]
-    # Claude with allowed_tools uses native tool calling; Python callables fall back.
-    if self.use_claude and self._tool_schemas and not self.allowed_tools and self.fallback:
-      _logger.info("Claude CLI can't run Python tool callables, using fallback %s", self.fallback)
-      fb = LLM(self.fallback, system_prompt=self.system_prompt, think=self.think,
-               output_schema=self.output_schema, tools=self._original_tools,
-               max_tool_rounds=self.max_tool_rounds)
-      return await fb.agenerate(message, **kwargs)
-    if self.use_claude:
+    backend = self._select_backend()
+    if backend == _BACKEND_TOOLS_FALLBACK:
+      _logger.info("%s can't run Python tool callables, using fallback %s",
+                   self.model_name, self.fallback)
+      return await self._fallback_llm().agenerate(message, **kwargs)
+    if backend == _BACKEND_CLAUDE:
       return await asyncio.to_thread(self._claude_call, message, **kwargs)
-    if self._tool_schemas:
+    if backend == _BACKEND_CODEX:
+      return await asyncio.to_thread(self._codex_call, message, **kwargs)
+    if backend == _BACKEND_TOOL_LOOP:
       text, _ = await self._arun_tool_loop(messages, **kwargs)
       return text
-    if self.use_openrouter:
+    if backend == _BACKEND_OPENROUTER:
       return await self._acloud_call(messages, **kwargs)
     return await asyncio.to_thread(self._local_call, messages, **kwargs)
 
@@ -1029,42 +1070,48 @@ class LLM:
           raise
 
     # Fallback: generate full response and yield as one chunk
-    fb = LLM(self.fallback or self.model_name,
-             system_prompt=self.system_prompt, think=self.think,
-             output_schema=self.output_schema,
-             add_dirs=self.add_dirs, allowed_tools=self.allowed_tools)
+    fb = self._fallback_llm(self.fallback or self.model_name)
     yield fb.generate(message, **kwargs)
 
   async def astream_generate(self, message: str, **kwargs):
-    """Async streaming generator. Wraps sync stream in a thread."""
+    """Async streaming generator. Runs the sync stream in a worker thread."""
     import asyncio
-    import queue
+    import threading
 
-    q = queue.Queue()
+    loop = asyncio.get_running_loop()
+    q: asyncio.Queue = asyncio.Queue()
     sentinel = object()
+    stop = threading.Event()  # set when the consumer abandons early
+
+    def _put(item):
+      try:
+        loop.call_soon_threadsafe(q.put_nowait, item)
+      except RuntimeError:
+        pass  # loop closed during teardown; nothing left to deliver to
 
     def _run():
       try:
         for chunk in self.stream_generate(message, **kwargs):
-          q.put(chunk)
+          if stop.is_set():
+            return
+          _put(chunk)
       except Exception as e:
-        q.put(e)
+        _put(e)
       finally:
-        q.put(sentinel)
+        _put(sentinel)
 
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, _run)
-
-    while True:
-      # Poll queue with short sleep to avoid blocking event loop
-      while q.empty():
-        await asyncio.sleep(0.02)
-      item = q.get()
-      if item is sentinel:
-        break
-      if isinstance(item, Exception):
-        raise item
-      yield item
+    producer = loop.run_in_executor(None, _run)
+    try:
+      while True:
+        item = await q.get()
+        if item is sentinel:
+          break
+        if isinstance(item, Exception):
+          raise item
+        yield item
+    finally:
+      stop.set()  # bounds the finalizer wait to at most one in-flight chunk
+      await asyncio.shield(producer)
 
   def generate_with_video(
     self,
