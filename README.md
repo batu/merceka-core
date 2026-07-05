@@ -18,7 +18,7 @@ pip install "merceka-core[wa-bot]"
 ## Usage
 
 ```python
-from merceka_core.llm import LLM
+from merceka_core import LLM
 
 # Local Ollama model
 llm = LLM("gemma3:27b")
