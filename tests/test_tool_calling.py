@@ -1,6 +1,5 @@
 """Tests for tool calling / agentic loop in merceka_core.llm."""
 
-import asyncio
 import json
 import json as json_module
 

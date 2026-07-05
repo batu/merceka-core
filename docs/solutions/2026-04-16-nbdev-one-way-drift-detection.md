@@ -83,3 +83,10 @@ to use per the deepened plan. Merceka is the only nbdev holdout, and
 even there, `errors.py` / `resources/gpu.py` in this card are plain
 modules precisely because they're infra, not LLM-behavior literate
 docs. Keep nbdev scope narrow.
+
+---
+
+**Resolved 2026-07-05:** the notebook layer was removed entirely (card zmriapqL).
+`nbs/`, `_modidx.py`, and `settings.ini` are deleted; `llm.py` / `evaluation.py`
+are now plain hand-edited modules. The drift class this doc describes can no
+longer occur in this repo. Kept for reference for other nbdev projects.

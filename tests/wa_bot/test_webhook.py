@@ -7,9 +7,7 @@ Tests:
 Uses FastHTML's test client for route testing.
 """
 
-import json
 import pytest
-from unittest.mock import AsyncMock
 
 from fasthtml.common import FastHTML
 from starlette.testclient import TestClient

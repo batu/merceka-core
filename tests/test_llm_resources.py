@@ -1,6 +1,5 @@
 """Tests for LLM resource support (images/PDFs)."""
 import base64
-import tempfile
 from pathlib import Path
 
 import pytest

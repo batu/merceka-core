@@ -260,7 +260,7 @@ def create_webhook_routes(
         # All three conditions must be true for successful verification
         if mode == "subscribe" and token == verify_token and challenge is not None:
             # Success! Echo back the challenge
-            print(f"WEBHOOK: Verification successful")
+            print("WEBHOOK: Verification successful")
             return Response(challenge, media_type="text/plain")
         
         # Verification failed - wrong token or missing parameters
