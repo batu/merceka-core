@@ -291,8 +291,11 @@ class LLM:
     if self.use_claude:
       raise ValueError(
         "generate_with_resource is not supported for Claude CLI models — "
-        "the CLI accepts stdin text only. Use an openrouter or ollama model."
+        "the CLI accepts stdin text only. Use an openrouter, gemini, or ollama model."
       )
+
+    if self.use_gemini:
+      return _gemini_image_call(self, message, resource_path, **kwargs)
 
     if self.use_openrouter:
       messages = [
@@ -325,7 +328,12 @@ class LLM:
     if self.use_claude:
       raise ValueError(
         "agenerate_with_resource is not supported for Claude CLI models — "
-        "the CLI accepts stdin text only. Use an openrouter or ollama model."
+        "the CLI accepts stdin text only. Use an openrouter, gemini, or ollama model."
+      )
+
+    if self.use_gemini:
+      return await asyncio.to_thread(
+        _gemini_image_call, self, message, resource_path, **kwargs
       )
 
     if self.use_openrouter:
@@ -952,6 +960,7 @@ class LLM:
 # Gemini surface moved to merceka_core.llm_gemini; re-exported for back-compat.
 from merceka_core.llm_gemini import (  # noqa: E402, F401 — re-exported for back-compat
   _build_video_config,
+  _gemini_image_call,
   _extract_grounding,
   _gemini_client,
   _gemini_poll_until_active,

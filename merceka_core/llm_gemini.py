@@ -162,6 +162,66 @@ def _gemini_video_call(
       except Exception:  # pragma: no cover — hygiene, not critical.
         _logger.debug("Gemini file delete failed for %s", getattr(f, "name", "?"))
 
+_IMAGE_MIME_FALLBACK = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".bmp": "image/bmp",
+  ".tiff": "image/tiff",
+}
+
+
+def _gemini_image_call(llm, message: str, resource_path, **kwargs):
+  """Image understanding via inline bytes (no Files API ceremony).
+
+  Called by ``LLM.generate_with_resource`` for ``gemini/`` models. Unlike
+  the video path, images ride inline on the request, so there is no
+  upload/poll/delete lifecycle. Retries transient failures via the shared
+  retry policy; raises :class:`VideoBackendError` (the shared Gemini
+  transport error) when retries are exhausted or the error is terminal.
+  """
+  import mimetypes
+
+  from google.genai import types
+
+  path = Path(resource_path)
+  if not path.exists():
+    raise FileNotFoundError(f"Resource not found: {path}")
+
+  mime_type, _ = mimetypes.guess_type(str(path))
+  if mime_type is None:
+    mime_type = _IMAGE_MIME_FALLBACK.get(path.suffix.lower(), "application/octet-stream")
+
+  model = llm.model_name.removeprefix("gemini/")
+  config, remaining_kwargs = _build_video_config(system_prompt=llm.system_prompt, **kwargs)
+  part = types.Part.from_bytes(data=path.read_bytes(), mime_type=mime_type)
+
+  client = _gemini_client()
+  response = None
+  for attempt in range(_RETRY_MAX_ATTEMPTS):
+    try:
+      gc_kwargs: dict = {"model": model, "contents": [part, message]}
+      if config is not None:
+        gc_kwargs["config"] = config
+      response = client.models.generate_content(**gc_kwargs)
+      break
+    except Exception as exc:  # noqa: BLE001 — bridge SDK errors to our taxonomy.
+      status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+      is_retryable = status in _RETRY_STATUS_CODES or isinstance(
+        exc, (ConnectionResetError, ConnectionRefusedError)
+      )
+      if not is_retryable or attempt == _RETRY_MAX_ATTEMPTS - 1:
+        raise VideoBackendError(f"Gemini image generate_content failed: {exc}") from exc
+      delay = _retry_delay(attempt)
+      _logger.warning("Gemini image %s, retrying in %.2fs", type(exc).__name__, delay)
+      time.sleep(delay)
+
+  text = getattr(response, "text", None) or ""
+  return llm._parse_response(text)
+
+
 def _extract_grounding(response) -> dict:
   """Pull grounding metadata from a google-genai response into a plain dict.
 
