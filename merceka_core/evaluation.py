@@ -9,6 +9,7 @@ from pathlib import Path
 from datetime import datetime
 import json
 import logging
+import subprocess
 import tempfile
 import shutil
 import inspect
@@ -22,11 +23,15 @@ eval_logger = logging.getLogger("merceka_core.evaluation")
 def get_git_hash() -> str:
     """Returns the current git commit hash or 'unknown' if not in a git repo."""
     try:
-        from git import Repo
-        repo = Repo(search_parent_directories=True)
-        return repo.head.object.hexsha
-    except Exception:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
         return "unknown"
+    if result.returncode != 0:
+        return "unknown"
+    return result.stdout.strip()
 
 
 def config_name(config: dict) -> str:
@@ -107,8 +112,8 @@ class TaskResult:
     @property
     def success(self) -> bool | None:
         """Convenience: get the 'success' evaluation if it exists."""
-        eval = self.get_evaluation("success")
-        return eval.value if eval else None
+        evaluation = self.get_evaluation("success")
+        return evaluation.value if evaluation else None
     
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization."""
@@ -265,9 +270,9 @@ class ExperimentResults:
         """Get all values for a named evaluation across results."""
         values = []
         for r in self.results:
-            eval = r.get_evaluation(name)
-            if eval:
-                values.append(eval.value)
+            evaluation = r.get_evaluation(name)
+            if evaluation:
+                values.append(evaluation.value)
         return values
     
     @property
@@ -758,10 +763,15 @@ def run_experiment(
 
 def to_dataframe(results: ExperimentResults):
     """Convert ExperimentResults to a pandas DataFrame.
-    
-    Requires pandas to be installed.
+
+    Requires pandas: install with `pip install "merceka-core[evaluation]"`.
     """
-    import pandas as pd
+    try:
+        import pandas as pd
+    except ImportError as e:
+        raise ImportError(
+            'to_dataframe requires pandas. Install with: pip install "merceka-core[evaluation]"'
+        ) from e
     
     rows = []
     for r in results:
