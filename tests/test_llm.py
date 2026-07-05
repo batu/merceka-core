@@ -21,7 +21,9 @@ class TestCodexProvider:
     out = llm.generate("MSG", images=["/tmp/a.jpg"])
     assert out == "hello"
     assert captured["cmd"][:2] == ["codex", "exec"]
-    assert ["-m", "gpt-5.2"] == captured["cmd"][captured["cmd"].index("-m"):captured["cmd"].index("-m") + 2]
+    idx = captured["cmd"].index("--model")
+    assert ["--model", "gpt-5.2"] == captured["cmd"][idx:idx + 2]
+    assert "--ephemeral" in captured["cmd"]
     assert ["-i", "/tmp/a.jpg"] == captured["cmd"][captured["cmd"].index("-i"):captured["cmd"].index("-i") + 2]
     assert captured["cmd"][-1] == "-"
     assert captured["input"].startswith("SYS\n\nMSG")
@@ -30,7 +32,7 @@ class TestCodexProvider:
     from merceka_core.llm import LLM
 
     def fake_run(cmd, **kwargs):
-      assert "-m" not in cmd
+      assert "--model" not in cmd
       class R:
         returncode = 0
         stdout = "ok"
