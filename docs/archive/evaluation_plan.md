@@ -1,3 +1,5 @@
+> **Archived 2026-07-05:** pre-implementation design/plan doc. evaluation.py is fully implemented; this document describes intent, not shipped code.
+
 ### `Evaluation Framework` Plan
 
 **1. Problem Statement**

@@ -12,6 +12,7 @@ def test_heavy_tooling_is_optional_dependency_metadata():
   extras = set(package_metadata.get_all("Provides-Extra") or [])
   requirements = requires("merceka-core") or []
 
-  assert {"notebooks", "wa-bot"}.issubset(extras)
-  assert any("jupyterlab" in req and 'extra == "notebooks"' in req for req in requirements)
+  assert "wa-bot" in extras
+  assert "notebooks" not in extras  # notebook layer removed 2026-07-05
+  assert not any("jupyterlab" in req or "nbdev" in req for req in requirements)
   assert any("python-fasthtml" in req and 'extra == "wa-bot"' in req for req in requirements)
