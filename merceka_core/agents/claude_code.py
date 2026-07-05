@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import subprocess
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
+from merceka_core import _cli
 from merceka_core.agent import (
   AgentComplete,
   AgentProfile,
@@ -106,7 +106,7 @@ class ClaudeCodeAgentProvider:
           text_chunks.append(text)
           yield AgentTextDelta(content=text)
 
-        if payload.get("type") == "result":
+        if _cli.is_claude_result_event(payload):
           completed = True
           break
 
@@ -137,23 +137,16 @@ class ClaudeCodeAgentProvider:
       self._close_pipe(process.stderr)
 
   def _command(self, request: AgentRequest, *, stream: bool) -> list[str]:
-    cmd = [self.claude_binary, "-p", "--model", self.model]
-    if stream:
-      cmd.extend([
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--include-partial-messages",
-      ])
-    if request.profile == AgentProfile.WRITE:
-      cmd.extend(["--permission-mode", "acceptEdits"])
-    if request.system_prompt:
-      cmd.extend(["--system-prompt", request.system_prompt])
-    for root in request.roots:
-      cmd.extend(["--add-dir", str(root)])
     tools = WRITE_TOOLS if request.profile == AgentProfile.WRITE else READ_ONLY_TOOLS
-    cmd.extend(["--allowedTools", ",".join(tools)])
-    return cmd
+    return _cli.claude_command(
+      self.model,
+      system_prompt=request.system_prompt,
+      add_dirs=[str(root) for root in request.roots],
+      allowed_tools=tools,
+      stream=stream,
+      accept_edits=request.profile == AgentProfile.WRITE,
+      binary=self.claude_binary,
+    )
 
   def _raw_event_from_line(self, line: str) -> RawProviderEvent:
     try:
@@ -168,19 +161,10 @@ class ClaudeCodeAgentProvider:
     return RawProviderEvent(provider=CLAUDE_CODE_PROVIDER, event_type=event_type, payload=payload)
 
   def _text_delta_from_payload(self, payload: dict[str, Any]) -> str | None:
-    if payload.get("type") != "stream_event":
-      return None
-    event = payload.get("event")
-    if not isinstance(event, dict) or event.get("type") != "content_block_delta":
-      return None
-    delta = event.get("delta")
-    if not isinstance(delta, dict) or delta.get("type") != "text_delta":
-      return None
-    text = delta.get("text")
-    return text if isinstance(text, str) else None
+    return _cli.claude_stream_text_delta(payload)
 
   def _env(self) -> dict[str, str]:
-    return {**os.environ, "ANTHROPIC_API_KEY": ""}
+    return _cli.claude_env()
 
   def _terminate_process(self, process: subprocess.Popen[str]) -> None:
     process.terminate()

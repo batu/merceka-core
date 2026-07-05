@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from merceka_core import _cli
 from merceka_core.agent import (
   AgentComplete,
   AgentProfile,
@@ -127,31 +128,16 @@ class CodexAgentProvider:
       self._close_pipe(process.stderr)
 
   def _command(self, request: AgentRequest, *, json_output: bool) -> list[str]:
-    cmd = [
-      self.codex_binary,
-      "exec",
-    ]
-    if self.model in DEFAULT_CODEX_MODEL_ALIASES:
-      cmd.extend(["-c", 'model_reasoning_effort="high"'])
-    else:
-      cmd.extend(["--model", self.model])
-    sandbox = "workspace-write" if request.profile == AgentProfile.WRITE else "read-only"
-    cmd.extend([
-      "--sandbox",
-      sandbox,
-      "--cd",
-      str(request.roots[0]),
-      "--skip-git-repo-check",
-      "--color",
-      "never",
-      "-",
-    ])
-    if json_output:
-      cmd.insert(-1, "--json")
-    for root in request.roots[1:]:
-      cmd.insert(-1, str(root))
-      cmd.insert(-2, "--add-dir")
-    return cmd
+    model = "" if self.model in DEFAULT_CODEX_MODEL_ALIASES else self.model
+    return _cli.codex_exec_command(
+      model,
+      sandbox="workspace-write" if request.profile == AgentProfile.WRITE else "read-only",
+      cd=str(request.roots[0]),
+      add_dirs=[str(root) for root in request.roots[1:]],
+      json_output=json_output,
+      reasoning_effort="high",
+      binary=self.codex_binary,
+    )
 
   def _prompt(self, request: AgentRequest) -> str:
     if request.profile == AgentProfile.WRITE:

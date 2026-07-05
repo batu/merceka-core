@@ -300,6 +300,7 @@ def _openrouter_response_format(schema: type[BaseModel]) -> dict:
 
 Tool = Callable | tuple[dict, Callable]  # auto-schema or (raw_schema, handler)
 
+from merceka_core import _cli
 from merceka_core.errors import (
   VideoBackendError,
   VideoNotFoundError,
@@ -938,19 +939,14 @@ class LLM:
     --add-dir flags. When these are set, Claude Code handles file
     access (Read, Grep, Glob) internally — no Python tool loop needed.
     """
-    model_alias = self.model_name.removeprefix("claude/")
-    cmd = ["claude", "-p", "--model", model_alias]
-    if self.system_prompt:
-      cmd.extend(["--system-prompt", self.system_prompt])
-
-    # Claude Code native tool access
-    for d in self.add_dirs:
-      cmd.extend(["--add-dir", d])
-    if self.allowed_tools:
-      cmd.extend(["--allowedTools", ",".join(self.allowed_tools)])
-
+    cmd = _cli.claude_command(
+      self.model_name.removeprefix("claude/"),
+      system_prompt=self.system_prompt,
+      add_dirs=self.add_dirs,
+      allowed_tools=self.allowed_tools,
+    )
     timeout = kwargs.get("timeout", CLAUDE_CLI_TIMEOUT)
-    env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+    env = _cli.claude_env()
 
     result = subprocess.run(
       cmd,
@@ -976,14 +972,11 @@ class LLM:
     No structured-output support — ask for JSON in the prompt and parse
     the response yourself (same approach as the Claude CLI provider).
     """
-    model_alias = self.model_name.removeprefix("codex/")
-    cmd = ["codex", "exec", "--ephemeral", "-s", "read-only",
-           "--skip-git-repo-check", "--color", "never"]
-    if model_alias and model_alias != "default":
-      cmd.extend(["-m", model_alias])
-    for img in kwargs.get("images", []) or []:
-      cmd.extend(["-i", str(img)])
-    cmd.append("-")  # prompt from stdin
+    cmd = _cli.codex_exec_command(
+      self.model_name.removeprefix("codex/"),
+      ephemeral=True,
+      images=kwargs.get("images", []) or [],
+    )
 
     # codex exec has no --system-prompt flag; prepend it to the message
     prompt = f"{self.system_prompt}\n\n{message}" if self.system_prompt else message
@@ -1009,18 +1002,14 @@ class LLM:
     internally (Claude Code handles Read/Grep/Glob) — only text
     deltas are yielded.
     """
-    model_alias = self.model_name.removeprefix("claude/")
-    cmd = ["claude", "-p", "--model", model_alias,
-           "--output-format", "stream-json", "--verbose",
-           "--include-partial-messages"]
-    if self.system_prompt:
-      cmd.extend(["--system-prompt", self.system_prompt])
-    for d in self.add_dirs:
-      cmd.extend(["--add-dir", d])
-    if self.allowed_tools:
-      cmd.extend(["--allowedTools", ",".join(self.allowed_tools)])
-
-    env = {**os.environ, "ANTHROPIC_API_KEY": ""}
+    cmd = _cli.claude_command(
+      self.model_name.removeprefix("claude/"),
+      system_prompt=self.system_prompt,
+      add_dirs=self.add_dirs,
+      allowed_tools=self.allowed_tools,
+      stream=True,
+    )
+    env = _cli.claude_env()
     process = subprocess.Popen(
       cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
       stderr=subprocess.PIPE, text=True, bufsize=1, env=env,
@@ -1039,14 +1028,10 @@ class LLM:
         except json.JSONDecodeError:
           continue
 
-        evt_type = obj.get("type")
-        if evt_type == "stream_event":
-          event = obj.get("event", {})
-          if event.get("type") == "content_block_delta":
-            delta = event.get("delta", {})
-            if delta.get("type") == "text_delta":
-              yield delta.get("text", "")
-        elif evt_type == "result":
+        text = _cli.claude_stream_text_delta(obj)
+        if text is not None:
+          yield text
+        elif _cli.is_claude_result_event(obj):
           break
     finally:
       process.stdout.close()
