@@ -9,7 +9,6 @@ import logging
 import os
 import subprocess
 import httpx
-import random
 import time
 import urllib.error
 
@@ -21,7 +20,7 @@ CLAUDE_CLI_TIMEOUT = 120  # seconds
 dotenv.load_dotenv()
 
 
-from typing import Literal, Optional
+from typing import Optional
 from ollama import list as ollama_list
 
 
@@ -58,207 +57,11 @@ def _download_model(model_name: str):
 from ollama import chat as ollama_chat
 
 
-def create_message(content: Optional[str], role: Literal["user", "assistant", "system"] = "user"):
-  """Create a message for the chat."""
-  return {"role": role, "content": content}
-
-
-import base64
-import mimetypes
 from pathlib import Path
 
 
-def create_message_with_resource(
-  text: str,
-  resource_path: Path | str,
-  role: Literal["user", "assistant"] = "user",
-) -> dict:
-  """Create a message with an attached file (image/PDF) for vision models.
-  
-  Args:
-    text: The text prompt to accompany the resource
-    resource_path: Path to the file (image or PDF)
-    role: Message role (user or assistant)
-    
-  Returns:
-    Message dict in litellm vision format with base64-encoded content
-  """
-  resource_path = Path(resource_path)
-  
-  # Read and encode file
-  file_bytes = resource_path.read_bytes()
-  base64_data = base64.b64encode(file_bytes).decode("utf-8")
-  
-  # Detect MIME type
-  mime_type, _ = mimetypes.guess_type(str(resource_path))
-  if mime_type is None:
-    # Default based on extension
-    ext = resource_path.suffix.lower()
-    mime_map = {
-      ".pdf": "application/pdf",
-      ".png": "image/png",
-      ".jpg": "image/jpeg",
-      ".jpeg": "image/jpeg",
-      ".gif": "image/gif",
-      ".webp": "image/webp",
-      # Video formats (Gemini long-context video).
-      ".mp4": "video/mp4",
-      ".mov": "video/quicktime",
-      ".webm": "video/webm",
-      ".mpeg": "video/mpeg",
-      ".mpg": "video/mpeg",
-      ".avi": "video/x-msvideo",
-      ".flv": "video/x-flv",
-      ".wmv": "video/x-ms-wmv",
-      ".3gp": "video/3gpp",
-    }
-    mime_type = mime_map.get(ext, "application/octet-stream")
-  
-  # Create message with multimodal content
-  return {
-    "role": role,
-    "content": [
-      {"type": "text", "text": text},
-      {
-        "type": "image_url",
-        "image_url": {"url": f"data:{mime_type};base64,{base64_data}"},
-      },
-    ],
-  }
+from typing import Callable
 
-
-def create_ollama_vision_message(
-  text: str,
-  image_path: Path | str,
-  role: Literal["user", "assistant"] = "user",
-) -> dict:
-  """Create a vision message in Ollama-native format.
-
-  Ollama-python's ``chat`` expects images as a top-level ``images`` field on the
-  message, not embedded in ``content``. The value may be a list of file paths,
-  bytes, or base64 strings. We pass a path — Ollama reads and encodes it.
-
-  Args:
-    text: The text prompt to accompany the image.
-    image_path: Path to the image file on disk.
-    role: Message role (user or assistant).
-
-  Returns:
-    Message dict in Ollama's native vision format:
-    ``{"role": role, "content": text, "images": [str(path)]}``.
-  """
-  return {
-    "role": role,
-    "content": text,
-    "images": [str(Path(image_path))],
-  }
-
-
-import inspect
-import re as _re
-from typing import Callable, get_type_hints
-
-
-def _python_type_to_json(hint) -> str:
-  """Map a Python type annotation to a JSON Schema type string."""
-  _TYPE_MAP = {
-    str: "string",
-    int: "integer",
-    float: "number",
-    bool: "boolean",
-    list: "array",
-  }
-  origin = getattr(hint, "__origin__", None)
-  if origin is list:
-    return "array"
-  return _TYPE_MAP.get(hint, "string")
-
-
-def _parse_param_docs(docstring: str | None) -> dict[str, str]:
-  """Extract parameter descriptions from a Google-style Args: section."""
-  if not docstring:
-    return {}
-  result: dict[str, str] = {}
-  in_args = False
-  current_param: str | None = None
-  current_desc_lines: list[str] = []
-
-  for line in docstring.splitlines():
-    stripped = line.strip()
-    if stripped.lower().startswith("args:"):
-      in_args = True
-      continue
-    if in_args:
-      if stripped and not stripped[0].isspace() and not stripped.startswith("-") and ":" not in stripped:
-        # Left-aligned non-param line → we've exited the Args section
-        if not stripped[0].isalpha() or stripped.endswith(":"):
-          break
-      # Check for "param_name: description" or "param_name (type): description"
-      m = _re.match(r"^(\w+)\s*(?:\([^)]*\))?\s*[:–—-]\s*(.+)", stripped)
-      if m:
-        if current_param:
-          result[current_param] = " ".join(current_desc_lines).strip()
-        current_param = m.group(1)
-        current_desc_lines = [m.group(2)]
-      elif current_param and stripped:
-        current_desc_lines.append(stripped)
-      elif not stripped and current_param:
-        result[current_param] = " ".join(current_desc_lines).strip()
-        current_param = None
-        current_desc_lines = []
-
-  if current_param:
-    result[current_param] = " ".join(current_desc_lines).strip()
-  return result
-
-def tool_from_callable(fn: Callable) -> dict:
-  """Convert a typed Python function to an OpenAI tool schema dict.
-
-  Extracts function name, docstring, type hints, and default values to produce
-  the schema expected by OpenAI/OpenRouter tool calling APIs.
-
-  Args:
-    fn: A Python function with type annotations and optional docstring.
-
-  Returns:
-    A dict in OpenAI tool format: {"type": "function", "function": {...}}
-  """
-  sig = inspect.signature(fn)
-  try:
-    hints = get_type_hints(fn)
-  except Exception:
-    hints = {}
-
-  doc = inspect.getdoc(fn) or ""
-  description = doc.split("\n\n")[0].strip() if doc else fn.__name__
-  param_docs = _parse_param_docs(doc)
-
-  properties: dict[str, dict] = {}
-  required: list[str] = []
-
-  for name, param in sig.parameters.items():
-    hint = hints.get(name)
-    prop: dict = {"type": _python_type_to_json(hint) if hint else "string"}
-    if name in param_docs:
-      prop["description"] = param_docs[name]
-    properties[name] = prop
-    if param.default is inspect.Parameter.empty:
-      required.append(name)
-
-  schema: dict = {
-    "type": "function",
-    "function": {
-      "name": fn.__name__,
-      "description": description,
-      "parameters": {
-        "type": "object",
-        "properties": properties,
-      },
-    },
-  }
-  if required:
-    schema["function"]["parameters"]["required"] = required
-  return schema
 
 def _chat_one(model: str, message: str, think: Optional[bool] = None, **kwargs):
   """Chat with the model."""
@@ -270,38 +73,26 @@ def _chat_one(model: str, message: str, think: Optional[bool] = None, **kwargs):
 from pydantic import BaseModel
 
 
-class OutputSchema(BaseModel):
-  """Base class for structured LLM outputs. Subclass this to define your schema.
-
-  The optional `content` field will be used for chat history when present."""
-
-  content: str | None = None
-
 from ollama import ChatResponse
 import litellm
 litellm.suppress_debug_info = True  # Stop printing "Provider List" spam
 from urllib.request import Request, urlopen
 
 
-def _schema_name(schema: type[BaseModel]) -> str:
-  name = getattr(schema, "__name__", "structured_response")
-  return "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in name) or "structured_response"
-
-
-def _openrouter_response_format(schema: type[BaseModel]) -> dict:
-  return {
-    "type": "json_schema",
-    "json_schema": {
-      "name": _schema_name(schema),
-      "strict": True,
-      "schema": schema.model_json_schema(),
-    },
-  }
-
-Tool = Callable | tuple[dict, Callable]  # auto-schema or (raw_schema, handler)
-
+from merceka_core.messages import (  # noqa: E402, F401 — re-exported for back-compat
+  OutputSchema,
+  Tool,
+  _openrouter_response_format,
+  _parse_param_docs,
+  _python_type_to_json,
+  _schema_name,
+  create_message,
+  create_message_with_resource,
+  create_ollama_vision_message,
+  tool_from_callable,
+)
 from merceka_core import _cli
-from merceka_core.errors import (
+from merceka_core.errors import (  # noqa: F401 — VideoNotFoundError/VideoUploadError re-exported
   VideoBackendError,
   VideoNotFoundError,
   VideoUploadError,
@@ -316,32 +107,14 @@ _BACKEND_TOOL_LOOP = "tool_loop"
 _BACKEND_OPENROUTER = "openrouter"
 _BACKEND_LOCAL = "local"
 
-_RETRY_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504, 529})
-_RETRY_BASE_DELAY = 1.0
-_RETRY_MAX_DELAY = 30.0
-_RETRY_MAX_ATTEMPTS = 3
-
-
-def _retry_delay(attempt: int, retry_after: float | None = None) -> float:
-  """Exponential backoff with jitter, honoring Retry-After."""
-  if retry_after is not None:
-    return min(retry_after, _RETRY_MAX_DELAY)
-  base = min(_RETRY_BASE_DELAY * (2 ** attempt), _RETRY_MAX_DELAY)
-  return base + random.uniform(0, 1.0)
-
-
-def _retry_after_seconds(headers) -> float | None:
-  """Parse a Retry-After header value to seconds, or None."""
-  value = None
-  if hasattr(headers, "get"):
-    value = headers.get("Retry-After") or headers.get("retry-after")
-  if not value:
-    return None
-  try:
-    return float(value)
-  except (TypeError, ValueError):
-    return None
-
+from merceka_core.retry import (  # noqa: F401 — re-exported for back-compat
+  _RETRY_BASE_DELAY,
+  _RETRY_MAX_ATTEMPTS,
+  _RETRY_MAX_DELAY,
+  _RETRY_STATUS_CODES,
+  _retry_delay,
+  _retry_after_seconds,
+)
 
 class LLM:
   """A class for interacting with an LLM."""
@@ -1176,258 +949,13 @@ class LLM:
     if self.model_name not in list_local_models():
       _download_model(self.model_name)
 
-
-def _gemini_client():
-  """Construct a google-genai Client lazily (SDK import is heavy)."""
-  from google import genai
-  from google.genai import types
-
-  # The SDK picks up GOOGLE_API_KEY or GEMINI_API_KEY automatically.
-  # http_options.timeout is in milliseconds.
-  return genai.Client(http_options=types.HttpOptions(timeout=600_000))
-
-
-def _gemini_poll_until_active(client, file_obj, timeout_s: float, poll_interval_s: float):
-  """Block until ``file_obj.state.name == 'ACTIVE'`` or raise.
-
-  Raises:
-    VideoUploadError: On ``FAILED`` or timeout.
-  """
-  deadline = time.monotonic() + timeout_s
-  current = file_obj
-  while True:
-    state = getattr(current, "state", None)
-    state_name = getattr(state, "name", None) or str(state)
-    if state_name == "ACTIVE":
-      return current
-    if state_name == "FAILED":
-      raise VideoUploadError(f"Gemini file upload FAILED: {current.name}")
-    if time.monotonic() >= deadline:
-      raise VideoUploadError(
-        f"Gemini file upload did not reach ACTIVE within {timeout_s}s "
-        f"(current state={state_name}, name={current.name})"
-      )
-    time.sleep(poll_interval_s)
-    current = client.files.get(name=current.name)
-
-
-def _build_video_config(max_tokens=None, system_prompt: str = "", **extra):
-  """Translate common slab kwargs into a google-genai GenerateContentConfig.
-
-  google-genai rejects unknown top-level kwargs on ``generate_content``
-  (e.g. ``max_tokens``) — they have to ride on ``config``. This helper
-  keeps callers in merceka-land portable to both the litellm-style
-  argument names they already use and the SDK-native shape.
-  """
-  from google.genai import types
-
-  cfg: dict = {}
-  if max_tokens:
-    cfg["max_output_tokens"] = int(max_tokens)
-  if system_prompt:
-    cfg["system_instruction"] = system_prompt
-  # Passthrough known config fields the caller may want to set directly.
-  for key in (
-    "temperature", "top_p", "top_k",
-    "stop_sequences", "response_mime_type", "response_schema",
-    "safety_settings",
-  ):
-    if key in extra:
-      cfg[key] = extra.pop(key)
-  if not cfg:
-    return None, extra
-  return types.GenerateContentConfig(**cfg), extra
-
-
-def _gemini_video_call(
-  llm,  # LLM instance (forward-decl to avoid circular self-ref in helper)
-  message: str,
-  video_paths,
-  *,
-  timeout_s: float,
-  poll_interval_s: float,
-  **kwargs,
-) -> str | OutputSchema:
-  """Upload, poll, generate, delete. Blocking."""
-  # Normalize to list of Path.
-  if isinstance(video_paths, (str, Path)):
-    paths = [Path(video_paths)]
-  else:
-    paths = [Path(p) for p in video_paths]
-
-  for p in paths:
-    if not p.exists():
-      raise VideoNotFoundError(f"Video not found: {p}")
-
-  client = _gemini_client()
-  model_alias = llm.model_name.removeprefix("gemini/")
-
-  # Extract caller kwargs that google-genai doesn't accept as top-level.
-  config, remaining_kwargs = _build_video_config(
-    max_tokens=kwargs.pop("max_tokens", None),
-    system_prompt=llm.system_prompt,
-    **kwargs,
-  )
-
-  uploaded = []
-  try:
-    for p in paths:
-      try:
-        file_obj = client.files.upload(file=str(p))
-      except Exception as exc:  # pragma: no cover — SDK-specific errors.
-        raise VideoUploadError(f"upload failed for {p}: {exc}") from exc
-      active = _gemini_poll_until_active(client, file_obj, timeout_s, poll_interval_s)
-      uploaded.append(active)
-
-    contents = [*uploaded, message]
-
-    # Apply retry around generate_content for transient 5xx/429.
-    for attempt in range(_RETRY_MAX_ATTEMPTS):
-      try:
-        gc_kwargs: dict = {"model": model_alias, "contents": contents, **remaining_kwargs}
-        if config is not None:
-          gc_kwargs["config"] = config
-        response = client.models.generate_content(**gc_kwargs)
-        break
-      except Exception as exc:  # noqa: BLE001 — bridge to our taxonomy.
-        status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
-        is_retryable = status in _RETRY_STATUS_CODES or isinstance(
-          exc, (ConnectionResetError, ConnectionRefusedError)
-        )
-        if not is_retryable or attempt == _RETRY_MAX_ATTEMPTS - 1:
-          raise VideoBackendError(f"Gemini generate_content failed: {exc}") from exc
-        delay = _retry_delay(attempt)
-        _logger.warning("Gemini %s, retrying in %.2fs", type(exc).__name__, delay)
-        time.sleep(delay)
-
-    text = getattr(response, "text", None) or ""
-    return llm._parse_response(text)
-  finally:
-    for f in uploaded:
-      try:
-        client.files.delete(name=f.name)
-      except Exception:  # pragma: no cover — hygiene, not critical.
-        _logger.debug("Gemini file delete failed for %s", getattr(f, "name", "?"))
-
-def _extract_grounding(response) -> dict:
-  """Pull grounding metadata from a google-genai response into a plain dict.
-
-  Schema:
-    {"queries": list[str],
-     "citations": list[{"uri": str, "title": str}],
-     "search_entry_point_html": str | None}
-
-  Handles python-genai #802: ``grounding_metadata`` may be absent on the
-  first candidate even when searches were performed. Returns empty
-  queries/citations so the caller can decide to degrade.
-  """
-  out: dict = {"queries": [], "citations": [], "search_entry_point_html": None}
-  candidates = getattr(response, "candidates", None) or []
-  if not candidates:
-    return out
-  gm = getattr(candidates[0], "grounding_metadata", None)
-  if gm is None:
-    return out
-  queries = getattr(gm, "web_search_queries", None) or []
-  out["queries"] = [str(q) for q in queries]
-  chunks = getattr(gm, "grounding_chunks", None) or []
-  citations = []
-  for chunk in chunks:
-    web = getattr(chunk, "web", None)
-    if web is not None:
-      citations.append({
-        "uri": str(getattr(web, "uri", "") or ""),
-        "title": str(getattr(web, "title", "") or ""),
-      })
-  out["citations"] = citations
-  sep = getattr(gm, "search_entry_point", None)
-  if sep is not None:
-    out["search_entry_point_html"] = getattr(sep, "rendered_content", None)
-  return out
-
-
-def _generate_with_search_grounding_sync(
-  *,
-  prompt: str,
-  system_prompt: str,
-  model: str,
-  max_tokens: int,
-  timeout_s: float,
-) -> tuple[str, dict]:
-  """Blocking impl; ``generate_with_search_grounding`` wraps this in a thread."""
-  from google.genai import types
-
-  client = _gemini_client()
-  tools = [types.Tool(google_search=types.GoogleSearch())]
-  config_kwargs: dict = {"tools": tools}
-  if max_tokens:
-    config_kwargs["max_output_tokens"] = max_tokens
-  if system_prompt:
-    config_kwargs["system_instruction"] = system_prompt
-  config = types.GenerateContentConfig(**config_kwargs)
-
-  response = None
-  for attempt in range(_RETRY_MAX_ATTEMPTS):
-    try:
-      response = client.models.generate_content(
-        model=model, contents=prompt, config=config,
-      )
-      break
-    except Exception as exc:  # noqa: BLE001 — bridge to our taxonomy.
-      status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
-      is_retryable = status in _RETRY_STATUS_CODES or isinstance(
-        exc, (ConnectionResetError, ConnectionRefusedError)
-      )
-      if not is_retryable or attempt == _RETRY_MAX_ATTEMPTS - 1:
-        raise VideoBackendError(
-          f"Gemini search-grounded generate_content failed: {exc}"
-        ) from exc
-      delay = _retry_delay(attempt)
-      _logger.warning(
-        "Gemini search-grounded %s, retrying in %.2fs", type(exc).__name__, delay,
-      )
-      time.sleep(delay)
-
-  text = getattr(response, "text", None) or ""
-  try:
-    grounding = _extract_grounding(response)
-  except Exception as exc:  # noqa: BLE001 — never fail the call on metadata parse.
-    _logger.warning("Failed to extract grounding metadata: %s", exc)
-    grounding = {"queries": [], "citations": [], "search_entry_point_html": None}
-  return text, grounding
-
-
-async def generate_with_search_grounding(
-  *,
-  prompt: str,
-  system_prompt: str = "",
-  model: str = "gemini-2.5-pro",
-  max_tokens: int = 6000,
-  timeout_s: float = 120.0,
-) -> tuple[str, dict]:
-  """Gemini generate_content with Google-Search grounding.
-
-  Returns ``(raw_text, grounding_dict)`` where ``grounding_dict`` has
-  keys ``queries``, ``citations``, ``search_entry_point_html``.
-  When the python-genai SDK omits ``grounding_metadata`` (issue #802),
-  the returned lists are empty — the caller is expected to degrade.
-
-  Args:
-    prompt: User prompt.
-    system_prompt: Optional system instruction.
-    model: Gemini model ID (without ``gemini/`` prefix).
-    max_tokens: Output cap. ``0`` disables the cap.
-    timeout_s: Reserved; the underlying client uses its own timeout.
-
-  Raises:
-    VideoBackendError: On non-retryable 5xx / persistent transport errors.
-  """
-  import asyncio
-  return await asyncio.to_thread(
-    _generate_with_search_grounding_sync,
-    prompt=prompt,
-    system_prompt=system_prompt,
-    model=model,
-    max_tokens=max_tokens,
-    timeout_s=timeout_s,
-  )
+# Gemini surface moved to merceka_core.llm_gemini; re-exported for back-compat.
+from merceka_core.llm_gemini import (  # noqa: E402, F401 — re-exported for back-compat
+  _build_video_config,
+  _extract_grounding,
+  _gemini_client,
+  _gemini_poll_until_active,
+  _gemini_video_call,
+  _generate_with_search_grounding_sync,
+  generate_with_search_grounding,
+)
