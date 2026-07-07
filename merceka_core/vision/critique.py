@@ -27,13 +27,13 @@ _ENV_FALLBACK_PATH = Path("/Users/base/dev/appletolye/.env")
 
 JUDGE_REGISTRY: list[dict[str, Any]] = [
   {
-    "id": "anthropic/claude-opus-4.1",
-    "model": "anthropic/claude-opus-4.1",
+    "id": "anthropic/claude-opus-4.8",
+    "model": "anthropic/claude-opus-4.8",
     "enabled": True,
   },
   {
-    "id": "anthropic/claude-sonnet-5",
-    "model": "anthropic/claude-sonnet-5",
+    "id": "anthropic/claude-sonnet-4.6",
+    "model": "anthropic/claude-sonnet-4.6",
     "enabled": True,
   },
   {
@@ -101,7 +101,7 @@ _OPENROUTER_RESPONSE_FORMAT = {
       "additionalProperties": False,
       "required": ["score", "defects"],
       "properties": {
-        "score": {"type": "number", "minimum": 0, "maximum": 100},
+        "score": {"type": "number"},
         "defects": {
           "type": "array",
           "items": {
@@ -290,8 +290,10 @@ def _call_judge(
     "model": judge["model"],
     "messages": messages,
     "temperature": 0,
+    # response_format is best-effort: providers that ignore it (e.g. anthropic)
+    # fall back to the tolerant fenced/prose parser. require_parameters would
+    # hard-400 those providers (found live: anthropic 400 vs gemini 200).
     "response_format": _OPENROUTER_RESPONSE_FORMAT,
-    "provider": {"require_parameters": True},
   }
   try:
     response = client.post(

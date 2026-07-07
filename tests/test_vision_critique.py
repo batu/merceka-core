@@ -154,7 +154,9 @@ def test_critique_median_payload_and_reference(monkeypatch, tmp_path):
   body = json.loads(request.content)
   assert body["temperature"] == 0
   assert body["response_format"]["type"] == "json_schema"
-  assert body["provider"] == {"require_parameters": True}
+  # provider.require_parameters dropped: anthropic-via-OpenRouter hard-400s strict
+  # params (schema numeric bounds); tolerant fenced/prose parse is the fallback.
+  assert "provider" not in body
   parts = body["messages"][0]["content"]
   assert [part["type"] for part in parts].count("image_url") == 2
   assert parts[2]["image_url"]["url"].startswith("data:image/png;base64,")
