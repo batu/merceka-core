@@ -7,7 +7,11 @@ import pytest
 
 from merceka_core.vision import critique, openrouter_budget_floor
 from merceka_core.vision import critique as exported_critique
-from merceka_core.vision.critique import OPENROUTER_CHAT_URL, parse_judge_response
+from merceka_core.vision.critique import (
+  OPENROUTER_CHAT_URL,
+  RECURRING_CHECK_IDS,
+  parse_judge_response,
+)
 from merceka_core.vision import critique as run_critique
 
 
@@ -38,6 +42,21 @@ def _content(score: float, keys: list[str] | None = None, severity: str = "major
 
 def _content_with_defects(score: float, defects: list[dict]) -> str:
   return json.dumps({"score": score, "defects": defects})
+
+
+def _recurring_checks(unit: str = "OURS 1") -> list[dict]:
+  return [
+    {
+      "id": check_id,
+      "pass": check_id != "asset-identity",
+      "evidence": f"{unit} x={index} y={index}",
+    }
+    for index, check_id in enumerate(RECURRING_CHECK_IDS, start=1)
+  ]
+
+
+def _content_with_recurring_checks(score: float, checks: list[dict]) -> str:
+  return json.dumps({"score": score, "defects": [], "recurring_checks": checks})
 
 
 def _openrouter_response(content: str, status_code: int = 200) -> httpx.Response:
@@ -160,6 +179,44 @@ def test_critique_median_payload_and_reference(monkeypatch, tmp_path):
   parts = body["messages"][0]["content"]
   assert [part["type"] for part in parts].count("image_url") == 2
   assert parts[2]["image_url"]["url"].startswith("data:image/png;base64,")
+  schema = body["response_format"]["json_schema"]["schema"]
+  assert schema["properties"]["recurring_checks"]["items"]["properties"]["id"]["enum"] == (
+    RECURRING_CHECK_IDS
+  )
+  prompt = parts[0]["text"]
+  assert "banner-transparency" in prompt
+  assert "Recurring check subjects:" in prompt
+
+
+def test_recurring_checks_parse_pass_fail_from_model_response(monkeypatch):
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  client = _client_for([_content_with_recurring_checks(96, _recurring_checks("hud crop"))])
+
+  result = run_critique(
+    [PNG_BYTES],
+    recurring_check_units=["hud crop"],
+    judges=[_judge("judge")],
+    client=client,
+  )
+
+  assert result["recurring_checks"] == _recurring_checks("hud crop")
+  assert result["per_model"]["judge"]["recurring_checks"] == _recurring_checks("hud crop")
+
+
+def test_missing_recurring_checks_are_recorded_as_skipped(monkeypatch):
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  client = _client_for([_content(94, [])])
+
+  result = run_critique(
+    [PNG_BYTES],
+    recurring_check_units=["hud crop"],
+    judges=[_judge("judge")],
+    client=client,
+  )
+
+  assert [check["id"] for check in result["recurring_checks"]] == RECURRING_CHECK_IDS
+  assert all(check["pass"] is None for check in result["recurring_checks"])
+  assert all("skipped: model omitted recurring_checks" in check["evidence"] for check in result["recurring_checks"])
 
 
 def test_openrouter_list_content_is_parsed(monkeypatch):

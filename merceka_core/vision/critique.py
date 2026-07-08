@@ -64,6 +64,41 @@ FINDING_KEYS = [
 SEVERITY_RANK = {"blocker": 3, "major": 2, "minor": 1}
 _SEVERITIES = set(SEVERITY_RANK)
 _MAX_TEXT = 400
+RECURRING_CHECKS = [
+  {
+    "id": "banner-transparency",
+    "description": (
+      "sprite banners/ribbons must composite transparently over the background; "
+      "an opaque box behind one fails"
+    ),
+  },
+  {
+    "id": "asset-identity",
+    "description": (
+      "an element visibly using a different asset than the reference's, including "
+      "a font glyph standing in for art, fails"
+    ),
+  },
+  {
+    "id": "glyph-centering",
+    "description": (
+      "glyphs in circular/pill buttons, such as a '+', must be visually centered"
+    ),
+  },
+  {
+    "id": "content-containment",
+    "description": "text/icons must not leak outside their pill/chip/button bounds",
+  },
+  {
+    "id": "sibling-size-consistency",
+    "description": "cells/buttons in one row must be equal-sized",
+  },
+]
+RECURRING_CHECK_IDS = [check["id"] for check in RECURRING_CHECKS]
+_RECURRING_CHECK_ID_SET = set(RECURRING_CHECK_IDS)
+_RECURRING_CHECK_PROMPT = "\n".join(
+  f"- {check['id']}: {check['description']}" for check in RECURRING_CHECKS
+)
 
 CRITIQUE_PROMPT = f"""You are the studio's shared multi-model visual fidelity judge.
 Compare the supplied image(s) against the target.
@@ -84,12 +119,26 @@ Respond with ONLY a JSON object, no prose, in this exact shape:
       "defect": "<short: what differs>",
       "direction": "<short: how OURS should move toward the target>"
     }}
+  ],
+  "recurring_checks": [
+    {{
+      "id": <one of: {", ".join(RECURRING_CHECK_IDS)}>,
+      "pass": <true if this recurring defect is absent, false if present>,
+      "evidence": "<short phrase naming the subject and pixel location>"
+    }}
   ]
 }}
 
 Order defects most-severe first. Use "blocker" only for differences that break
 the screen's identity or usability. If the image(s) match the target, return an
-empty defects array."""
+empty defects array.
+
+Recurring defects checklist:
+{_RECURRING_CHECK_PROMPT}
+
+For recurring_checks, emit one entry per judged subject per checklist id. If
+multiple OURS images or named crop subjects are listed, repeat the ids for each
+subject and include the image/crop name plus a pixel location in evidence."""
 
 _OPENROUTER_RESPONSE_FORMAT = {
   "type": "json_schema",
@@ -99,7 +148,7 @@ _OPENROUTER_RESPONSE_FORMAT = {
     "schema": {
       "type": "object",
       "additionalProperties": False,
-      "required": ["score", "defects"],
+      "required": ["score", "defects", "recurring_checks"],
       "properties": {
         "score": {"type": "number"},
         "defects": {
@@ -117,6 +166,19 @@ _OPENROUTER_RESPONSE_FORMAT = {
             },
           },
         },
+        "recurring_checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["id", "pass", "evidence"],
+            "properties": {
+              "id": {"type": "string", "enum": RECURRING_CHECK_IDS},
+              "pass": {"type": "boolean"},
+              "evidence": {"type": "string"},
+            },
+          },
+        },
       },
     },
   },
@@ -130,6 +192,7 @@ def critique(
   judges: list[str | dict[str, Any]] | None = None,
   budget_check: Callable[..., Any] | None = None,
   *,
+  recurring_check_units: list[str] | None = None,
   floor: float = 85.0,
   timeout: float = 60.0,
   client: httpx.Client | None = None,
@@ -146,6 +209,8 @@ def critique(
     budget_check: Optional callable run before each billable judge call. A
       falsy return skips the current and remaining judges with reason
       ``"budget"``.
+    recurring_check_units: Optional labels for the subjects that need recurring
+      defect checks. Defaults to one subject per OURS image.
     floor: Informational pass/fail score floor. Defaults to 85.
     timeout: Per-judge HTTP timeout in seconds when this function owns the
       client.
@@ -169,7 +234,13 @@ def critique(
     )
 
   roster = _normalize_judges(judges)
-  messages = _build_messages(images, reference=reference, spec=spec)
+  check_units = _normalize_recurring_check_units(images, recurring_check_units)
+  messages = _build_messages(
+    images,
+    reference=reference,
+    spec=spec,
+    recurring_check_units=check_units,
+  )
   per_model: dict[str, dict[str, Any]] = {}
   participated: list[str] = []
   skipped: list[dict[str, str]] = []
@@ -193,12 +264,13 @@ def critique(
         _record_skip(per_model, skipped, judge, "budget")
         continue
 
-      result = _call_judge(http_client, judge, messages, api_key)
+      result = _call_judge(http_client, judge, messages, api_key, check_units)
       if result["ok"]:
         per_model[judge_id] = {
           "model": judge["model"],
           "score": result["score"],
           "defects": [_public_defect(d, include_key=True) for d in result["defects"]],
+          "recurring_checks": [_public_recurring_check(c) for c in result["recurring_checks"]],
         }
         participated.append(judge_id)
         participant_results.append(
@@ -207,6 +279,7 @@ def critique(
             "model": judge["model"],
             "score": result["score"],
             "defects": result["defects"],
+            "recurring_checks": result["recurring_checks"],
           }
         )
       else:
@@ -222,6 +295,9 @@ def critique(
   score = float(median([r["score"] for r in participant_results]))
   consensus = _consensus_keys(participant_results)
   defects = [_public_defect(d) for d in _aggregate_defects(participant_results)]
+  recurring_checks = [
+    _public_recurring_check(c) for c in _aggregate_recurring_checks(participant_results, check_units)
+  ]
   consensus_blocker = _has_consensus_blocker(consensus, participant_results)
   verdict = "fail" if score < floor or consensus_blocker else "pass"
 
@@ -229,6 +305,7 @@ def critique(
     "score": score,
     "verdict": verdict,
     "defects": defects,
+    "recurring_checks": recurring_checks,
     "per_model": per_model,
     "consensus": consensus,
     "participated": participated,
@@ -285,6 +362,7 @@ def _call_judge(
   judge: dict[str, Any],
   messages: list[dict[str, Any]],
   api_key: str,
+  recurring_check_units: list[str],
 ) -> dict[str, Any]:
   payload = {
     "model": judge["model"],
@@ -314,20 +392,25 @@ def _call_judge(
 
   try:
     content = _extract_openrouter_text(response.json())
-    parsed = parse_judge_response(content)
+    parsed = parse_judge_response(content, recurring_check_units=recurring_check_units)
   except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
     return {"ok": False, "reason": "parse-failure"}
 
   return {"ok": True, **parsed}
 
 
-def parse_judge_response(text: str) -> dict[str, Any]:
+def parse_judge_response(
+  text: str,
+  *,
+  recurring_check_units: list[str] | None = None,
+) -> dict[str, Any]:
   """Parse one judge response into a clamped score and normalized defects."""
   if not isinstance(text, str):
     raise ValueError("judge response is not text")
+  check_units = _normalize_recurring_check_units([b""], recurring_check_units)
   obj = _extract_json_object(text)
   if obj is None:
-    return _parse_prose_response(text)
+    return _parse_prose_response(text, check_units)
 
   raw_score = obj.get("score", obj.get("fidelity"))
   score = _clamp_score(raw_score)
@@ -337,7 +420,8 @@ def parse_judge_response(text: str) -> dict[str, Any]:
   raw_defects = obj.get("defects", obj.get("findings", []))
   defects = [_normalize_defect(d) for d in raw_defects] if isinstance(raw_defects, list) else []
   defects.sort(key=lambda d: SEVERITY_RANK[d["severity"]], reverse=True)
-  return {"score": score, "defects": defects}
+  recurring_checks = _normalize_recurring_checks(obj.get("recurring_checks"), check_units)
+  return {"score": score, "defects": defects, "recurring_checks": recurring_checks}
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -351,7 +435,7 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
-def _parse_prose_response(text: str) -> dict[str, Any]:
+def _parse_prose_response(text: str, recurring_check_units: list[str]) -> dict[str, Any]:
   match = re.search(r"\b(?:score|fidelity)\b[^0-9-]*(-?\d+(?:\.\d+)?)\s*%?", text, re.I)
   if match is None:
     match = re.search(r"(-?\d+(?:\.\d+)?)\s*%\s*(?:fidelity|match|score)", text, re.I)
@@ -381,7 +465,14 @@ def _parse_prose_response(text: str) -> dict[str, Any]:
     )
 
   defects.sort(key=lambda d: SEVERITY_RANK[d["severity"]], reverse=True)
-  return {"score": score, "defects": defects}
+  return {
+    "score": score,
+    "defects": defects,
+    "recurring_checks": _skipped_recurring_checks(
+      recurring_check_units,
+      "model returned prose only",
+    ),
+  }
 
 
 def _normalize_defect(raw: Any) -> dict[str, str]:
@@ -408,6 +499,91 @@ def _normalize_defect(raw: Any) -> dict[str, str]:
     "severity": severity,
     "defect": _clip(defect_text),
     "direction": _clip(direction or ""),
+  }
+
+
+def _normalize_recurring_checks(raw: Any, recurring_check_units: list[str]) -> list[dict[str, Any]]:
+  if not isinstance(raw, list):
+    return _skipped_recurring_checks(recurring_check_units, "model omitted recurring_checks")
+
+  checks = []
+  for item in raw:
+    check = _normalize_recurring_check(item)
+    if check is not None:
+      checks.append(check)
+  if not checks:
+    return _skipped_recurring_checks(recurring_check_units, "model returned no valid checks")
+  return _complete_recurring_checks(checks, recurring_check_units)
+
+
+def _normalize_recurring_check(raw: Any) -> dict[str, Any] | None:
+  if not isinstance(raw, dict):
+    return None
+
+  check_id = _normalize_recurring_check_id(raw.get("id"))
+  if check_id is None:
+    return None
+
+  pass_value = _coerce_check_pass(raw.get("pass"))
+  evidence = _clip(raw.get("evidence") or raw.get("location") or raw.get("area") or "")
+  if pass_value is None and not evidence.lower().startswith("skipped:"):
+    evidence = _clip(f"skipped: {evidence or 'pass value missing'}")
+
+  return {
+    "id": check_id,
+    "pass": pass_value,
+    "evidence": evidence,
+  }
+
+
+def _normalize_recurring_check_id(value: Any) -> str | None:
+  if not isinstance(value, str):
+    return None
+  compact = re.sub(r"[\s_]+", "-", value.strip().lower())
+  return compact if compact in _RECURRING_CHECK_ID_SET else None
+
+
+def _coerce_check_pass(value: Any) -> bool | None:
+  if isinstance(value, bool):
+    return value
+  if isinstance(value, str):
+    normalized = value.strip().lower()
+    if normalized in {"pass", "passed", "true", "yes"}:
+      return True
+    if normalized in {"fail", "failed", "false", "no"}:
+      return False
+  return None
+
+
+def _complete_recurring_checks(
+  checks: list[dict[str, Any]],
+  recurring_check_units: list[str],
+) -> list[dict[str, Any]]:
+  expected_count = len(recurring_check_units)
+  counts = Counter(check["id"] for check in checks)
+  completed = list(checks)
+  for check_id in RECURRING_CHECK_IDS:
+    for unit in recurring_check_units[counts[check_id] : expected_count]:
+      completed.append(_skipped_recurring_check(check_id, unit, "model omitted check"))
+  return completed
+
+
+def _skipped_recurring_checks(
+  recurring_check_units: list[str],
+  reason: str,
+) -> list[dict[str, Any]]:
+  return [
+    _skipped_recurring_check(check_id, unit, reason)
+    for unit in recurring_check_units
+    for check_id in RECURRING_CHECK_IDS
+  ]
+
+
+def _skipped_recurring_check(check_id: str, unit: str, reason: str) -> dict[str, Any]:
+  return {
+    "id": check_id,
+    "pass": None,
+    "evidence": _clip(f"skipped: {reason} for {unit}"),
   }
 
 
@@ -469,8 +645,11 @@ def _build_messages(
   *,
   reference: str | Path | None,
   spec: str | None,
+  recurring_check_units: list[str],
 ) -> list[dict[str, Any]]:
-  content: list[dict[str, Any]] = [{"type": "text", "text": _prompt_with_spec(spec, reference)}]
+  content: list[dict[str, Any]] = [
+    {"type": "text", "text": _prompt_with_spec(spec, reference, recurring_check_units)}
+  ]
   if reference is not None:
     content.append({"type": "text", "text": "IMAGE 1: REFERENCE"})
     content.append(_image_url_part(reference))
@@ -481,15 +660,22 @@ def _build_messages(
   return [{"role": "user", "content": content}]
 
 
-def _prompt_with_spec(spec: str | None, reference: str | Path | None) -> str:
+def _prompt_with_spec(
+  spec: str | None,
+  reference: str | Path | None,
+  recurring_check_units: list[str],
+) -> str:
+  recurring_note = "Recurring check subjects:\n" + "\n".join(
+    f"- {unit}" for unit in recurring_check_units
+  )
   if spec:
-    return f"{CRITIQUE_PROMPT}\n\nWritten spec:\n{spec}"
+    return f"{CRITIQUE_PROMPT}\n\n{recurring_note}\n\nWritten spec:\n{spec}"
   if reference is None:
     return (
-      f"{CRITIQUE_PROMPT}\n\nNo reference image or written spec was supplied; "
+      f"{CRITIQUE_PROMPT}\n\n{recurring_note}\n\nNo reference image or written spec was supplied; "
       "judge internal visual quality and report only concrete defects."
     )
-  return CRITIQUE_PROMPT
+  return f"{CRITIQUE_PROMPT}\n\n{recurring_note}"
 
 
 def _image_url_part(image: str | Path | bytes | bytearray | memoryview) -> dict[str, Any]:
@@ -554,6 +740,17 @@ def _normalize_judges(judges: list[str | dict[str, Any]] | None) -> list[dict[st
       }
     )
   return normalized
+
+
+def _normalize_recurring_check_units(
+  images: list[str | Path | bytes | bytearray | memoryview],
+  recurring_check_units: list[str] | None,
+) -> list[str]:
+  if recurring_check_units is None:
+    return [f"OURS {index}" for index in range(1, len(images) + 1)]
+
+  units = [str(unit).strip() for unit in recurring_check_units if str(unit).strip()]
+  return units or [f"OURS {index}" for index in range(1, len(images) + 1)]
 
 
 def _budget_allows(fn: Callable[..., Any], judge: dict[str, Any]) -> bool:
@@ -622,6 +819,52 @@ def _aggregate_defects(results: list[dict[str, Any]]) -> list[dict[str, str]]:
   return aggregated
 
 
+def _aggregate_recurring_checks(
+  results: list[dict[str, Any]],
+  recurring_check_units: list[str],
+) -> list[dict[str, Any]]:
+  checks_by_slot: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+  max_slot_by_id: Counter[str] = Counter()
+  for result in results:
+    counts: Counter[str] = Counter()
+    for check in result["recurring_checks"]:
+      check_id = check["id"]
+      slot = counts[check_id]
+      counts[check_id] += 1
+      max_slot_by_id[check_id] = max(max_slot_by_id[check_id], slot + 1)
+      checks_by_slot[(check_id, slot)].append(check)
+
+  slot_count = max([len(recurring_check_units), *max_slot_by_id.values()] or [1])
+  aggregated = []
+  for slot in range(slot_count):
+    unit = (
+      recurring_check_units[slot]
+      if slot < len(recurring_check_units)
+      else f"subject {slot + 1}"
+    )
+    for check_id in RECURRING_CHECK_IDS:
+      aggregated.append(
+        _aggregate_recurring_check_slot(check_id, unit, checks_by_slot.get((check_id, slot), []))
+      )
+  return aggregated
+
+
+def _aggregate_recurring_check_slot(
+  check_id: str,
+  unit: str,
+  checks: list[dict[str, Any]],
+) -> dict[str, Any]:
+  for check in checks:
+    if check["pass"] is False:
+      return {"id": check_id, "pass": False, "evidence": check["evidence"]}
+  for check in checks:
+    if check["pass"] is True:
+      return {"id": check_id, "pass": True, "evidence": check["evidence"]}
+  if checks:
+    return {"id": check_id, "pass": None, "evidence": checks[0]["evidence"]}
+  return _skipped_recurring_check(check_id, unit, "model omitted check")
+
+
 def _has_consensus_blocker(consensus: list[str], results: list[dict[str, Any]]) -> bool:
   threshold = math.ceil(len(results) / 2)
   for key in consensus:
@@ -646,6 +889,14 @@ def _public_defect(defect: dict[str, str], *, include_key: bool = False) -> dict
   if include_key:
     return {"key": defect["key"], **public}
   return public
+
+
+def _public_recurring_check(check: dict[str, Any]) -> dict[str, Any]:
+  return {
+    "id": check["id"],
+    "pass": check["pass"],
+    "evidence": check["evidence"],
+  }
 
 
 def _clip(value: Any) -> str:
