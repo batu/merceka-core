@@ -9,10 +9,13 @@ known hold-time and appends START/END events to a shared log. Assert
 the intervals do not overlap (no START → START without an END between
 them).
 
-Marked ``@pytest.mark.gpu`` — runs on self-hosted runners that have
-fcntl + a real filesystem for the lock file. Does NOT need a GPU or
-credentials.
+Runs in the default suite: it needs only ``fcntl`` + a real filesystem
+for the lock file, NOT a GPU or credentials, and cross-process exclusion
+is a core acceptance criterion that must be verified by default. Each
+subprocess is pointed at a per-test temp lock file, so it never touches
+the live ``~/.local/state`` lock.
 """
+
 from __future__ import annotations
 
 import os
@@ -21,10 +24,6 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-
-import pytest
-
-pytestmark = pytest.mark.gpu
 
 
 HOLDER_SCRIPT = """
@@ -105,16 +104,12 @@ class TestCrossProcessExclusion:
     # Filter for START/END only; check no two STARTs in a row.
     start_end = [(ts, label, ev) for (ts, label, ev) in events if ev in {"START", "END"}]
     held_by = None
-    for (_ts, label, ev) in start_end:
+    for _ts, label, ev in start_end:
       if ev == "START":
-        assert held_by is None, (
-          f"{label} acquired while {held_by} still holds! events={start_end}"
-        )
+        assert held_by is None, f"{label} acquired while {held_by} still holds! events={start_end}"
         held_by = label
       elif ev == "END":
-        assert held_by == label, (
-          f"{label} ending but held_by={held_by}! events={start_end}"
-        )
+        assert held_by == label, f"{label} ending but held_by={held_by}! events={start_end}"
         held_by = None
     assert held_by is None, f"lock left held at end of test: {start_end}"
 

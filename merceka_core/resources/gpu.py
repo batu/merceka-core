@@ -110,9 +110,7 @@ async def gpu_lock(timeout: float | None = None) -> AsyncIterator[None]:
   try:
     acquired = await _acquire_with_deadline(fd, timeout)
     if not acquired:
-      raise GpuLockTimeout(
-        f"gpu_lock({GPU_LOCK_PATH}) timed out after {timeout}s"
-      )
+      raise GpuLockTimeout(f"gpu_lock({GPU_LOCK_PATH}) timed out after {timeout}s")
     yield
   finally:
     if acquired:

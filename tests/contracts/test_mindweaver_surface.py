@@ -3,8 +3,10 @@
 Mindweaver migrates from ``asyncio.Lock()`` to ``merceka_core.gpu_lock``.
 These tests assert the exact shape mindweaver imports and uses.
 """
+
 from __future__ import annotations
 
+import asyncio
 import errno
 import fcntl
 import inspect
@@ -27,6 +29,18 @@ from merceka_core import (
 )
 from merceka_core.agents import ClaudeCodeAgentProvider, CodexAgentProvider
 from merceka_core.llm import LLM
+
+
+@pytest.fixture(autouse=True)
+def _isolate_gpu_lock(tmp_path, monkeypatch):
+  """Point ``gpu_lock`` at a per-test temp file.
+
+  Without this, the contract tests acquire the live
+  ``~/.local/state/utolye/gpu.lock`` and can hang waiting behind a real
+  GPU job that legitimately holds it. Each test gets its own lock path so
+  acquisition/timeout behavior is deterministic and self-contained.
+  """
+  monkeypatch.setattr("merceka_core.resources.gpu.GPU_LOCK_PATH", tmp_path / "gpu.lock")
 
 
 def test_gpu_lock_is_factory_not_instance():
@@ -104,6 +118,34 @@ async def test_acquire_times_out_when_loop_stalls_past_deadline(monkeypatch):
   assert attempts["n"] == 1, (
     f"flock retried after the deadline had passed (attempts={attempts['n']})"
   )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_waiter_releases_and_lock_reacquires():
+  """Cancelling a waiter blocked on acquisition must release its fd
+  exactly once, leaving the lock immediately acquirable once the holder
+  exits (acceptance criterion #2: cancellation releases descriptors).
+
+  A late/orphaned fd or an executor thread surviving the cancel would
+  keep the lock held and make the final reacquire hang or raise."""
+
+  async def waiter():
+    # Blocks: the lock is already held on a separate fd. Cancellation
+    # must unwind through gpu_lock's finally (acquired=False -> close fd).
+    async with gpu_lock():
+      await asyncio.sleep(3600)
+
+  async with gpu_lock(timeout=5):
+    task = asyncio.create_task(waiter())
+    # Let the waiter reach the non-blocking flock poll loop.
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await task
+
+  # Holder released. With no orphaned fd/thread, this must acquire fast.
+  async with gpu_lock(timeout=1):
+    pass
 
 
 def test_agenerate_with_resource_exists():
