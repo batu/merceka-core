@@ -5,7 +5,10 @@ These tests assert the exact shape mindweaver imports and uses.
 """
 from __future__ import annotations
 
+import errno
+import fcntl
 import inspect
+import time
 
 import pytest
 
@@ -61,6 +64,46 @@ async def test_gpu_lock_timeout_raises():
       # Second acquisition opens a fresh fd → blocked, we time out fast.
       async with gpu_lock(timeout=0.2):
         pytest.fail("Should not have acquired while held")
+
+
+@pytest.mark.asyncio
+async def test_acquire_times_out_when_loop_stalls_past_deadline(monkeypatch):
+  """Regression: a stall past the deadline must not let a late release be
+  acquired after the timeout window.
+
+  Simulate the race directly against ``_acquire_with_deadline``: the first
+  non-blocking ``flock`` attempt reports "held" (would-block), then the
+  ``asyncio.sleep`` stalls real (monotonic) time past the deadline while the
+  holder "releases" — so a second ``flock`` attempt *would* succeed. The
+  contract is that we time out (return ``False``) rather than acquire late,
+  which means ``flock`` must be attempted exactly once."""
+  from merceka_core.resources import gpu
+
+  attempts = {"n": 0}
+
+  def fake_flock(fd, op):
+    if op & fcntl.LOCK_NB:
+      attempts["n"] += 1
+      if attempts["n"] == 1:
+        raise OSError(errno.EAGAIN, "held by someone else")
+      # Any later attempt would succeed — the holder released mid-stall.
+      return None
+    return None
+
+  async def stalling_sleep(_delay):
+    # Block real monotonic time (which loop.time() reads) well past the
+    # 0.01s deadline, mimicking a stalled event loop.
+    time.sleep(0.05)
+
+  monkeypatch.setattr(gpu.fcntl, "flock", fake_flock)
+  monkeypatch.setattr(gpu.asyncio, "sleep", stalling_sleep)
+
+  acquired = await gpu._acquire_with_deadline(fd=-1, timeout=0.01)
+
+  assert acquired is False, "acquired the lock after the deadline (late success)"
+  assert attempts["n"] == 1, (
+    f"flock retried after the deadline had passed (attempts={attempts['n']})"
+  )
 
 
 def test_agenerate_with_resource_exists():

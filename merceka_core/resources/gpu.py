@@ -77,6 +77,14 @@ async def _acquire_with_deadline(fd: int, timeout: float | None) -> bool:
     if deadline is not None:
       delay = min(delay, deadline - loop.time())
     await asyncio.sleep(max(0.0, delay))
+    # The event loop may have stalled well past the deadline while we
+    # were sleeping (or between wakeups). Re-check before the next
+    # attempt: without this, a holder that releases during the stall
+    # would let us acquire *after* the caller's timeout window, so a
+    # late success masquerades as an on-time one. Only the first attempt
+    # (top of the loop, before any sleep) is exempt.
+    if deadline is not None and loop.time() >= deadline:
+      return False
 
 
 @contextlib.asynccontextmanager
