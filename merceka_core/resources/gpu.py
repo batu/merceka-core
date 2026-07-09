@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import fcntl
 import os
 from pathlib import Path
@@ -40,10 +41,42 @@ from merceka_core.errors import GpuLockTimeout
 
 GPU_LOCK_PATH: Path = Path.home() / ".local" / "state" / "utolye" / "gpu.lock"
 
+# How often to retry a non-blocking acquisition while waiting. Small
+# enough that a freed lock is picked up promptly and the timeout is
+# honored within a tight bound; large enough that the poll is cheap.
+_POLL_INTERVAL: float = 0.01
 
-def _acquire_blocking(fd: int) -> None:
-  """Blocking LOCK_EX acquisition — run this in an executor."""
-  fcntl.flock(fd, fcntl.LOCK_EX)
+# flock reports "held by someone else" via one of these errnos depending
+# on the platform.
+_WOULD_BLOCK = {errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK}
+
+
+async def _acquire_with_deadline(fd: int, timeout: float | None) -> bool:
+  """Poll ``LOCK_EX | LOCK_NB`` until acquired or the deadline passes.
+
+  Returns ``True`` if the lock was acquired, ``False`` on timeout. This
+  runs entirely on the event loop: each ``flock`` attempt is
+  non-blocking and returns immediately, and we ``await asyncio.sleep``
+  between attempts so cancellation (including :class:`asyncio.TimeoutError`
+  from an outer ``wait_for``) unwinds cleanly with no orphaned executor
+  thread. The caller owns the fd, so all cleanup happens in its
+  ``finally``.
+  """
+  loop = asyncio.get_running_loop()
+  deadline = None if timeout is None else loop.time() + timeout
+  while True:
+    try:
+      fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      return True
+    except OSError as exc:
+      if exc.errno not in _WOULD_BLOCK:
+        raise
+    if deadline is not None and loop.time() >= deadline:
+      return False
+    delay = _POLL_INTERVAL
+    if deadline is not None:
+      delay = min(delay, deadline - loop.time())
+    await asyncio.sleep(max(0.0, delay))
 
 
 @contextlib.asynccontextmanager
@@ -56,32 +89,22 @@ async def gpu_lock(timeout: float | None = None) -> AsyncIterator[None]:
       on timeout.
 
   Notes:
-    The underlying ``fcntl.flock`` call is blocking; we dispatch it to
-    the default thread executor so the event loop remains responsive.
-    The kernel releases the lock when the fd is closed — including on
-    unexpected process death — so we do NOT need a stale-lock cleanup
-    pass.
+    Acquisition uses non-blocking ``flock(LOCK_NB)`` polling against a
+    monotonic deadline, so it never blocks the event loop and is
+    cancellation-safe: on timeout or cancellation no work is left
+    running in a background thread. The kernel releases the lock when
+    the fd is closed — including on unexpected process death — so we do
+    NOT need a stale-lock cleanup pass.
   """
   GPU_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
   fd = os.open(GPU_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600)
   acquired = False
   try:
-    loop = asyncio.get_running_loop()
-    acquire_future = loop.run_in_executor(None, _acquire_blocking, fd)
-    try:
-      if timeout is None:
-        await acquire_future
-      else:
-        await asyncio.wait_for(acquire_future, timeout=timeout)
-      acquired = True
-    except asyncio.TimeoutError as exc:
-      # The executor task is still running and will eventually acquire.
-      # That's unavoidable with blocking flock; the caller treats this
-      # as "give up", and the eventual acquisition is followed
-      # immediately by fd close, which releases the lock.
+    acquired = await _acquire_with_deadline(fd, timeout)
+    if not acquired:
       raise GpuLockTimeout(
         f"gpu_lock({GPU_LOCK_PATH}) timed out after {timeout}s"
-      ) from exc
+      )
     yield
   finally:
     if acquired:
