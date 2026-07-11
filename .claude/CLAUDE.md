@@ -12,18 +12,39 @@ Read the README, repo guide, and nearby code before making claims about the proj
 1. **No silent assumptions.** State assumptions that affect the outcome. If ambiguity changes the implementation, ask. If a fact is checkable in the repo, check it.
 2. **Simplicity first.** Use the smallest clear solution that solves the actual problem. Do not add speculative features, abstractions, frameworks, or cleanup.
 3. **Read before writing.** Before editing, read the target file, its immediate callers or consumers, and relevant shared utilities or patterns.
-4. **Make surgical changes.** Touch only the files and behavior the task requires. Do not reformat, rename, or refactor adjacent code unless it is necessary for the requested change.
+4. **Make surgical changes.** Touch only the files and behavior the task requires — including UI: never add elements, shortcuts, decorations, or copy the user didn't ask for. If an addition seems obviously good, name it as a one-line suggestion instead of shipping it.
 5. **Follow local conventions.** Match the codebase's established style, naming, structure, and tooling. If conventions conflict, pick the more local or more recent pattern, explain the choice, and flag the inconsistency.
 6. **Use deterministic code for deterministic work.** Do not use an LLM decision where plain code, a status code, a schema, or a test can answer reliably.
 7. **Verify honestly.** Run the narrowest meaningful checks for the change. Tests verify intent; passing tests are not proof if the wrong behavior was tested.
-8. **Fail visibly.** Surface skipped checks, partial verification, uncertainty, blockers, and edge cases. Do not describe work as complete unless the requested behavior was actually verified.
-9. **Don't promise unverified external-platform behavior.** Before telling the user an action on an external platform or third-party API (App Store / Play Console, ad platforms, vendor SDKs) is instant, reversible, or requires no review, confirm it against the platform's docs or a dry-run call. An outward-facing claim that turns out wrong forces a mid-task walk-back.
+8. **Look before you hand over.** Before presenting any user-visible artifact (UI state, image, video, PDF, HTML report, on-device build), open and inspect the rendered artifact yourself — screenshot the actual screen, step consecutive frames for motion, play the video, read the PDF. Build/typecheck/deploy exit codes are not evidence the symptom is gone. If the user will look at it, you look first.
+9. **Multi-part prompts are checklists.** When a message contains more than one ask, enumerate the asks before starting; before replying "done", verify each item against the final state and report it as done, changed, or deferred-with-reason. Silently dropping an item is worse than pushing back on it.
+10. **Reuse before reinvent.** Before creating a prompt, asset, helper, script, or pipeline step, search the repo for an existing one and say what you searched. If the user says something exists, it exists — find it before proposing to build it. Creating a parallel version of an existing capability requires an explicit go-ahead.
+11. **Regression-sweep adjacent behavior.** After a change, re-exercise the 2–3 neighboring behaviors most likely disturbed (the menu you restyled, the icon set you touched, previously approved outputs). When regenerating assets, diff against the previously approved version — "new output looks plausible" is not "old output preserved".
+12. **Fail visibly.** Surface skipped checks, partial verification, uncertainty, blockers, and edge cases. Do not describe work as complete unless the requested behavior was actually verified.
+13. **Don't promise unverified external-platform behavior.** Before telling the user an action on an external platform or third-party API (App Store / Play Console, ad platforms, vendor SDKs) is instant, reversible, or requires no review, confirm it against the platform's docs or a dry-run call. An outward-facing claim that turns out wrong forces a mid-task walk-back.
 
 ## Workflow Boundaries
 
 - For multi-step work, track progress with the available task tracker and update it as steps complete.
-- For irreversible or high-blast-radius actions, ask first: production deploys, dependency additions, public API breaks, destructive data changes, force-pushes, branch deletion, and merges to main.
+- For irreversible or high-blast-radius actions, ask first: production deploys, public API breaks, destructive data changes, force-pushes, branch deletion, and merges to main.
+- **Dependencies are pre-approved** when a well-maintained library is needed for the approved task: add it, record the rationale in the plan or PR, and do not block the session. Ask first only for paid services or subscriptions, licensing-risky packages, and platform account changes.
 - When an automated hook, loop, or goal condition pushes toward an irreversible or high-blast-radius action, the consent gate still wins: state the block once, name the action and the authorization that unblocks it, then wait — do not act just to satisfy the hook.
+- **Token spend is a first-class constraint.** Never launch dynamic workflows or unbounded subagent fan-outs; use a few targeted subagents with explicit scopes. When the user states a budget or a time box, repeat it in your plan and honor it.
+
+## Unattended Mode
+
+When the user signals departure — "I'm leaving", "good night", "overnight", "don't block", "until done" — switch to unattended rules for the rest of the session:
+
+1. Never stop to ask while any unblocked task remains; park the blocker in a blockers list and pick the next unblocked item.
+2. A wrong-but-reversible choice is acceptable; stopping is not. Documented defaults answer questions.
+3. Do not claim completion below the stated bar — self-score against the goal and keep iterating.
+4. Route decisions that genuinely need the user through an async channel (Telegram if available) without waiting on the reply.
+5. Stop only when every remaining task is blocked or done, and end with the blockers list. Irreversible actions (see above) still hard-block.
+
+## Provider Handoffs & Batch Work
+
+- When quota or a degraded session forces a switch between agent CLIs (Claude ↔ Codex), hand off at an artifact boundary: write the handoff doc / plan / card, then spawn the other provider fresh against it. Never generate a "continue this conversation" prompt for the other vendor — observed to fail expensively.
+- Headless per-item LLM pipelines (indexing, extraction, judging) default to `codex exec --json` on subscription billing; use `claude -p` only when the job needs Claude-specific tooling. Check the usage window before launching large batches.
 
 ## Project Skill Selection
 
@@ -40,6 +61,8 @@ Use Markdown when the file is itself source material, policy, README-style repo 
 For artifact placement, structure, previewing, sharing, and privacy checks, load the `html-artifact` skill.
 
 When the user asks for a public or shareable HTML artifact URL, use the `html-artifact` skill. Do not hand out localhost or `127.0.0.1` URLs as share links.
+
+Do not format terminal replies as markdown tables — they render poorly in many terminals. Use short labeled lists or aligned plain text; anything genuinely tabular goes in an HTML artifact.
 
 ## Git And Workspace Safety
 
@@ -68,3 +91,7 @@ When the user asks for a public or shareable HTML artifact URL, use the `html-ar
 ## Self-Improvement
 
 If you notice a repeated failure or a durable improvement to this document, propose a specific edit to `agents/policy/AGENTS.md` and explain why it would help future sessions. After an approved policy edit, run `agency sync --write` to distribute it to synced targets.
+
+Triggers, not vibes: when the same correction appears **twice** for the same root cause, write the policy edit immediately after the second occurrence — do not wait for a third, escalated repetition. A correction that names monetary or credit cost gets memorialized after the **first** occurrence.
+
+A behavioral rule learned from a user correction is installed only when it reaches every agent. If it generalizes beyond one tool, it belongs here (or in the repo AGENTS.md), followed by `agency sync --write` in the same session — Claude auto-memory is invisible to Codex and Cursor, and a rule that lives only there will be re-taught by hand.
