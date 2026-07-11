@@ -8,7 +8,7 @@ class TestClaudeCommand:
     # LLM's no-tools text path: no --allowedTools, no --add-dir
     cmd = _cli.claude_command("sonnet", system_prompt="Be helpful")
     assert cmd == ["claude", "-p", "--model", "sonnet",
-                   "--system-prompt", "Be helpful"]
+                   "--append-system-prompt", "Be helpful"]
 
   def test_agent_write_profile_shape(self):
     cmd = _cli.claude_command(

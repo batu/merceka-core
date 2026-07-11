@@ -43,7 +43,13 @@ def claude_command(
   if accept_edits:
     cmd.extend(["--permission-mode", "acceptEdits"])
   if system_prompt:
-    cmd.extend(["--system-prompt", system_prompt])
+    # --append-system-prompt (not --system-prompt): appends to Claude Code's
+    # default prompt instead of replacing it. Full-replace strips the dynamic
+    # working-directory/env context, so the model stops knowing its cwd already
+    # IS the book dir — it reads the sibling books/ tree and asks "which book?",
+    # never reads a file, emits no citation markers. All callers (book-chat,
+    # content-chat, enrichment WRITE) supply add_dirs and want that cwd context.
+    cmd.extend(["--append-system-prompt", system_prompt])
   for d in add_dirs:
     cmd.extend(["--add-dir", str(d)])
   if allowed_tools:
