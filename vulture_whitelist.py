@@ -25,3 +25,6 @@ _Whitelist.limit
 _Whitelist.verbose
 _Whitelist.items
 _Whitelist.value
+
+# --- Tool-function stub params in tests (names are part of the LLM tool schema) ---
+q  # noqa
