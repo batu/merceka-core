@@ -85,6 +85,47 @@ class TestClaudeCall:
 
         assert mock_run.call_args[1]["timeout"] == CLAUDE_CLI_TIMEOUT
 
+    def test_claude_call_uses_instance_timeout_when_no_per_call_kwarg(self):
+        with patch.object(LLM, '_verify'):
+            llm = LLM("claude/opus", system_prompt="test", timeout=600)
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+            llm.generate("test")
+
+        assert mock_run.call_args[1]["timeout"] == 600
+
+    def test_per_call_timeout_overrides_instance_timeout(self):
+        with patch.object(LLM, '_verify'):
+            llm = LLM("claude/opus", system_prompt="test", timeout=600)
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+            llm.generate("test", timeout=30)
+
+        assert mock_run.call_args[1]["timeout"] == 30
+
+    def test_default_timeout_unchanged_when_neither_given(self):
+        with patch.object(LLM, '_verify'):
+            llm = LLM("claude/opus", system_prompt="test")
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+            llm.generate("test")
+
+        assert mock_run.call_args[1]["timeout"] == CLAUDE_CLI_TIMEOUT
+
+    @pytest.mark.asyncio
+    async def test_agenerate_respects_instance_timeout(self):
+        with patch.object(LLM, '_verify'):
+            llm = LLM("claude/opus", system_prompt="test", timeout=600)
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+            await llm.agenerate("test")
+
+        assert mock_run.call_args[1]["timeout"] == 600
+
     def test_claude_call_raises_on_nonzero_exit(self):
         with patch.object(LLM, '_verify'):
             llm = LLM("claude/opus", system_prompt="test")
