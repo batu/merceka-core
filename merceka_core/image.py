@@ -370,6 +370,60 @@ def _inpaint_openai(
   return result
 
 
+
+def _google_image_or_raise(data: dict) -> Image.Image:
+  """Extract the first inline image from a Gemini generateContent response."""
+  for cand in data.get("candidates", []):
+    for part in cand.get("content", {}).get("parts", []):
+      inline = part.get("inlineData") or part.get("inline_data")
+      if inline and inline.get("data"):
+        raw = base64.b64decode(inline["data"])
+        return Image.open(io.BytesIO(raw))
+  raise RuntimeError(f"Gemini API returned no image: {str(data)[:400]}")
+
+
+def _generate_google(
+  prompt: str,
+  model: str,
+  aspect_ratio: str,
+  transparent: bool,
+  input_images: list[Image.Image] | None = None,
+) -> Image.Image:
+  """Direct Google Gemini API image generation/editing (key-gated fallback
+  when OpenRouter is unavailable). Same prompt contract as the OpenRouter
+  path; alpha is prompt-requested only, so callers needing guaranteed alpha
+  must check the result mode and fall back to matting."""
+  api_key = os.environ.get("GOOGLE_API_KEY")
+  if not api_key:
+    raise RuntimeError("GOOGLE_API_KEY not set in environment")
+  suffix = _IMAGE_ONLY_SUFFIX + (_TRANSPARENT_SUFFIX if transparent else "")
+  parts: list[dict] = []
+  for img in input_images or []:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    parts.append({
+      "inlineData": {"mimeType": "image/png", "data": base64.b64encode(buf.getvalue()).decode()},
+    })
+  parts.append({"text": prompt + suffix})
+  payload = {
+    "contents": [{"parts": parts}],
+    "generationConfig": {
+      "responseModalities": ["IMAGE"],
+      "imageConfig": {"aspectRatio": aspect_ratio},
+    },
+  }
+  with httpx.Client(timeout=300) as client:
+    response = client.post(
+      f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+      json=payload,
+      headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+    )
+    if response.status_code != 200:
+      raise RuntimeError(f"Gemini API error {response.status_code}: {response.text[:400]}")
+    data = response.json()
+  return _google_image_or_raise(data)
+
+
 def generate_image(
   prompt: str,
   *,
@@ -405,6 +459,10 @@ def generate_image(
   # Without an OpenAI key, `openai/...` ids fall through to OpenRouter, which
   # serves the same model ids (no native `background: transparent` there —
   # callers needing guaranteed alpha must check the result mode).
+  if model.startswith("google/") and os.environ.get("GOOGLE_API_KEY") and not os.environ.get("MERCEKA_FORCE_OPENROUTER"):
+    # Key-gated direct Gemini dispatch; OpenRouter remains the default when
+    # only OPENROUTER_API_KEY is present.
+    return _generate_google(prompt, model.removeprefix("google/"), aspect_ratio, transparent)
 
   api_key = os.environ.get("OPENROUTER_API_KEY")
   if not api_key:
@@ -462,6 +520,11 @@ def edit_image(
   """
   if model.startswith("openai/") and os.environ.get("OPENAI_API_KEY"):
     return _edit_openai(image, prompt, model.removeprefix("openai/"))
+  if model.startswith("google/") and os.environ.get("GOOGLE_API_KEY") and not os.environ.get("MERCEKA_FORCE_OPENROUTER"):
+    result = _generate_google(prompt, model.removeprefix("google/"), "1:1", False, input_images=[image])
+    if resize_to_input and result.size != image.size:
+      result = result.resize(image.size, Image.Resampling.LANCZOS)
+    return result
 
   api_key = os.environ.get("OPENROUTER_API_KEY")
   if not api_key:
