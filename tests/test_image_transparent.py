@@ -112,3 +112,14 @@ def test_generate_openai_default_payload_unchanged(monkeypatch):
     img = _generate_openai("a coin", "gpt-image-2", "1:1", "1K")
   assert "background" not in _CapturingClient.last_payload
   assert img.mode == "RGB"
+
+
+def test_openai_prefix_falls_back_to_openrouter_without_key(monkeypatch):
+  monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+  monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+  _CapturingClient.response_payload = _openrouter_response(_png_uri("RGB", (9, 9, 9)))
+  with patch("merceka_core.image.httpx.Client", _CapturingClient):
+    img = generate_image("a coin", model="openai/gpt-5.4-image-2")
+  assert _CapturingClient.last_payload["model"] == "openai/gpt-5.4-image-2"
+  assert _CapturingClient.last_payload["modalities"] == ["image", "text"]
+  assert img.mode == "RGB"

@@ -398,10 +398,13 @@ def generate_image(
   Returns:
     PIL Image — RGBA when `transparent` produced real alpha, RGB otherwise.
   """
-  if model.startswith("openai/"):
+  if model.startswith("openai/") and os.environ.get("OPENAI_API_KEY"):
     return _generate_openai(
       prompt, model.removeprefix("openai/"), aspect_ratio, image_size, transparent
     )
+  # Without an OpenAI key, `openai/...` ids fall through to OpenRouter, which
+  # serves the same model ids (no native `background: transparent` there —
+  # callers needing guaranteed alpha must check the result mode).
 
   api_key = os.environ.get("OPENROUTER_API_KEY")
   if not api_key:
