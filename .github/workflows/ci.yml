@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+          enable-cache: true
+      - run: uv sync
+      # addopts in pyproject already deselects integration/gpu markers
+      - run: uv run pytest -q
+      - run: uv run ruff check
+      # basic mode with a grandfathered exclude list in pyproject — shrink it, never grow it
+      - run: uv run basedpyright

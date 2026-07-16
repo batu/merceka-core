@@ -38,7 +38,17 @@ addopts = "-m 'not integration and not gpu'"
 include = ["merceka_core*"]
 
 [tool.basedpyright]
+typeCheckingMode = "basic"
 reportMissingImports = false
+include = ["merceka_core"]
+# Grandfathered files with pre-existing type errors (2026-07-15, CI introduction).
+# Fix and remove entries; never add new ones.
+exclude = [
+  "merceka_core/evaluation.py",
+  "merceka_core/llm.py",
+  "merceka_core/image.py",
+  "merceka_core/wa_bot/webhook.py",
+]
 
 [tool.ruff]
 line-length = 100
@@ -60,6 +70,7 @@ convention = "google"
 
 [dependency-groups]
 dev = [
+    "basedpyright>=1.39.9",
     "httpx>=0.28.1",
     "pytest>=9.0.2",
     "pytest-asyncio>=1.3.0",
