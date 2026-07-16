@@ -123,3 +123,18 @@ def test_openai_prefix_falls_back_to_openrouter_without_key(monkeypatch):
   assert _CapturingClient.last_payload["model"] == "openai/gpt-5.4-image-2"
   assert _CapturingClient.last_payload["modalities"] == ["image", "text"]
   assert img.mode == "RGB"
+
+
+def test_edit_image_can_skip_resize_and_falls_back_without_key(monkeypatch):
+  from merceka_core.image import edit_image
+
+  monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+  monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+  _CapturingClient.response_payload = _openrouter_response(_png_uri("RGB", (9, 9, 9)))
+  anchor = Image.new("RGB", (64, 64), (1, 2, 3))
+  with patch("merceka_core.image.httpx.Client", _CapturingClient):
+    kept = edit_image(anchor, "make tiers", model="openai/gpt-5.4-image-2")
+    free = edit_image(anchor, "make tiers", model="openai/gpt-5.4-image-2", resize_to_input=False)
+  assert _CapturingClient.last_payload["model"] == "openai/gpt-5.4-image-2"
+  assert kept.size == (64, 64)
+  assert free.size == (2, 2)  # model output size preserved

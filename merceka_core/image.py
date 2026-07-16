@@ -443,6 +443,7 @@ def edit_image(
   prompt: str,
   *,
   model: str = "google/gemini-3.1-flash-image-preview",
+  resize_to_input: bool = True,
 ) -> Image.Image:
   """Send one image + text prompt, get back a modified image.
 
@@ -459,7 +460,7 @@ def edit_image(
   Returns:
     PIL Image in RGB mode, resized to the input's original dimensions.
   """
-  if model.startswith("openai/"):
+  if model.startswith("openai/") and os.environ.get("OPENAI_API_KEY"):
     return _edit_openai(image, prompt, model.removeprefix("openai/"))
 
   api_key = os.environ.get("OPENROUTER_API_KEY")
@@ -508,7 +509,7 @@ def edit_image(
     data = response.json()
 
   result = _openrouter_image_or_raise(data)
-  if result.size != original_size:
+  if resize_to_input and result.size != original_size:
     result = result.resize(original_size, Image.Resampling.LANCZOS)
   return result
 
