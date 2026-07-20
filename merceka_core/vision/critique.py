@@ -20,12 +20,23 @@ from statistics import median
 from typing import Any, Callable
 
 import httpx
+import shutil
+import subprocess
+import tempfile as _tempfile
 
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits"
 _ENV_FALLBACK_PATH = Path("/Users/base/dev/appletolye/.env")
 
 JUDGE_REGISTRY: list[dict[str, Any]] = [
+  {
+    # Runs through the local `codex` CLI (subscription billing), not OpenRouter.
+    "id": "codex/gpt-5.6-terra",
+    "model": "gpt-5.6-terra",
+    "cli": "codex",
+    "effort": "max",
+    "enabled": True,
+  },
   {
     "id": "anthropic/claude-fable-5",
     "model": "anthropic/claude-fable-5",
@@ -264,12 +275,16 @@ def critique(
       if budget_halted:
         _record_skip(per_model, skipped, judge, "budget")
         continue
-      if budget_check is not None and not _budget_allows(budget_check, judge):
-        budget_halted = True
-        _record_skip(per_model, skipped, judge, "budget")
-        continue
-
-      result = _call_judge(http_client, judge, messages, api_key, check_units)
+      if judge.get("cli") == "codex":
+        # CLI judges bill the codex subscription, not OpenRouter credits, so
+        # the OpenRouter budget gate does not apply to them.
+        result = _call_codex_cli_judge(judge, images, reference, spec, check_units)
+      else:
+        if budget_check is not None and not _budget_allows(budget_check, judge):
+          budget_halted = True
+          _record_skip(per_model, skipped, judge, "budget")
+          continue
+        result = _call_judge(http_client, judge, messages, api_key, check_units)
       if result["ok"]:
         per_model[judge_id] = {
           "model": judge["model"],
@@ -360,6 +375,58 @@ def openrouter_budget_floor(
         http_client.close()
 
   return check
+
+
+def _call_codex_cli_judge(
+  judge: dict[str, Any],
+  images: list[str | Path | bytes | bytearray | memoryview],
+  reference: str | Path | None,
+  spec: str | None,
+  recurring_check_units: list[str],
+) -> dict[str, Any]:
+  """Run one judge through the local `codex` CLI (vision via -i attachments)."""
+  binary = shutil.which("codex") or "/opt/homebrew/bin/codex"
+  prompt = _prompt_with_spec(spec, reference, recurring_check_units)
+  ordered: list[str | Path | bytes | bytearray | memoryview] = []
+  if reference is not None:
+    prompt += "\n\nAttached images, in order: image 1 is the REFERENCE; the rest are OURS."
+    ordered.append(reference)
+  else:
+    prompt += "\n\nAttached images are OURS, in order."
+  ordered.extend(images)
+
+  args = [binary, "exec", "-m", judge["model"],
+          "-c", f"model_reasoning_effort={judge.get('effort', 'high')}"]
+  temps: list[str] = []
+  try:
+    for item in ordered:
+      if isinstance(item, (bytes, bytearray, memoryview)):
+        handle = _tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        handle.write(bytes(item))
+        handle.close()
+        temps.append(handle.name)
+        args.extend(["-i", handle.name])
+      else:
+        args.extend(["-i", str(item)])
+    args.append("-")
+    completed = subprocess.run(
+      args, input=prompt, capture_output=True, text=True, timeout=600,
+    )
+  except (OSError, subprocess.TimeoutExpired):
+    return {"ok": False, "reason": "cli-error"}
+  finally:
+    for name in temps:
+      Path(name).unlink(missing_ok=True)
+
+  if completed.returncode != 0:
+    return {"ok": False, "reason": "cli-error"}
+  # codex exec prints the answer, a "tokens used" line, then echoes the answer.
+  text = completed.stdout.split("tokens used", 1)[0]
+  try:
+    parsed = parse_judge_response(text, recurring_check_units=recurring_check_units)
+  except (TypeError, ValueError, json.JSONDecodeError):
+    return {"ok": False, "reason": "parse-failure"}
+  return {"ok": True, **parsed}
 
 
 def _call_judge(
