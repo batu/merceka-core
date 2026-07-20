@@ -27,6 +27,11 @@ _ENV_FALLBACK_PATH = Path("/Users/base/dev/appletolye/.env")
 
 JUDGE_REGISTRY: list[dict[str, Any]] = [
   {
+    "id": "anthropic/claude-fable-5",
+    "model": "anthropic/claude-fable-5",
+    "enabled": True,
+  },
+  {
     "id": "anthropic/claude-opus-4.8",
     "model": "anthropic/claude-opus-4.8",
     "enabled": True,
