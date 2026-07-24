@@ -70,6 +70,7 @@ def test_openrouter_transparent_without_alpha_returns_rgb():
 
 def test_generate_image_openrouter_transparent_prompt_and_alpha(monkeypatch):
   monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+  monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
   _CapturingClient.response_payload = _openrouter_response(_png_uri("RGBA", (0, 255, 0, 64)))
   with patch("merceka_core.image.httpx.Client", _CapturingClient):
     img = generate_image("a coin", model="google/gemini-3.1-flash-image", transparent=True)
@@ -80,6 +81,7 @@ def test_generate_image_openrouter_transparent_prompt_and_alpha(monkeypatch):
 
 def test_generate_image_openrouter_default_has_no_transparent_suffix(monkeypatch):
   monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+  monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
   _CapturingClient.response_payload = _openrouter_response(_png_uri("RGB", (0, 255, 0)))
   with patch("merceka_core.image.httpx.Client", _CapturingClient):
     img = generate_image("a coin", model="google/gemini-3.1-flash-image")
