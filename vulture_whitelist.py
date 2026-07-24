@@ -15,9 +15,13 @@ class _Whitelist:
   verbose = None
   items = None
   value = None
+  # Tool-function parameter in test_claude_provider.py's delegation test —
+  # exists to exercise schema generation from the signature.
+  q = None
 
 
 _Whitelist.api_keys
+_Whitelist.q
 _Whitelist.exc
 _Whitelist.exc_type
 _Whitelist.tb
