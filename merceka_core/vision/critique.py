@@ -21,6 +21,8 @@ from typing import Any, Callable
 
 import httpx
 import shutil
+
+from merceka_core.vision import zoom_judge as _zoom_judge
 import subprocess
 import tempfile as _tempfile
 
@@ -35,6 +37,14 @@ JUDGE_REGISTRY: list[dict[str, Any]] = [
     "model": "gpt-5.6-terra",
     "cli": "codex",
     "effort": "max",
+    "enabled": True,
+  },
+  {
+    # Agentic zoom judge: bills the Anthropic API directly (key-gated on
+    # ANTHROPIC_API_KEY), magnifies regions before judging small detail.
+    "id": "anthropic/claude-fable-5-zoom",
+    "model": "claude-fable-5",
+    "api": "anthropic-zoom",
     "enabled": True,
   },
   {
@@ -279,6 +289,10 @@ def critique(
         # CLI judges bill the codex subscription, not OpenRouter credits, so
         # the OpenRouter budget gate does not apply to them.
         result = _call_codex_cli_judge(judge, images, reference, spec, check_units)
+      elif judge.get("api") == "anthropic-zoom":
+        # Bills the Anthropic API directly; the OpenRouter budget gate does
+        # not apply. Skips itself when no key is configured.
+        result = _call_anthropic_zoom_judge(judge, images, reference, spec, check_units)
       else:
         if budget_check is not None and not _budget_allows(budget_check, judge):
           budget_halted = True
@@ -375,6 +389,32 @@ def openrouter_budget_floor(
         http_client.close()
 
   return check
+
+
+def _call_anthropic_zoom_judge(
+  judge: dict[str, Any],
+  images: list[str | Path | bytes | bytearray | memoryview],
+  reference: str | Path | None,
+  spec: str | None,
+  recurring_check_units: list[str],
+) -> dict[str, Any]:
+  api_key = _anthropic_api_key()
+  if not api_key:
+    return {"ok": False, "reason": "no-key"}
+  raw = _zoom_judge.call_zoom_judge(
+    judge,
+    images,
+    reference,
+    _prompt_with_spec(spec, reference, recurring_check_units),
+    api_key=api_key,
+  )
+  if not raw["ok"]:
+    return raw
+  try:
+    parsed = parse_judge_response(raw["text"], recurring_check_units=recurring_check_units)
+  except (TypeError, ValueError, json.JSONDecodeError):
+    return {"ok": False, "reason": "parse-failure"}
+  return {"ok": True, **parsed}
 
 
 def _call_codex_cli_judge(
@@ -804,13 +844,17 @@ def _normalize_judges(judges: list[str | dict[str, Any]] | None) -> list[dict[st
     judge_id = item.get("id") or model
     if not model or not judge_id:
       raise ValueError(f"invalid judge registry item: {item!r}")
-    normalized.append(
-      {
-        "id": str(judge_id),
-        "model": str(model),
-        "enabled": bool(item.get("enabled", True)),
-      }
-    )
+    normalized_item = {
+      "id": str(judge_id),
+      "model": str(model),
+      "enabled": bool(item.get("enabled", True)),
+    }
+    # Transport selectors must survive normalization or dispatch falls back
+    # to the default OpenRouter path.
+    for transport_key in ("cli", "effort", "api"):
+      if transport_key in item:
+        normalized_item[transport_key] = item[transport_key]
+    normalized.append(normalized_item)
   return normalized
 
 
@@ -976,13 +1020,21 @@ def _clip(value: Any) -> str:
 
 
 def _openrouter_api_key() -> str | None:
-  key = os.getenv("OPENROUTER_API_KEY")
+  return _api_key("OPENROUTER_API_KEY")
+
+
+def _anthropic_api_key() -> str | None:
+  return _api_key("ANTHROPIC_API_KEY")
+
+
+def _api_key(name: str) -> str | None:
+  key = os.getenv(name)
   if key:
     return key
-  return _env_file_key(_ENV_FALLBACK_PATH)
+  return _env_file_key(_ENV_FALLBACK_PATH, name)
 
 
-def _env_file_key(path: Path) -> str | None:
+def _env_file_key(path: Path, target_name: str = "OPENROUTER_API_KEY") -> str | None:
   try:
     lines = path.read_text().splitlines()
   except OSError:
@@ -993,6 +1045,6 @@ def _env_file_key(path: Path) -> str | None:
       continue
     name, value = stripped.split("=", 1)
     name = name.removeprefix("export ").strip()
-    if name == "OPENROUTER_API_KEY":
+    if name == target_name:
       return value.strip().strip("\"'") or None
   return None
