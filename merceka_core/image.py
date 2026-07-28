@@ -92,18 +92,34 @@ def _extract_openrouter_image_ref(data: dict) -> str:
   raise KeyError("images")
 
 
-def _openrouter_image_or_raise(data: dict) -> Image.Image:
+def _openrouter_image_or_raise(data: dict, *, transparent: bool = False) -> Image.Image:
   try:
     image_ref = _extract_openrouter_image_ref(data)
   except (KeyError, IndexError, TypeError) as e:
     raise RuntimeError(
       f"No image in OpenRouter response: {e}\nResponse: {json.dumps(data, indent=2)[:500]}"
     ) from e
-  return _load_image_ref(image_ref).convert("RGB")
+  image = _load_image_ref(image_ref)
+  if transparent and _has_alpha(image):
+    return image.convert("RGBA")
+  return image.convert("RGB")
+
+
+def _has_alpha(image: Image.Image) -> bool:
+  """True when the image carries an alpha channel (or palette transparency)."""
+  return (
+    image.mode in ("RGBA", "LA", "PA")
+    or (image.mode == "P" and "transparency" in image.info)
+  )
 
 
 _IMAGE_ONLY_SUFFIX = (
   "\n\nReturn an image using the image modality. Do not respond with text only."
+)
+
+_TRANSPARENT_SUFFIX = (
+  "\n\nRender the subject on a fully transparent background (PNG alpha channel,"
+  " no backdrop, no solid color fill behind the subject)."
 )
 
 
@@ -152,7 +168,13 @@ def _openai_size(aspect_ratio: str, image_size: str, model: str = "") -> str:
   return _OPENAI_1K_SIZES.get(aspect_ratio, "1024x1024")
 
 
-def _generate_openai(prompt: str, model: str, aspect_ratio: str, image_size: str) -> Image.Image:
+def _generate_openai(
+  prompt: str,
+  model: str,
+  aspect_ratio: str,
+  image_size: str,
+  transparent: bool = False,
+) -> Image.Image:
   """Generate an image via OpenAI's direct image API (e.g. gpt-image-2).
 
   OpenAI-side model id has no `openai/` prefix. The caller strips it
@@ -169,6 +191,9 @@ def _generate_openai(prompt: str, model: str, aspect_ratio: str, image_size: str
     "size": size,
     "n": 1,
   }
+  if transparent:
+    payload["background"] = "transparent"
+  target_mode = "RGBA" if transparent else "RGB"
 
   with httpx.Client(timeout=300) as client:
     response = client.post(
@@ -187,13 +212,13 @@ def _generate_openai(prompt: str, model: str, aspect_ratio: str, image_size: str
     item = data["data"][0]
     if "b64_json" in item:
       raw = base64.b64decode(item["b64_json"])
-      return Image.open(io.BytesIO(raw)).convert("RGB")
+      return Image.open(io.BytesIO(raw)).convert(target_mode)
     # Some responses use a URL instead of b64_json.
     url = item["url"]
     with httpx.Client(timeout=120) as client:
       r = client.get(url)
       r.raise_for_status()
-      return Image.open(io.BytesIO(r.content)).convert("RGB")
+      return Image.open(io.BytesIO(r.content)).convert(target_mode)
   except (KeyError, IndexError) as e:
     raise RuntimeError(
       f"No image in OpenAI response: {e}\nResponse: {json.dumps(data, indent=2)[:500]}"
@@ -345,12 +370,67 @@ def _inpaint_openai(
   return result
 
 
+
+def _google_image_or_raise(data: dict) -> Image.Image:
+  """Extract the first inline image from a Gemini generateContent response."""
+  for cand in data.get("candidates", []):
+    for part in cand.get("content", {}).get("parts", []):
+      inline = part.get("inlineData") or part.get("inline_data")
+      if inline and inline.get("data"):
+        raw = base64.b64decode(inline["data"])
+        return Image.open(io.BytesIO(raw))
+  raise RuntimeError(f"Gemini API returned no image: {str(data)[:400]}")
+
+
+def _generate_google(
+  prompt: str,
+  model: str,
+  aspect_ratio: str,
+  transparent: bool,
+  input_images: list[Image.Image] | None = None,
+) -> Image.Image:
+  """Direct Google Gemini API image generation/editing (key-gated fallback
+  when OpenRouter is unavailable). Same prompt contract as the OpenRouter
+  path; alpha is prompt-requested only, so callers needing guaranteed alpha
+  must check the result mode and fall back to matting."""
+  api_key = os.environ.get("GOOGLE_API_KEY")
+  if not api_key:
+    raise RuntimeError("GOOGLE_API_KEY not set in environment")
+  suffix = _IMAGE_ONLY_SUFFIX + (_TRANSPARENT_SUFFIX if transparent else "")
+  parts: list[dict] = []
+  for img in input_images or []:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    parts.append({
+      "inlineData": {"mimeType": "image/png", "data": base64.b64encode(buf.getvalue()).decode()},
+    })
+  parts.append({"text": prompt + suffix})
+  payload = {
+    "contents": [{"parts": parts}],
+    "generationConfig": {
+      "responseModalities": ["IMAGE"],
+      "imageConfig": {"aspectRatio": aspect_ratio},
+    },
+  }
+  with httpx.Client(timeout=300) as client:
+    response = client.post(
+      f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+      json=payload,
+      headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+    )
+    if response.status_code != 200:
+      raise RuntimeError(f"Gemini API error {response.status_code}: {response.text[:400]}")
+    data = response.json()
+  return _google_image_or_raise(data)
+
+
 def generate_image(
   prompt: str,
   *,
   model: str = "google/gemini-3.1-flash-image-preview",
   aspect_ratio: str = "1:1",
   image_size: str = "1K",
+  transparent: bool = False,
 ) -> Image.Image:
   """Generate an image from a text prompt.
 
@@ -363,20 +443,35 @@ def generate_image(
     model: OpenRouter model id OR `openai/<openai-model>`.
     aspect_ratio: Aspect ratio string (e.g., "1:1", "9:16", "16:9").
     image_size: Resolution tier ("1K", "2K", "4K") — OpenAI maps to WxH.
+    transparent: Request a transparent background. OpenAI: native alpha via
+      `background: "transparent"` (RGBA result). OpenRouter: prompt-requested;
+      alpha is preserved only when the model actually returns it — callers
+      needing guaranteed alpha must check the result mode and fall back to
+      matting.
 
   Returns:
-    PIL Image in RGB mode.
+    PIL Image — RGBA when `transparent` produced real alpha, RGB otherwise.
   """
-  if model.startswith("openai/"):
-    return _generate_openai(prompt, model.removeprefix("openai/"), aspect_ratio, image_size)
+  if model.startswith("openai/") and os.environ.get("OPENAI_API_KEY"):
+    return _generate_openai(
+      prompt, model.removeprefix("openai/"), aspect_ratio, image_size, transparent
+    )
+  # Without an OpenAI key, `openai/...` ids fall through to OpenRouter, which
+  # serves the same model ids (no native `background: transparent` there —
+  # callers needing guaranteed alpha must check the result mode).
+  if model.startswith("google/") and os.environ.get("GOOGLE_API_KEY") and not os.environ.get("MERCEKA_FORCE_OPENROUTER"):
+    # Key-gated direct Gemini dispatch; OpenRouter remains the default when
+    # only OPENROUTER_API_KEY is present.
+    return _generate_google(prompt, model.removeprefix("google/"), aspect_ratio, transparent)
 
   api_key = os.environ.get("OPENROUTER_API_KEY")
   if not api_key:
     raise RuntimeError("OPENROUTER_API_KEY not set in environment")
 
+  suffix = _IMAGE_ONLY_SUFFIX + (_TRANSPARENT_SUFFIX if transparent else "")
   payload = {
     "model": model,
-    "messages": [{"role": "user", "content": prompt + _IMAGE_ONLY_SUFFIX}],
+    "messages": [{"role": "user", "content": prompt + suffix}],
     "modalities": ["image", "text"],
     "image_config": {
       "aspect_ratio": aspect_ratio,
@@ -398,7 +493,7 @@ def generate_image(
 
     data = response.json()
 
-  return _openrouter_image_or_raise(data)
+  return _openrouter_image_or_raise(data, transparent=transparent)
 
 
 def edit_image(
@@ -406,6 +501,7 @@ def edit_image(
   prompt: str,
   *,
   model: str = "google/gemini-3.1-flash-image-preview",
+  resize_to_input: bool = True,
 ) -> Image.Image:
   """Send one image + text prompt, get back a modified image.
 
@@ -422,8 +518,13 @@ def edit_image(
   Returns:
     PIL Image in RGB mode, resized to the input's original dimensions.
   """
-  if model.startswith("openai/"):
+  if model.startswith("openai/") and os.environ.get("OPENAI_API_KEY"):
     return _edit_openai(image, prompt, model.removeprefix("openai/"))
+  if model.startswith("google/") and os.environ.get("GOOGLE_API_KEY") and not os.environ.get("MERCEKA_FORCE_OPENROUTER"):
+    result = _generate_google(prompt, model.removeprefix("google/"), "1:1", False, input_images=[image])
+    if resize_to_input and result.size != image.size:
+      result = result.resize(image.size, Image.Resampling.LANCZOS)
+    return result
 
   api_key = os.environ.get("OPENROUTER_API_KEY")
   if not api_key:
@@ -471,7 +572,7 @@ def edit_image(
     data = response.json()
 
   result = _openrouter_image_or_raise(data)
-  if result.size != original_size:
+  if resize_to_input and result.size != original_size:
     result = result.resize(original_size, Image.Resampling.LANCZOS)
   return result
 

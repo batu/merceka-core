@@ -83,6 +83,10 @@ class FakeHttpx:
 def api_keys(monkeypatch):
   monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-test")
   monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+  # Direct-provider dispatch is key-gated; strip ambient keys so these tests
+  # exercise the routes they assert regardless of the developer's shell env.
+  monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+  monkeypatch.delenv("MERCEKA_FORCE_OPENROUTER", raising=False)
 
 
 @pytest.fixture
@@ -172,13 +176,19 @@ class TestGenerateImageDispatch:
       generate_image("x", model="google/gemini-3.1-flash-image-preview")
     assert fake.posts == []
 
-  def test_missing_openai_key_raises(self, fake_post, monkeypatch):
-    fake = fake_post(FakeResponse(body=_openai_body()))
+  def test_openai_id_without_key_falls_through_to_openrouter(self, fake_post, monkeypatch):
+    # Without an OpenAI key, `openai/...` ids are served by OpenRouter, which
+    # hosts the same model ids.
+    fake = fake_post(FakeResponse(body=_openrouter_body()))
     monkeypatch.delenv("OPENAI_API_KEY")
 
-    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
-      generate_image("x", model="openai/gpt-image-2")
-    assert fake.posts == []
+    result = generate_image("x", model="openai/gpt-image-2")
+
+    assert result.mode == "RGB"
+    url, kwargs = fake.posts[0]
+    assert url == OPENROUTER_CHAT
+    assert kwargs["json"]["model"] == "openai/gpt-image-2"
+    assert kwargs["headers"]["Authorization"] == "Bearer sk-or-test"
 
 
 # --- edit_image dispatch ---
