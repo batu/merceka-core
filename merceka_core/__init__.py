@@ -17,7 +17,7 @@ from merceka_core.errors import (
   VideoNotFoundError,
   VideoUploadError,
 )
-from merceka_core.resources import GPU_LOCK_PATH, gpu_lock
+from merceka_core.resources import GPU_LOCK_PATH, gpu_lock, gpu_lock_sync
 
 # Heavy names (LLM pulls litellm/ollama; providers pull subprocess plumbing)
 # resolve lazily via PEP 562 so `from merceka_core import gpu_lock` stays light.
@@ -80,4 +80,5 @@ __all__ = [
   "VideoNotFoundError",
   "VideoUploadError",
   "gpu_lock",
+  "gpu_lock_sync",
 ]

@@ -25,6 +25,15 @@ Usage::
     async def transcribe(audio):
         async with gpu_lock(timeout=600):
             return await whisperx.transcribe(audio)
+
+Callers without an event loop use the blocking twin, which contends for
+the same lock file::
+
+    from merceka_core import gpu_lock_sync
+
+    for chunk in chunks:                 # per chunk, never per job
+        with gpu_lock_sync(timeout=600):
+            render(chunk)
 """
 
 from __future__ import annotations
@@ -34,8 +43,9 @@ import contextlib
 import errno
 import fcntl
 import os
+import time
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Iterator
 
 from merceka_core.errors import GpuLockTimeout
 
@@ -85,6 +95,72 @@ async def _acquire_with_deadline(fd: int, timeout: float | None) -> bool:
     # (top of the loop, before any sleep) is exempt.
     if deadline is not None and loop.time() >= deadline:
       return False
+
+
+def _acquire_with_deadline_sync(fd: int, timeout: float | None) -> bool:
+  """Blocking twin of :func:`_acquire_with_deadline`.
+
+  Returns ``True`` if the lock was acquired, ``False`` on timeout. Polls
+  the same non-blocking ``flock`` rather than using a blocking
+  ``LOCK_EX``, so a timeout is honored within ``_POLL_INTERVAL`` instead
+  of waiting forever on the kernel.
+  """
+  deadline = None if timeout is None else time.monotonic() + timeout
+  while True:
+    try:
+      fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      return True
+    except OSError as exc:
+      if exc.errno not in _WOULD_BLOCK:
+        raise
+    if deadline is not None and time.monotonic() >= deadline:
+      return False
+    delay = _POLL_INTERVAL
+    if deadline is not None:
+      delay = min(delay, deadline - time.monotonic())
+    time.sleep(max(0.0, delay))
+    # Mirrors the async path: the process may have been descheduled well
+    # past the deadline while sleeping, and a holder releasing during
+    # that stall must not let a late acquisition pass as an on-time one.
+    if deadline is not None and time.monotonic() >= deadline:
+      return False
+
+
+@contextlib.contextmanager
+def gpu_lock_sync(timeout: float | None = None) -> Iterator[None]:
+  """Synchronous context manager that serializes GPU access across processes.
+
+  The blocking counterpart to :func:`gpu_lock`, for callers with no event
+  loop — batch renderers, CLIs, worker scripts. Both take ``LOCK_EX`` on
+  the same :data:`GPU_LOCK_PATH`, so sync and async holders exclude each
+  other; the kernel does not care which flavor of Python took the lock.
+
+  Args:
+    timeout: Seconds to wait for acquisition. ``None`` waits
+      indefinitely. Raises :class:`~merceka_core.errors.GpuLockTimeout`
+      on timeout.
+
+  Notes:
+    Hold this for one unit of GPU work, not one job. A long render should
+    acquire and release per chunk so other GPU consumers can interleave;
+    holding it for hours starves every other pipeline on the machine.
+  """
+  GPU_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+  fd = os.open(GPU_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600)
+  acquired = False
+  try:
+    acquired = _acquire_with_deadline_sync(fd, timeout)
+    if not acquired:
+      raise GpuLockTimeout(f"gpu_lock_sync({GPU_LOCK_PATH}) timed out after {timeout}s")
+    yield
+  finally:
+    if acquired:
+      try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+      except OSError:
+        # fd may have been closed by the kernel on process shutdown.
+        pass
+    os.close(fd)
 
 
 @contextlib.asynccontextmanager
