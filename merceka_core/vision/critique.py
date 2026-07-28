@@ -45,26 +45,39 @@ JUDGE_REGISTRY: list[dict[str, Any]] = [
     "id": "anthropic/claude-fable-5-zoom",
     "model": "claude-fable-5",
     "api": "anthropic-zoom",
+    # Off by default: bills the Anthropic API directly rather than a
+    # subscription. Re-enable per-call via an explicit roster when a job needs
+    # magnified small-detail judging.
+    "enabled": False,
+  },
+  {
+    # Runs through the local `claude` CLI (subscription billing), not OpenRouter.
+    "id": "anthropic/claude-fable-5",
+    "model": "claude-fable-5",
+    "cli": "claude",
     "enabled": True,
   },
   {
-    "id": "anthropic/claude-fable-5",
-    "model": "anthropic/claude-fable-5",
+    # Runs through the local `claude` CLI (subscription billing), not OpenRouter.
+    "id": "anthropic/claude-opus-5",
+    "model": "claude-opus-5",
+    "cli": "claude",
     "enabled": True,
   },
   {
     "id": "anthropic/claude-opus-4.8",
     "model": "anthropic/claude-opus-4.8",
-    "enabled": True,
+    "enabled": False,
   },
   {
     "id": "anthropic/claude-sonnet-4.6",
     "model": "anthropic/claude-sonnet-4.6",
-    "enabled": True,
+    "enabled": False,
   },
   {
-    "id": "google/gemini-3.5-flash",
-    "model": "google/gemini-3.5-flash",
+    # The only judge that spends OpenRouter credits.
+    "id": "google/gemini-3.6-flash",
+    "model": "google/gemini-3.6-flash",
     "enabled": True,
   },
   {
@@ -289,6 +302,10 @@ def critique(
         # CLI judges bill the codex subscription, not OpenRouter credits, so
         # the OpenRouter budget gate does not apply to them.
         result = _call_codex_cli_judge(judge, images, reference, spec, check_units)
+      elif judge.get("cli") == "claude":
+        # Bills the Claude subscription through the local CLI, not OpenRouter
+        # credits, so the OpenRouter budget gate does not apply.
+        result = _call_claude_cli_judge(judge, images, reference, spec, check_units)
       elif judge.get("api") == "anthropic-zoom":
         # Bills the Anthropic API directly; the OpenRouter budget gate does
         # not apply. Skips itself when no key is configured.
@@ -464,6 +481,81 @@ def _call_codex_cli_judge(
   text = completed.stdout.split("tokens used", 1)[0]
   try:
     parsed = parse_judge_response(text, recurring_check_units=recurring_check_units)
+  except (TypeError, ValueError, json.JSONDecodeError):
+    return {"ok": False, "reason": "parse-failure"}
+  return {"ok": True, **parsed}
+
+
+def _call_claude_cli_judge(
+  judge: dict[str, Any],
+  images: list[str | Path | bytes | bytearray | memoryview],
+  reference: str | Path | None,
+  spec: str | None,
+  recurring_check_units: list[str],
+) -> dict[str, Any]:
+  """Run one judge through the local `claude` CLI on subscription billing.
+
+  Unlike `codex exec -i`, `claude -p` has no image-attachment flag, so images
+  are named by absolute path and read with the Read tool. The judge runs in a
+  scratch cwd so the calling repo's CLAUDE.md and hooks never leak into the
+  critique prompt.
+  """
+  binary = shutil.which("claude") or "/opt/homebrew/bin/claude"
+  prompt = _prompt_with_spec(spec, reference, recurring_check_units)
+  ordered: list[str | Path | bytes | bytearray | memoryview] = []
+  if reference is not None:
+    ordered.append(reference)
+  ordered.extend(images)
+
+  temps: list[str] = []
+  try:
+    paths: list[Path] = []
+    for item in ordered:
+      if isinstance(item, (bytes, bytearray, memoryview)):
+        handle = _tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        handle.write(bytes(item))
+        handle.close()
+        temps.append(handle.name)
+        paths.append(Path(handle.name).resolve())
+      else:
+        paths.append(Path(item).resolve())
+
+    listing = "\n".join(f"- {p}" for p in paths)
+    if reference is not None:
+      roles = "The first path is the REFERENCE; every path after it is OURS."
+    else:
+      roles = "Every path is OURS."
+    prompt += (
+      f"\n\nRead each of these image files in order with the Read tool, then judge.\n"
+      f"{roles}\n{listing}\n\n"
+      "Output ONLY the JSON object. No preamble, no commentary, no code fence."
+    )
+
+    allow_dirs: list[str] = []
+    for parent in dict.fromkeys(str(p.parent) for p in paths):
+      allow_dirs.extend(["--add-dir", parent])
+
+    with _tempfile.TemporaryDirectory(prefix="critique-claude-") as workdir:
+      completed = subprocess.run(
+        [binary, "-p", "--model", judge["model"], "--allowedTools", "Read", *allow_dirs],
+        input=prompt,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        cwd=workdir,
+      )
+  except (OSError, subprocess.TimeoutExpired):
+    return {"ok": False, "reason": "cli-error"}
+  finally:
+    for name in temps:
+      Path(name).unlink(missing_ok=True)
+
+  if completed.returncode != 0:
+    return {"ok": False, "reason": "cli-error"}
+  try:
+    parsed = parse_judge_response(
+      completed.stdout, recurring_check_units=recurring_check_units
+    )
   except (TypeError, ValueError, json.JSONDecodeError):
     return {"ok": False, "reason": "parse-failure"}
   return {"ok": True, **parsed}
