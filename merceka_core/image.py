@@ -16,6 +16,8 @@ import re
 import httpx
 from PIL import Image
 
+from merceka_core import costs as _costs
+
 
 def _image_to_base64_uri(image: Image.Image) -> str:
   """Convert a PIL Image to a base64 PNG data URI."""
@@ -421,6 +423,7 @@ def _generate_google(
     if response.status_code != 200:
       raise RuntimeError(f"Gemini API error {response.status_code}: {response.text[:400]}")
     data = response.json()
+  _costs.record(source="google-direct", model=f"google/{model}", usage=data.get("usageMetadata"))
   return _google_image_or_raise(data)
 
 
@@ -477,6 +480,7 @@ def generate_image(
       "aspect_ratio": aspect_ratio,
       "image_size": image_size,
     },
+    "usage": {"include": True},
   }
 
   with httpx.Client(timeout=300) as client:
@@ -493,6 +497,8 @@ def generate_image(
 
     data = response.json()
 
+  usage = data.get("usage") or {}
+  _costs.record(source="openrouter", model=model, usage=usage, usd=usage.get("cost"))
   return _openrouter_image_or_raise(data, transparent=transparent)
 
 
@@ -556,6 +562,8 @@ def edit_image(
       "aspect_ratio": ar,
       "image_size": img_size,
     },
+    # Ask the biller to state the exact cost of this call in the response.
+    "usage": {"include": True},
   }
 
   with httpx.Client(timeout=300) as client:
@@ -571,6 +579,8 @@ def edit_image(
       raise RuntimeError(f"OpenRouter API error {response.status_code}: {response.text[:500]}")
     data = response.json()
 
+  usage = data.get("usage") or {}
+  _costs.record(source="openrouter", model=model, usage=usage, usd=usage.get("cost"))
   result = _openrouter_image_or_raise(data)
   if resize_to_input and result.size != original_size:
     result = result.resize(original_size, Image.Resampling.LANCZOS)
@@ -791,6 +801,7 @@ def _inpaint_openrouter(
       "aspect_ratio": ar,
       "image_size": img_size,
     },
+    "usage": {"include": True},
   }
 
   with httpx.Client(timeout=300) as client:
@@ -806,6 +817,8 @@ def _inpaint_openrouter(
       raise RuntimeError(f"OpenRouter API error {response.status_code}: {response.text[:500]}")
     data = response.json()
 
+  usage = data.get("usage") or {}
+  _costs.record(source="openrouter", model=model, usage=usage, usd=usage.get("cost"))
   result = _openrouter_image_or_raise(data)
   # Resize to match input dimensions (OpenRouter may return different size)
   if result.size != original_size:
