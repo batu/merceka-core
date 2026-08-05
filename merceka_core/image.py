@@ -109,15 +109,10 @@ def _openrouter_image_or_raise(data: dict, *, transparent: bool = False) -> Imag
 
 def _has_alpha(image: Image.Image) -> bool:
   """True when the image carries an alpha channel (or palette transparency)."""
-  return (
-    image.mode in ("RGBA", "LA", "PA")
-    or (image.mode == "P" and "transparency" in image.info)
-  )
+  return image.mode in ("RGBA", "LA", "PA") or (image.mode == "P" and "transparency" in image.info)
 
 
-_IMAGE_ONLY_SUFFIX = (
-  "\n\nReturn an image using the image modality. Do not respond with text only."
-)
+_IMAGE_ONLY_SUFFIX = "\n\nReturn an image using the image modality. Do not respond with text only."
 
 _TRANSPARENT_SUFFIX = (
   "\n\nRender the subject on a fully transparent background (PNG alpha channel,"
@@ -129,7 +124,7 @@ _OPENAI_1K_SIZES = {
   "1:1": "1024x1024",
   "9:16": "1024x1536",
   "16:9": "1536x1024",
-  "3:4": "1024x1536",   # closest OpenAI-supported size
+  "3:4": "1024x1536",  # closest OpenAI-supported size
   "4:3": "1536x1024",
 }
 
@@ -210,6 +205,9 @@ def _generate_openai(
       raise RuntimeError(f"OpenAI API error {response.status_code}: {response.text[:500]}")
     data = response.json()
 
+  _costs.record(
+    source="openai-direct", model=f"openai/{model.removeprefix('openai/')}", usage=data.get("usage")
+  )
   try:
     item = data["data"][0]
     if "b64_json" in item:
@@ -272,6 +270,9 @@ def _edit_openai(image: Image.Image, prompt: str, model: str) -> Image.Image:
       raise RuntimeError(f"OpenAI edit API error {response.status_code}: {response.text[:500]}")
     data = response.json()
 
+  _costs.record(
+    source="openai-direct", model=f"openai/{model.removeprefix('openai/')}", usage=data.get("usage")
+  )
   try:
     item = data["data"][0]
     if "b64_json" in item:
@@ -386,6 +387,9 @@ def _inpaint_openai(
       raise RuntimeError(f"OpenAI edit API error {response.status_code}: {response.text[:500]}")
     data = response.json()
 
+  _costs.record(
+    source="openai-direct", model=f"openai/{model.removeprefix('openai/')}", usage=data.get("usage")
+  )
   try:
     item = data["data"][0]
     if "b64_json" in item:
@@ -403,7 +407,6 @@ def _inpaint_openai(
     ) from e
 
   return _resize_to_input_guarded(result, original_size)
-
 
 
 def _google_image_or_raise(data: dict) -> Image.Image:
@@ -436,9 +439,11 @@ def _generate_google(
   for img in input_images or []:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
-    parts.append({
-      "inlineData": {"mimeType": "image/png", "data": base64.b64encode(buf.getvalue()).decode()},
-    })
+    parts.append(
+      {
+        "inlineData": {"mimeType": "image/png", "data": base64.b64encode(buf.getvalue()).decode()},
+      }
+    )
   parts.append({"text": prompt + suffix})
   payload = {
     "contents": [{"parts": parts}],
@@ -495,7 +500,11 @@ def generate_image(
   # Without an OpenAI key, `openai/...` ids fall through to OpenRouter, which
   # serves the same model ids (no native `background: transparent` there —
   # callers needing guaranteed alpha must check the result mode).
-  if model.startswith("google/") and os.environ.get("GOOGLE_API_KEY") and not os.environ.get("MERCEKA_FORCE_OPENROUTER"):
+  if (
+    model.startswith("google/")
+    and os.environ.get("GOOGLE_API_KEY")
+    and not os.environ.get("MERCEKA_FORCE_OPENROUTER")
+  ):
     # Key-gated direct Gemini dispatch; OpenRouter remains the default when
     # only OPENROUTER_API_KEY is present.
     return _generate_google(prompt, model.removeprefix("google/"), aspect_ratio, transparent)
@@ -559,8 +568,14 @@ def edit_image(
   """
   if model.startswith("openai/") and os.environ.get("OPENAI_API_KEY"):
     return _edit_openai(image, prompt, model.removeprefix("openai/"))
-  if model.startswith("google/") and os.environ.get("GOOGLE_API_KEY") and not os.environ.get("MERCEKA_FORCE_OPENROUTER"):
-    result = _generate_google(prompt, model.removeprefix("google/"), "1:1", False, input_images=[image])
+  if (
+    model.startswith("google/")
+    and os.environ.get("GOOGLE_API_KEY")
+    and not os.environ.get("MERCEKA_FORCE_OPENROUTER")
+  ):
+    result = _generate_google(
+      prompt, model.removeprefix("google/"), "1:1", False, input_images=[image]
+    )
     if resize_to_input and result.size != image.size:
       result = result.resize(image.size, Image.Resampling.LANCZOS)
     return result
@@ -583,13 +598,15 @@ def edit_image(
 
   payload = {
     "model": model,
-    "messages": [{
-      "role": "user",
-      "content": [
-        {"type": "text", "text": prompt + _IMAGE_ONLY_SUFFIX},
-        {"type": "image_url", "image_url": {"url": image_uri}},
-      ],
-    }],
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "text", "text": prompt + _IMAGE_ONLY_SUFFIX},
+          {"type": "image_url", "image_url": {"url": image_uri}},
+        ],
+      }
+    ],
     "modalities": ["image", "text"],
     "image_config": {
       "aspect_ratio": ar,
@@ -696,6 +713,9 @@ def upscale_image(
       raise RuntimeError(f"fal.ai API error {response.status_code}: {response.text[:500]}")
     result_data = response.json()
 
+  # fal does not return per-call cost; an unknown-cost row still records the
+  # call so spend is countable (rates.json can price it later).
+  _costs.record(source="fal", model=model, usage={"calls": 1}, meta={"scale": scale})
   return _image_from_fal_response(result_data)
 
 
@@ -734,7 +754,10 @@ def inpaint(
 
 
 def _inpaint_fal(
-  image: Image.Image, mask: Image.Image, prompt: str, model: str,
+  image: Image.Image,
+  mask: Image.Image,
+  prompt: str,
+  model: str,
 ) -> Image.Image:
   """Inpaint via fal.ai (true mask-based)."""
   api_key = os.environ.get("FAL_KEY")
@@ -787,7 +810,10 @@ def _inpaint_fal(
 
 
 def _inpaint_openrouter(
-  image: Image.Image, mask: Image.Image, prompt: str, model: str,
+  image: Image.Image,
+  mask: Image.Image,
+  prompt: str,
+  model: str,
 ) -> Image.Image:
   """Inpaint via OpenRouter (prompt-directed with image + mask as visual context)."""
   api_key = os.environ.get("OPENROUTER_API_KEY")
@@ -821,14 +847,16 @@ def _inpaint_openrouter(
 
   payload = {
     "model": model,
-    "messages": [{
-      "role": "user",
-      "content": [
-        {"type": "text", "text": edit_prompt},
-        {"type": "image_url", "image_url": {"url": image_uri}},
-        {"type": "image_url", "image_url": {"url": mask_uri}},
-      ],
-    }],
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "text", "text": edit_prompt},
+          {"type": "image_url", "image_url": {"url": image_uri}},
+          {"type": "image_url", "image_url": {"url": mask_uri}},
+        ],
+      }
+    ],
     "modalities": ["image", "text"],
     "image_config": {
       "aspect_ratio": ar,

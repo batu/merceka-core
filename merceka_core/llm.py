@@ -1,7 +1,16 @@
 """Load and run ollama models"""
 
-__all__ = ['Tool', 'list_local_models', 'create_message', 'create_message_with_resource', 'create_ollama_vision_message',
-           'tool_from_callable', 'OutputSchema', 'LLM', 'generate_with_search_grounding']
+__all__ = [
+  "Tool",
+  "list_local_models",
+  "create_message",
+  "create_message_with_resource",
+  "create_ollama_vision_message",
+  "tool_from_callable",
+  "OutputSchema",
+  "LLM",
+  "generate_with_search_grounding",
+]
 
 import dotenv
 import json
@@ -75,6 +84,7 @@ from pydantic import BaseModel
 
 from ollama import ChatResponse
 import litellm
+
 litellm.suppress_debug_info = True  # Stop printing "Provider List" spam
 from urllib.request import Request, urlopen
 
@@ -116,6 +126,7 @@ from merceka_core.retry import (  # noqa: F401 — re-exported for back-compat
   _retry_after_seconds,
 )
 
+
 class LLM:
   """A class for interacting with an LLM."""
 
@@ -124,9 +135,7 @@ class LLM:
     model_name: str,  # The name of the model to use
     system_prompt: str = "",  # The system prompt to use.
     think: Optional[bool] = None,  # Whether to enable thinking mode
-    output_schema: Optional[
-      type[BaseModel]
-    ] = None,  # Schema for structured output
+    output_schema: Optional[type[BaseModel]] = None,  # Schema for structured output
     tools: list[Tool] | None = None,  # Tool functions for agentic calling
     max_tool_rounds: int = 10,  # Max iterations of the tool loop
     fallback: Optional[str] = None,  # Fallback model if primary fails
@@ -146,8 +155,12 @@ class LLM:
     self.use_claude = model_name.startswith("claude/")
     self.use_codex = model_name.startswith("codex/")
     self.use_gemini = model_name.startswith("gemini/")
-    self.use_openrouter = (not self.use_claude and not self.use_codex
-                           and not self.use_gemini and "openrouter" in model_name)
+    self.use_openrouter = (
+      not self.use_claude
+      and not self.use_codex
+      and not self.use_gemini
+      and "openrouter" in model_name
+    )
     self.add_dirs = add_dirs or []
     self.allowed_tools = allowed_tools or []
 
@@ -166,16 +179,23 @@ class LLM:
           self._tool_schemas.append(schema)
           self._tool_handlers[tool.__name__] = tool
 
-    if (not self.use_openrouter and not self.use_claude and not self.use_codex
-        and not self.use_gemini):
+    if (
+      not self.use_openrouter and not self.use_claude and not self.use_codex and not self.use_gemini
+    ):
       self._verify()
 
   def _fallback_llm(self, model_name: Optional[str] = None) -> "LLM":
     """Construct a fallback LLM preserving the full configuration of this one."""
-    return LLM(model_name or self.fallback, system_prompt=self.system_prompt,
-               think=self.think, output_schema=self.output_schema,
-               tools=self._original_tools, max_tool_rounds=self.max_tool_rounds,
-               add_dirs=self.add_dirs, allowed_tools=self.allowed_tools)
+    return LLM(
+      model_name or self.fallback,
+      system_prompt=self.system_prompt,
+      think=self.think,
+      output_schema=self.output_schema,
+      tools=self._original_tools,
+      max_tool_rounds=self.max_tool_rounds,
+      add_dirs=self.add_dirs,
+      allowed_tools=self.allowed_tools,
+    )
 
   def _select_backend(self) -> str:
     """Decide which backend serves plain generate/agenerate for this config.
@@ -188,7 +208,8 @@ class LLM:
       raise ValueError(
         f"{self.model_name!r} is a Gemini model: plain generate/chat is not supported. "
         "Use generate_with_video/agenerate_with_video or generate_with_search_grounding, "
-        "or route text through an openrouter/ model.")
+        "or route text through an openrouter/ model."
+      )
     if (self.use_claude or self.use_codex) and self._tool_schemas:
       # CLI providers can't run Python tool callables in-process, but both
       # forward allowed_tools to their native tool systems.
@@ -199,7 +220,8 @@ class LLM:
       raise ValueError(
         f"{self.model_name!r} cannot run Python tool callables. Either pass "
         "allowed_tools= (native CLI tools), set fallback= to a "
-        "tool-capable model, or drop tools=.")
+        "tool-capable model, or drop tools=."
+      )
     if self.use_claude:
       return _BACKEND_CLAUDE
     if self.use_codex:
@@ -214,12 +236,20 @@ class LLM:
     """One-shot generation. Does not maintain conversation history."""
     try:
       return self._generate_primary(message, **kwargs)
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError,
-            FileNotFoundError, ConnectionError, OSError,
-            httpx.HTTPError, urllib.error.URLError,
-            VideoBackendError) as e:
+    except (
+      subprocess.TimeoutExpired,
+      subprocess.CalledProcessError,
+      FileNotFoundError,
+      ConnectionError,
+      OSError,
+      httpx.HTTPError,
+      urllib.error.URLError,
+      VideoBackendError,
+    ) as e:
       if self.fallback:
-        _logger.warning("Primary LLM failed (%s), falling back to %s", type(e).__name__, self.fallback)
+        _logger.warning(
+          "Primary LLM failed (%s), falling back to %s", type(e).__name__, self.fallback
+        )
         return self._fallback_llm().generate(message, **kwargs)
       raise
 
@@ -228,8 +258,9 @@ class LLM:
     messages = [create_message(self.system_prompt, "system"), create_message(message, "user")]
     backend = self._select_backend()
     if backend == _BACKEND_TOOLS_FALLBACK:
-      _logger.info("%s can't run Python tool callables, using fallback %s",
-                   self.model_name, self.fallback)
+      _logger.info(
+        "%s can't run Python tool callables, using fallback %s", self.model_name, self.fallback
+      )
       return self._fallback_llm().generate(message, **kwargs)
     if backend == _BACKEND_CLAUDE:
       return self._claude_call(message, **kwargs)
@@ -254,7 +285,11 @@ class LLM:
 
     if self.use_claude:
       # Claude CLI is one-shot; send full history as context (exclude system, it's in --system-prompt)
-      history = "\n".join(f"{m['role']}: {m['content']}" for m in self.messages if m.get('content') and m['role'] != 'system')
+      history = "\n".join(
+        f"{m['role']}: {m['content']}"
+        for m in self.messages
+        if m.get("content") and m["role"] != "system"
+      )
       response = self._claude_call(history, **kwargs)
     elif self.use_openrouter:
       response = self._cloud_call(self.messages, **kwargs)
@@ -332,9 +367,7 @@ class LLM:
       )
 
     if self.use_gemini:
-      return await asyncio.to_thread(
-        _gemini_image_call, self, message, resource_path, **kwargs
-      )
+      return await asyncio.to_thread(_gemini_image_call, self, message, resource_path, **kwargs)
 
     if self.use_openrouter:
       messages = [
@@ -366,14 +399,16 @@ class LLM:
     if msg.tool_calls:
       tool_calls = []
       for i, tc in enumerate(msg.tool_calls):
-        tool_calls.append({
-          "id": f"call_{i}",
-          "type": "function",
-          "function": {
-            "name": tc.function.name,
-            "arguments": tc.function.arguments,
-          },
-        })
+        tool_calls.append(
+          {
+            "id": f"call_{i}",
+            "type": "function",
+            "function": {
+              "name": tc.function.name,
+              "arguments": tc.function.arguments,
+            },
+          }
+        )
     return {
       "role": "assistant",
       "content": msg.content,
@@ -457,11 +492,13 @@ class LLM:
 
       for tc in assistant_msg["tool_calls"]:
         result = self._execute_tool_call(tc)
-        messages.append({
-          "role": "tool",
-          "tool_call_id": tc["id"],
-          "content": result,
-        })
+        messages.append(
+          {
+            "role": "tool",
+            "tool_call_id": tc["id"],
+            "content": result,
+          }
+        )
 
     raise RuntimeError(f"Tool loop exceeded {self.max_tool_rounds} rounds")
 
@@ -496,11 +533,13 @@ class LLM:
               result = str(await asyncio.to_thread(handler, **fn_args))
           except Exception as e:
             result = f"Error calling {fn_name}: {e}"
-        messages.append({
-          "role": "tool",
-          "tool_call_id": tc["id"],
-          "content": result,
-        })
+        messages.append(
+          {
+            "role": "tool",
+            "tool_call_id": tc["id"],
+            "content": result,
+          }
+        )
 
     raise RuntimeError(f"Tool loop exceeded {self.max_tool_rounds} rounds")
 
@@ -548,6 +587,7 @@ class LLM:
     payload = {
       "model": self.model_name.removeprefix("openrouter/"),
       "messages": messages,
+      "usage": {"include": True},
       **kwargs,
     }
     if provider:
@@ -559,7 +599,9 @@ class LLM:
       payload["response_format"] = _openrouter_response_format(self.output_schema)
       if not payload.get("stream"):
         plugins = list(payload.get("plugins") or [])
-        if not any(plugin.get("id") == "response-healing" for plugin in plugins if isinstance(plugin, dict)):
+        if not any(
+          plugin.get("id") == "response-healing" for plugin in plugins if isinstance(plugin, dict)
+        ):
           plugins.append({"id": "response-healing"})
         payload["plugins"] = plugins
 
@@ -582,19 +624,36 @@ class LLM:
       try:
         with urlopen(request, timeout=120) as response:
           body = json.load(response)
+        from merceka_core import costs as _costs
+
+        usage = body.get("usage") or {}
+        _costs.record(
+          source="openrouter",
+          model=payload["model"],
+          usage=usage,
+          usd=usage.get("cost"),
+        )
         return self._parse_openrouter_body(body)
       except urllib.error.HTTPError as exc:
         if exc.code not in _RETRY_STATUS_CODES or attempt == _RETRY_MAX_ATTEMPTS - 1:
           raise
         retry_after = _retry_after_seconds(exc.headers)
         delay = _retry_delay(attempt, retry_after)
-        _logger.warning("OpenRouter HTTP %d, retrying in %.2fs (%d/%d)", exc.code, delay, attempt + 1, _RETRY_MAX_ATTEMPTS)
+        _logger.warning(
+          "OpenRouter HTTP %d, retrying in %.2fs (%d/%d)",
+          exc.code,
+          delay,
+          attempt + 1,
+          _RETRY_MAX_ATTEMPTS,
+        )
         time.sleep(delay)
       except (ConnectionRefusedError, ConnectionResetError, urllib.error.URLError) as exc:
         if attempt == _RETRY_MAX_ATTEMPTS - 1:
           raise
         delay = _retry_delay(attempt)
-        _logger.warning("OpenRouter connection error %s, retrying in %.2fs", type(exc).__name__, delay)
+        _logger.warning(
+          "OpenRouter connection error %s, retrying in %.2fs", type(exc).__name__, delay
+        )
         time.sleep(delay)
     # Unreachable (the loop either returns or raises on the last attempt).
     raise RuntimeError("retry loop exhausted without return")
@@ -616,17 +675,34 @@ class LLM:
           body = response.json()
         return self._parse_openrouter_body(body)
       except httpx.HTTPStatusError as exc:
-        if exc.response.status_code not in _RETRY_STATUS_CODES or attempt == _RETRY_MAX_ATTEMPTS - 1:
+        if (
+          exc.response.status_code not in _RETRY_STATUS_CODES or attempt == _RETRY_MAX_ATTEMPTS - 1
+        ):
           raise
         retry_after = _retry_after_seconds(exc.response.headers)
         delay = _retry_delay(attempt, retry_after)
-        _logger.warning("OpenRouter HTTP %d, retrying in %.2fs (%d/%d)", exc.response.status_code, delay, attempt + 1, _RETRY_MAX_ATTEMPTS)
+        _logger.warning(
+          "OpenRouter HTTP %d, retrying in %.2fs (%d/%d)",
+          exc.response.status_code,
+          delay,
+          attempt + 1,
+          _RETRY_MAX_ATTEMPTS,
+        )
         await asyncio.sleep(delay)
-      except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout, ConnectionRefusedError, ConnectionResetError) as exc:
+      except (
+        httpx.ConnectError,
+        httpx.ReadTimeout,
+        httpx.WriteTimeout,
+        httpx.PoolTimeout,
+        ConnectionRefusedError,
+        ConnectionResetError,
+      ) as exc:
         if attempt == _RETRY_MAX_ATTEMPTS - 1:
           raise
         delay = _retry_delay(attempt)
-        _logger.warning("OpenRouter connection error %s, retrying in %.2fs", type(exc).__name__, delay)
+        _logger.warning(
+          "OpenRouter connection error %s, retrying in %.2fs", type(exc).__name__, delay
+        )
         await asyncio.sleep(delay)
     raise RuntimeError("retry loop exhausted without return")
 
@@ -634,12 +710,20 @@ class LLM:
     """Async one-shot generation. Does not maintain conversation history."""
     try:
       return await self._agenerate_primary(message, **kwargs)
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError,
-            FileNotFoundError, ConnectionError, OSError,
-            httpx.HTTPError, urllib.error.URLError,
-            VideoBackendError) as e:
+    except (
+      subprocess.TimeoutExpired,
+      subprocess.CalledProcessError,
+      FileNotFoundError,
+      ConnectionError,
+      OSError,
+      httpx.HTTPError,
+      urllib.error.URLError,
+      VideoBackendError,
+    ) as e:
       if self.fallback:
-        _logger.warning("Primary LLM failed (%s), falling back to %s", type(e).__name__, self.fallback)
+        _logger.warning(
+          "Primary LLM failed (%s), falling back to %s", type(e).__name__, self.fallback
+        )
         return await self._fallback_llm().agenerate(message, **kwargs)
       raise
 
@@ -650,8 +734,9 @@ class LLM:
     messages = [create_message(self.system_prompt, "system"), create_message(message, "user")]
     backend = self._select_backend()
     if backend == _BACKEND_TOOLS_FALLBACK:
-      _logger.info("%s can't run Python tool callables, using fallback %s",
-                   self.model_name, self.fallback)
+      _logger.info(
+        "%s can't run Python tool callables, using fallback %s", self.model_name, self.fallback
+      )
       return await self._fallback_llm().agenerate(message, **kwargs)
     if backend == _BACKEND_CLAUDE:
       return await asyncio.to_thread(self._claude_call, message, **kwargs)
@@ -792,8 +877,13 @@ class LLM:
     )
     env = _cli.claude_env()
     process = subprocess.Popen(
-      cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-      stderr=subprocess.PIPE, text=True, bufsize=1, env=env,
+      cmd,
+      stdin=subprocess.PIPE,
+      stdout=subprocess.PIPE,
+      stderr=subprocess.PIPE,
+      text=True,
+      bufsize=1,
+      env=env,
     )
     # Send message and close stdin so Claude starts processing
     process.stdin.write(message)
@@ -918,8 +1008,7 @@ class LLM:
     """
     if not self.use_gemini:
       raise ValueError(
-        "generate_with_video requires a Gemini model (model_name must "
-        "start with 'gemini/')."
+        "generate_with_video requires a Gemini model (model_name must start with 'gemini/')."
       )
     return _gemini_video_call(
       self, message, video_paths, timeout_s=timeout_s, poll_interval_s=poll_interval_s, **kwargs
@@ -939,8 +1028,7 @@ class LLM:
 
     if not self.use_gemini:
       raise ValueError(
-        "agenerate_with_video requires a Gemini model (model_name must "
-        "start with 'gemini/')."
+        "agenerate_with_video requires a Gemini model (model_name must start with 'gemini/')."
       )
     return await asyncio.to_thread(
       _gemini_video_call,
@@ -956,6 +1044,7 @@ class LLM:
     """Verify the model is available, download if missing."""
     if self.model_name not in list_local_models():
       _download_model(self.model_name)
+
 
 # Gemini surface moved to merceka_core.llm_gemini; re-exported for back-compat.
 from merceka_core.llm_gemini import (  # noqa: E402, F401 — re-exported for back-compat
