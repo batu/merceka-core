@@ -332,11 +332,23 @@ def _inpaint_openai(
     "image[]": ("input.png", image_buf.getvalue(), "image/png"),
     "mask": ("mask.png", _mask_to_openai_alpha(mask), "image/png"),
   }
+  # Production-art settings (2026-08-05). The previous low/jpeg combo was
+  # tuned for latency-sensitive previews and leaked into final art: JPEG
+  # noise straddles the level-editor's diff-extract threshold (torn subject
+  # masks) and the sizeless request forced an aspect-distorting 1024² round
+  # trip on non-square crops. size picks the supported shape nearest the
+  # input aspect; input_fidelity=high asks the model to preserve unmasked
+  # input, which is the entire point of a masked edit.
+  w, h = image.size
+  aspect = w / h if h else 1.0
+  size = "1536x1024" if aspect > 1.25 else "1024x1536" if aspect < 0.8 else "1024x1024"
   form = {
     "model": model.removeprefix("openai/"),
     "prompt": prompt,
-    "quality": "low",
-    "output_format": "jpeg",
+    "quality": "high",
+    "output_format": "png",
+    "size": size,
+    "input_fidelity": "high",
     "n": "1",
   }
 
