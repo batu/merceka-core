@@ -141,6 +141,7 @@ class LLM:
     fallback: Optional[str] = None,  # Fallback model if primary fails
     add_dirs: list[str] | None = None,  # Directories Claude Code can access (--add-dir)
     allowed_tools: list[str] | None = None,  # Claude Code native tools (--allowedTools)
+    timeout: int | None = None,  # Default subprocess timeout (seconds) for CLI providers; per-call timeout= kwarg still wins
   ):
     if tools and output_schema:
       raise ValueError("Cannot use both tools and output_schema at the same time")
@@ -152,6 +153,7 @@ class LLM:
     self.think = think
     self.max_tool_rounds = max_tool_rounds
     self.fallback = fallback
+    self.timeout = timeout
     self.use_claude = model_name.startswith("claude/")
     self.use_codex = model_name.startswith("codex/")
     self.use_gemini = model_name.startswith("gemini/")
@@ -195,6 +197,7 @@ class LLM:
       max_tool_rounds=self.max_tool_rounds,
       add_dirs=self.add_dirs,
       allowed_tools=self.allowed_tools,
+      timeout=self.timeout,
     )
 
   def _select_backend(self) -> str:
@@ -798,6 +801,14 @@ class LLM:
       return await tqdm_asyncio.gather(*tasks, desc="Processing")
     return await asyncio.gather(*tasks)
 
+  def _resolve_timeout(self, kwargs: dict) -> int:
+    """Resolve the subprocess timeout: per-call kwarg > instance default > module default."""
+    if "timeout" in kwargs:
+      return kwargs["timeout"]
+    if self.timeout is not None:
+      return self.timeout
+    return CLAUDE_CLI_TIMEOUT
+
   def _claude_call(self, message: str, **kwargs) -> str | OutputSchema:
     """Call Claude CLI via subprocess.
 
@@ -811,7 +822,7 @@ class LLM:
       add_dirs=self.add_dirs,
       allowed_tools=self.allowed_tools,
     )
-    timeout = kwargs.get("timeout", CLAUDE_CLI_TIMEOUT)
+    timeout = self._resolve_timeout(kwargs)
     env = _cli.claude_env()
 
     result = subprocess.run(
@@ -847,7 +858,7 @@ class LLM:
     # codex exec has no --system-prompt flag; prepend it to the message
     prompt = f"{self.system_prompt}\n\n{message}" if self.system_prompt else message
 
-    timeout = kwargs.get("timeout", CLAUDE_CLI_TIMEOUT)
+    timeout = self._resolve_timeout(kwargs)
     result = subprocess.run(
       cmd,
       input=prompt,
