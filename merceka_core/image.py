@@ -348,9 +348,12 @@ def _inpaint_openai(
     "quality": "high",
     "output_format": "png",
     "size": size,
-    "input_fidelity": "high",
     "n": "1",
   }
+  # input_fidelity is a gpt-image-1-only parameter; gpt-image-2 rejects the
+  # request outright (invalid_input_fidelity_model, observed 2026-08-05).
+  if model.removeprefix("openai/") == "gpt-image-1":
+    form["input_fidelity"] = "high"
 
   with httpx.Client(timeout=300) as client:
     response = client.post(
