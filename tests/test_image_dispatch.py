@@ -27,8 +27,8 @@ def _png_b64(size=(1, 1)) -> str:
   return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def _openai_body():
-  return {"data": [{"b64_json": _png_b64()}]}
+def _openai_body(size=(1, 1)):
+  return {"data": [{"b64_json": _png_b64(size)}]}
 
 
 def _openrouter_body():
@@ -199,7 +199,7 @@ class TestEditImageDispatch:
     return Image.new("RGB", (10, 20), (200, 10, 10))
 
   def test_openai_prefix_hits_edits_endpoint_multipart(self, fake_post, source):
-    fake = fake_post(FakeResponse(body=_openai_body()))
+    fake = fake_post(FakeResponse(body=_openai_body(source.size)))
 
     result = edit_image(source, "make it blue", model="openai/gpt-image-2")
 
