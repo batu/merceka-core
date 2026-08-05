@@ -1,0 +1,11 @@
+{
+  "_source": "https://ai.google.dev/gemini-api/docs/pricing fetched 2026-08-04; USD per 1M tokens by usageMetadata field",
+  "google/gemini-3.1-flash-image-preview": {
+    "promptTokenCount": 0.50,
+    "candidatesTokenCount": 60.00
+  },
+  "google/gemini-3.1-flash-lite-image-preview": {
+    "promptTokenCount": 0.25,
+    "candidatesTokenCount": 30.00
+  }
+}
