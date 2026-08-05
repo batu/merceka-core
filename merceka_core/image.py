@@ -288,9 +288,7 @@ def _edit_openai(image: Image.Image, prompt: str, model: str) -> Image.Image:
       f"No image in OpenAI edit response: {e}\nResponse: {json.dumps(data, indent=2)[:500]}"
     ) from e
 
-  if result.size != original_size:
-    result = result.resize(original_size, Image.Resampling.LANCZOS)
-  return result
+  return _resize_to_input_guarded(result, original_size)
 
 
 def _mask_to_openai_alpha(mask: Image.Image) -> bytes:
@@ -306,6 +304,28 @@ def _mask_to_openai_alpha(mask: Image.Image) -> bytes:
   buf = io.BytesIO()
   rgba.save(buf, format="PNG")
   return buf.getvalue()
+
+
+def _resize_to_input_guarded(result: Image.Image, original_size: tuple[int, int]) -> Image.Image:
+  """Resize a model output back to the input size, refusing aspect mismatches.
+
+  Silently stretching a mismatched canvas warps content position-dependently
+  (observed 2026-08-05: docks displaced 100-500px after full-scene edits via
+  both OpenAI sizeless edits and OpenRouter-returned gemini dims). A >2%%
+  aspect delta means the provider changed the canvas shape — that is data
+  corruption for edit workflows, so fail loudly instead of hiding it."""
+  if result.size == original_size:
+    return result
+  ow, oh = original_size
+  rw, rh = result.size
+  in_aspect = ow / oh if oh else 1.0
+  out_aspect = rw / rh if rh else 1.0
+  if abs(out_aspect - in_aspect) / in_aspect > 0.02:
+    raise RuntimeError(
+      f"model returned aspect {rw}x{rh} for input {ow}x{oh} — refusing to stretch "
+      "(would spatially warp content). Request an aspect-matched size or handle explicitly."
+    )
+  return result.resize(original_size, Image.Resampling.LANCZOS)
 
 
 def _inpaint_openai(
@@ -382,9 +402,7 @@ def _inpaint_openai(
       f"No image in OpenAI edit response: {e}\nResponse: {json.dumps(data, indent=2)[:500]}"
     ) from e
 
-  if result.size != original_size:
-    result = result.resize(original_size, Image.Resampling.LANCZOS)
-  return result
+  return _resize_to_input_guarded(result, original_size)
 
 
 
@@ -836,6 +854,4 @@ def _inpaint_openrouter(
   _costs.record(source="openrouter", model=model, usage=usage, usd=usage.get("cost"))
   result = _openrouter_image_or_raise(data)
   # Resize to match input dimensions (OpenRouter may return different size)
-  if result.size != original_size:
-    result = result.resize(original_size, Image.Resampling.LANCZOS)
-  return result
+  return _resize_to_input_guarded(result, original_size)
