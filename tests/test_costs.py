@@ -42,3 +42,21 @@ def test_since_filter(tmp_path, monkeypatch):
 def test_record_never_raises(monkeypatch):
   monkeypatch.setenv("MERCEKA_COST_LEDGER", "/dev/null/impossible/costs.jsonl")
   costs.record(source="x", model="y", usage={})  # must not raise
+
+
+def test_attribution_context_tags_records(tmp_path, monkeypatch):
+    """Cost attribution: records inside costs.attribution(...) carry the
+    ambient meta, merged under any call-site meta; outside the block nothing
+    is tagged."""
+    import json
+
+    from merceka_core import costs
+
+    monkeypatch.setenv("MERCEKA_COST_LEDGER", str(tmp_path / "ledger.jsonl"))
+    with costs.attribution({"sessionId": "level_a", "operation": "extract"}):
+        costs.record(source="test", model="m", usage={}, usd=0.01,
+                     meta={"birdId": "bird_1"})
+    costs.record(source="test", model="m", usage={}, usd=0.02)
+    rows = [json.loads(line) for line in (tmp_path / "ledger.jsonl").read_text().splitlines()]
+    assert rows[0]["meta"] == {"sessionId": "level_a", "operation": "extract", "birdId": "bird_1"}
+    assert "meta" not in rows[1]

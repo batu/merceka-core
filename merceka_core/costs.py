@@ -38,6 +38,13 @@ def _load_rates() -> dict:
   return {}
 
 
+import contextvars
+
+_attribution_var: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+  "merceka_cost_attribution", default=None,
+)
+
+
 def _usd_from_rates(model: str, usage: dict) -> float | None:
   rates = _load_rates().get(model)
   if not isinstance(rates, dict):
@@ -50,6 +57,23 @@ def _usd_from_rates(model: str, usage: dict) -> float | None:
       total += tokens / 1_000_000 * per_million
       matched = True
   return round(total, 6) if matched else None
+
+
+def attribution(meta: dict):
+  """Context manager: every cost recorded inside the block carries `meta`
+  (merged under the record's own meta). Lets callers attribute provider
+  spend to a session/bird/operation without threading parameters through
+  every image-API signature."""
+  import contextlib
+
+  @contextlib.contextmanager
+  def _ctx():
+    token = _attribution_var.set({**(_attribution_var.get() or {}), **meta})
+    try:
+      yield
+    finally:
+      _attribution_var.reset(token)
+  return _ctx()
 
 
 def record(
@@ -73,8 +97,10 @@ def record(
       "usage": usage,
       "usd": usd,
     }
-    if meta:
-      row["meta"] = meta
+    ambient = _attribution_var.get()
+    merged = {**(ambient or {}), **(meta or {})}
+    if merged:
+      row["meta"] = merged
     path = ledger_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a") as f:
