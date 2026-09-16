@@ -56,3 +56,11 @@ def test_pad_to_multiple_of_16_replicates_edges_and_keeps_content_box():
   assert padded.getpixel((0, 191))[:3] == (10, 20, 30)
   same, box2 = _pad_to_multiple_of_16(Image.new("RGB", (192, 96)))
   assert same.size == (192, 96) and box2 == (0, 0, 192, 96)
+
+
+def test_native_edit_size_respects_the_minimum_pixel_budget():
+  from merceka_core.image import _openai_native_edit_size
+
+  assert _openai_native_edit_size("gpt-image-2.5-sunburst", 192, 192) is None  # API: below minimum pixel budget
+  assert _openai_native_edit_size("gpt-image-2.5-sunburst", 768, 768) is None
+  assert _openai_native_edit_size("gpt-image-2.5-sunburst", 896, 896) == "896x896"

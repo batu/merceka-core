@@ -228,6 +228,10 @@ def _generate_openai(
 
 
 _OPENAI_CUSTOM_SIZE_MAX_EDGE = 3840
+# Measured 2026-09-16 on gpt-image-2.5-sunburst edits: 768x768 is rejected as
+# "below the current minimum pixel budget", 896x896 is accepted. The floor sits
+# between 589,824 and 802,816 px; 1024x768 = 786,432 is the natural candidate.
+_OPENAI_CUSTOM_SIZE_MIN_PIXELS = 786_432
 
 
 def _openai_native_edit_size(model: str, w: int, h: int) -> str | None:
@@ -241,6 +245,8 @@ def _openai_native_edit_size(model: str, w: int, h: int) -> str | None:
   if not normalized_model.startswith("gpt-image-2"):
     return None
   if w % 16 or h % 16 or max(w, h) > _OPENAI_CUSTOM_SIZE_MAX_EDGE:
+    return None
+  if w * h < _OPENAI_CUSTOM_SIZE_MIN_PIXELS:
     return None
   if w / h > 3 or h / w > 3:
     return None
