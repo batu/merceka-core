@@ -52,7 +52,9 @@ def _usd_from_rates(model: str, usage: dict) -> float | None:
   total = 0.0
   matched = False
   for kind, per_million in rates.items():
-    tokens = usage.get(kind)
+    tokens: object = usage
+    for part in kind.split("."):
+      tokens = tokens.get(part) if isinstance(tokens, dict) else None
     if isinstance(tokens, (int, float)):
       total += tokens / 1_000_000 * per_million
       matched = True

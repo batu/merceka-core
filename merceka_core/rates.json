@@ -1,11 +1,26 @@
 {
-  "_source": "https://ai.google.dev/gemini-api/docs/pricing fetched 2026-08-04; USD per 1M tokens by usageMetadata field",
+  "_source": "https://ai.google.dev/gemini-api/docs/pricing fetched 2026-08-04; USD per 1M tokens by usageMetadata field; OpenAI image models from https://developers.openai.com/api/docs/pricing fetched 2026-09-11 (text in $5, image in $8, image out $30 per 1M; dotted keys read usage.input_tokens_details)",
   "google/gemini-3.1-flash-image-preview": {
-    "promptTokenCount": 0.50,
-    "candidatesTokenCount": 60.00
+    "promptTokenCount": 0.5,
+    "candidatesTokenCount": 60.0
   },
   "google/gemini-3.1-flash-lite-image-preview": {
     "promptTokenCount": 0.25,
-    "candidatesTokenCount": 30.00
+    "candidatesTokenCount": 30.0
+  },
+  "openai/gpt-image-2": {
+    "input_tokens_details.text_tokens": 5.0,
+    "input_tokens_details.image_tokens": 8.0,
+    "output_tokens": 30.0
+  },
+  "openai/gpt-image-2.5-sunburst": {
+    "input_tokens_details.text_tokens": 5.0,
+    "input_tokens_details.image_tokens": 8.0,
+    "output_tokens": 30.0
+  },
+  "openai/gpt-image-2.5-flare": {
+    "input_tokens_details.text_tokens": 5.0,
+    "input_tokens_details.image_tokens": 8.0,
+    "output_tokens": 30.0
   }
 }
