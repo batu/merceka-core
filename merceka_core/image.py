@@ -154,8 +154,10 @@ def _openai_size(aspect_ratio: str, image_size: str, model: str = "") -> str:
   fixed 1K-ish sizes plus `auto` path.
   """
   normalized_size = image_size.strip().upper()
-  normalized_model = model.strip().lower()
-  if normalized_model == "gpt-image-2":
+  normalized_model = model.strip().lower().removeprefix("openai/")
+  # gpt-image-2 and the gpt-image-2.5 variants (sunburst/flare, 2026-09-08)
+  # share the explicit-size contract: multiples of 16, edges <= 3840.
+  if normalized_model.startswith("gpt-image-2"):
     if normalized_size == "2K":
       return _OPENAI_GPT_IMAGE_2_2K_SIZES.get(aspect_ratio, "2048x2048")
     if normalized_size == "4K":
@@ -225,7 +227,50 @@ def _generate_openai(
     ) from e
 
 
-def _edit_openai(image: Image.Image, prompt: str, model: str) -> Image.Image:
+_OPENAI_CUSTOM_SIZE_MAX_EDGE = 3840
+
+
+def _openai_native_edit_size(model: str, w: int, h: int) -> str | None:
+  """Return the input's own dimensions as an OpenAI `size` when the model
+  accepts custom sizes (gpt-image-2 family: multiples of 16, edges <= 3840,
+  aspect within 1:3..3:1). A native-size request keeps the edit at the
+  input's pixel grid instead of a 1024-ish round trip that is then resized
+  back — the level-editor's alignment gate measures exactly that drift.
+  None means: fall back to the fixed 1K table."""
+  normalized_model = model.strip().lower().removeprefix("openai/")
+  if not normalized_model.startswith("gpt-image-2"):
+    return None
+  if w % 16 or h % 16 or max(w, h) > _OPENAI_CUSTOM_SIZE_MAX_EDGE:
+    return None
+  if w / h > 3 or h / w > 3:
+    return None
+  return f"{w}x{h}"
+
+
+def _pad_to_multiple_of_16(image: Image.Image) -> tuple[Image.Image, tuple[int, int, int, int]]:
+  """Pad the right/bottom edges by replicating the last column/row so both
+  edges become multiples of 16. Returns the padded image and the box of the
+  original content, so the model output can be cropped back. Lets a
+  gpt-image-2 edit of an arbitrary crop (the level editor's 182 px sticker
+  crops, 2026-09-16) take the native-size path instead of a 1024 round trip
+  that costs the 1024 price and hands back a downscaled result."""
+  w, h = image.size
+  pw, ph = (w + 15) // 16 * 16, (h + 15) // 16 * 16
+  if (pw, ph) == (w, h):
+    return image, (0, 0, w, h)
+  rgba = image.convert("RGBA")
+  out = Image.new("RGBA", (pw, ph))
+  out.paste(rgba, (0, 0))
+  if pw > w:
+    out.paste(rgba.crop((w - 1, 0, w, h)).resize((pw - w, h), Image.NEAREST), (w, 0))
+  if ph > h:
+    out.paste(out.crop((0, h - 1, pw, h)).resize((pw, ph - h), Image.NEAREST), (0, h))
+  return out, (0, 0, w, h)
+
+
+def _edit_openai(
+  image: Image.Image, prompt: str, model: str, quality: str | None = None
+) -> Image.Image:
   """Edit one image via OpenAI's image edits endpoint.
 
   Sends multipart/form-data with the image file + prompt. The returned
@@ -237,19 +282,24 @@ def _edit_openai(image: Image.Image, prompt: str, model: str) -> Image.Image:
     raise RuntimeError("OPENAI_API_KEY not set in environment")
 
   original_size = image.size
+  content_box = (0, 0, *original_size)
+  if _openai_native_edit_size(model, 16, 16) and not _openai_native_edit_size(model, *original_size):
+    padded, content_box = _pad_to_multiple_of_16(image)
+    if _openai_native_edit_size(model, *padded.size):
+      image = padded
   # Encode input as PNG bytes for the multipart upload.
   buf = io.BytesIO()
   image.convert("RGBA").save(buf, format="PNG")
   buf.seek(0)
 
-  w, h = original_size
+  w, h = image.size
   if w == h:
     ar = "1:1"
   elif w > h:
     ar = "16:9" if w / h > 1.5 else "4:3"
   else:
     ar = "9:16" if h / w > 1.5 else "3:4"
-  size = _openai_size(ar, "1K", model)
+  size = _openai_native_edit_size(model, w, h) or _openai_size(ar, "1K", model)
 
   files = {"image": ("input.png", buf.getvalue(), "image/png")}
   form = {
@@ -258,6 +308,10 @@ def _edit_openai(image: Image.Image, prompt: str, model: str) -> Image.Image:
     "size": size,
     "n": "1",
   }
+  if quality:
+    # low/medium/high/xhigh/max/auto on the gpt-image-2 family; omitted →
+    # the API default (auto). Callers pick low for cheap sticker recreates.
+    form["quality"] = quality
 
   with httpx.Client(timeout=300) as client:
     response = client.post(
@@ -289,6 +343,8 @@ def _edit_openai(image: Image.Image, prompt: str, model: str) -> Image.Image:
       f"No image in OpenAI edit response: {e}\nResponse: {json.dumps(data, indent=2)[:500]}"
     ) from e
 
+  if image.size != original_size and result.size == image.size:
+    result = result.crop(content_box)
   return _resize_to_input_guarded(result, original_size)
 
 
@@ -465,6 +521,95 @@ def _generate_google(
   return _google_image_or_raise(data)
 
 
+# ── Grok (xAI) via the Grok Build CLI ────────────────────────────────────────
+# There is no xAI image API key on this host and OpenRouter lists no x-ai
+# image model (checked live 2026-09-16), so `grok/...` ids run through the
+# subscription-billed `grok -p` CLI (image_gen / image_edit tools). The CLI
+# returns 1024x1024 JPEG regardless of the input size and takes an aspect
+# ratio, not pixel dimensions. `total_cost_usd` in its JSON result is the
+# agent-token meter; the image tool itself is not itemized there.
+_GROK_TIMEOUT_S = 600
+
+
+def _grok_run(prompt: str, job_dir: str) -> tuple[str, dict]:
+  import subprocess
+
+  prompt_path = os.path.join(job_dir, "prompt.txt")
+  with open(prompt_path, "w") as fh:
+    fh.write(prompt)
+  cmd = [
+    "grok", "--prompt-file", prompt_path, "--cwd", job_dir,
+    "--sandbox", "workspace", "--always-approve", "--no-plan", "--no-subagents",
+    "--disable-web-search", "--max-turns", "6", "--verbatim", "--output-format", "json",
+  ]
+  proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_GROK_TIMEOUT_S)
+  if proc.returncode != 0:
+    raise RuntimeError(f"grok CLI failed ({proc.returncode}): {proc.stderr[-500:]}")
+  try:
+    data = json.loads(proc.stdout)
+  except json.JSONDecodeError as e:
+    raise RuntimeError(f"grok CLI returned non-JSON: {proc.stdout[-500:]}") from e
+  out_dir = os.path.join(job_dir, "output")
+  files = sorted(os.listdir(out_dir)) if os.path.isdir(out_dir) else []
+  if not files:
+    raise RuntimeError(f"grok produced no image (stop={data.get('stopReason')}): {str(data.get('text'))[-300:]}")
+  return os.path.join(out_dir, files[-1]), data
+
+
+def _grok_record(model: str, data: dict) -> None:
+  usage = data.get("usage") or {}
+  _costs.record(
+    source="grok-cli", model=model, usage=usage, usd=data.get("total_cost_usd"),
+    meta={"sessionId": data.get("sessionId"), "numTurns": data.get("num_turns")},
+  )
+
+
+def _grok_job_dir() -> str:
+  import tempfile
+  import uuid
+
+  base = os.path.join(tempfile.gettempdir(), "merceka-grok")
+  job_dir = os.path.join(base, uuid.uuid4().hex)
+  os.makedirs(os.path.join(job_dir, "output"), exist_ok=True)
+  return job_dir
+
+
+def _generate_grok(prompt: str, model: str, aspect_ratio: str) -> Image.Image:
+  job_dir = _grok_job_dir()
+  full = (
+    "Call image_gen exactly once. Do not describe the image, do not list or search "
+    "directories, do not read files.\n\n"
+    f"Prompt for image_gen (use verbatim):\n{prompt}\n\n"
+    f"Aspect ratio: {aspect_ratio}.\n"
+    "Copy the generated file to output/result.png (or output/result.jpg if JPEG). "
+    "Final response: only that relative path."
+  )
+  path, data = _grok_run(full, job_dir)
+  _grok_record(model, data)
+  with Image.open(path) as img:
+    img.load()
+    return img.convert("RGB")
+
+
+def _edit_grok(image: Image.Image, prompt: str, model: str) -> Image.Image:
+  job_dir = _grok_job_dir()
+  src = os.path.join(job_dir, "source.png")
+  image.convert("RGB").save(src, format="PNG")
+  full = (
+    f"Call image_edit exactly once with the source image at the absolute path {src} "
+    "(it exists; do not search for it, do not list directories, do not read other files). "
+    "Do not describe the image. Use this exact text as the edit prompt:\n\n"
+    f"{prompt}\n\n"
+    "Copy the result to output/result.png (or output/result.jpg if JPEG). "
+    "Final response: only that relative path."
+  )
+  path, data = _grok_run(full, job_dir)
+  _grok_record(model, data)
+  with Image.open(path) as img:
+    img.load()
+    return img.convert("RGB")
+
+
 def generate_image(
   prompt: str,
   *,
@@ -493,6 +638,8 @@ def generate_image(
   Returns:
     PIL Image — RGBA when `transparent` produced real alpha, RGB otherwise.
   """
+  if model.startswith("grok/"):
+    return _generate_grok(prompt, model, aspect_ratio)
   if model.startswith("openai/") and os.environ.get("OPENAI_API_KEY"):
     return _generate_openai(
       prompt, model.removeprefix("openai/"), aspect_ratio, image_size, transparent
@@ -550,6 +697,7 @@ def edit_image(
   *,
   model: str = "google/gemini-3.1-flash-image-preview",
   resize_to_input: bool = True,
+  quality: str | None = None,
 ) -> Image.Image:
   """Send one image + text prompt, get back a modified image.
 
@@ -566,8 +714,13 @@ def edit_image(
   Returns:
     PIL Image in RGB mode, resized to the input's original dimensions.
   """
+  if model.startswith("grok/"):
+    result = _edit_grok(image, prompt, model)
+    if resize_to_input and result.size != image.size:
+      result = _resize_to_input_guarded(result, image.size)
+    return result
   if model.startswith("openai/") and os.environ.get("OPENAI_API_KEY"):
-    return _edit_openai(image, prompt, model.removeprefix("openai/"))
+    return _edit_openai(image, prompt, model.removeprefix("openai/"), quality=quality)
   if (
     model.startswith("google/")
     and os.environ.get("GOOGLE_API_KEY")
