@@ -68,7 +68,7 @@ class _FakeUrlopenResponse:
 def _install_urlopen(monkeypatch, bodies):
   queue = list(bodies)
   monkeypatch.setattr(
-    llm_module, "urlopen", lambda request, timeout=None: _FakeUrlopenResponse(queue.pop(0)))
+    llm_module, "urlopen", lambda *_args, **_kwargs: _FakeUrlopenResponse(queue.pop(0)))
 
 
 class _FakeAsyncResponse:
@@ -86,7 +86,7 @@ def _install_async_client(monkeypatch, bodies):
   queue = list(bodies)
 
   class FakeAsyncClient:
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *_args, **_kwargs):
       pass
 
     async def __aenter__(self):
@@ -163,3 +163,148 @@ class TestOpenRouterLedger:
     with pytest.raises(KeyError):
       LLM("openrouter/x", tools=[lookup]).generate("x")
     assert [row["request_id"] for row in _rows()] == ["gen-err"]
+
+
+# --- Gemini (google-genai SDK) ---
+
+
+def _usage_metadata(prompt=1000, image=400, text=100, thoughts=50):
+  from google.genai import types
+
+  return types.GenerateContentResponseUsageMetadata(
+    prompt_token_count=prompt,
+    candidates_token_count=image + text,
+    thoughts_token_count=thoughts,
+    total_token_count=prompt + image + text + thoughts,
+    candidates_tokens_details=[
+      types.ModalityTokenCount(modality=types.MediaModality.IMAGE, token_count=image),
+      types.ModalityTokenCount(modality=types.MediaModality.TEXT, token_count=text),
+    ],
+  )
+
+
+EXPECTED_USAGE = {
+  "promptTokenCount": 1000,
+  "candidatesTokenCount": 500,
+  "thoughtsTokenCount": 50,
+  "totalTokenCount": 1550,
+  "candidatesTokensDetails": [
+    {"modality": "IMAGE", "tokenCount": 400},
+    {"modality": "TEXT", "tokenCount": 100},
+  ],
+}
+
+
+def _gemini_response(text="ok", response_id="resp-1"):
+  from types import SimpleNamespace
+
+  return SimpleNamespace(
+    text=text, usage_metadata=_usage_metadata(), response_id=response_id, candidates=[])
+
+
+class _FakeGeminiClient:
+  def __init__(self, response):
+    from types import SimpleNamespace
+
+    self.deleted = []
+    self.models = SimpleNamespace(generate_content=lambda **_kwargs: response)
+    self.files = SimpleNamespace(
+      upload=lambda **_kwargs: SimpleNamespace(name="files/v", state=SimpleNamespace(name="ACTIVE")),
+      delete=lambda name: self.deleted.append(name),
+    )
+
+
+@pytest.fixture
+def gemini(monkeypatch):
+  from merceka_core import llm_gemini
+
+  monkeypatch.setattr(LLM, "_verify", lambda self: None)
+
+  def install(response):
+    monkeypatch.setattr(llm_gemini, "_gemini_client", lambda: _FakeGeminiClient(response))
+
+  return install
+
+
+class TestGeminiLedger:
+  def test_image_call_writes_google_direct_row_with_camelcase_usage(self, gemini, tmp_path):
+    png = tmp_path / "x.png"
+    png.write_bytes(b"\x89PNG fake")
+    gemini(_gemini_response())
+    assert LLM("gemini/gemini-flash-latest").generate_with_resource("x", png) == "ok"
+    [row] = _rows()
+    assert row["source"] == "google-direct"
+    assert row["model"] == "google/gemini-flash-latest"
+    assert row["usage"] == EXPECTED_USAGE
+    assert row["request_id"] == "resp-1"
+    assert row["usd"] is None  # no rate entry: tokens kept, price never invented
+
+  def test_async_image_call_writes_row(self, gemini, tmp_path):
+    png = tmp_path / "x.png"
+    png.write_bytes(b"\x89PNG fake")
+    gemini(_gemini_response())
+    llm = LLM("gemini/gemini-flash-latest")
+    assert asyncio.run(llm.agenerate_with_resource("x", png)) == "ok"
+    assert [row["model"] for row in _rows()] == ["google/gemini-flash-latest"]
+
+  def test_video_call_writes_row(self, gemini, tmp_path):
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"\x00")
+    gemini(_gemini_response("described"))
+    llm = LLM("gemini/gemini-flash-latest")
+    assert llm.generate_with_video("x", video, poll_interval_s=0) == "described"
+    [row] = _rows()
+    assert row["source"] == "google-direct" and row["usage"] == EXPECTED_USAGE
+
+  def test_search_grounding_writes_row(self, gemini):
+    from merceka_core.llm_gemini import generate_with_search_grounding
+
+    gemini(_gemini_response("grounded"))
+    text, _ = asyncio.run(generate_with_search_grounding(prompt="x", model="gemini-2.5-pro"))
+    assert text == "grounded"
+    [row] = _rows()
+    assert row["model"] == "google/gemini-2.5-pro" and row["usage"] == EXPECTED_USAGE
+
+  def test_row_is_written_before_parsing(self, gemini, tmp_path):
+    from pydantic import ValidationError
+
+    from merceka_core.llm import OutputSchema
+
+    class Label(OutputSchema):
+      label: str
+
+    png = tmp_path / "x.png"
+    png.write_bytes(b"\x89PNG fake")
+    gemini(_gemini_response("not json"))
+    with pytest.raises(ValidationError):
+      LLM("gemini/gemini-flash-latest", output_schema=Label).generate_with_resource("x", png)
+    assert len(_rows()) == 1
+
+  def test_rate_table_prices_the_modality_split(self, gemini, tmp_path, monkeypatch):
+    """The usage dict uses the names costs.py prices: image output and
+    text+thinking output are split by candidatesTokensDetails."""
+    rates = tmp_path / "rates.json"
+    rates.write_text(json.dumps({"google/gemini-img": {
+      "promptTokenCount": 1.0, "outputImageTokens": 10.0, "outputTextTokens": 2.0}}))
+    monkeypatch.setenv("MERCEKA_RATES_PATH", str(rates))
+    png = tmp_path / "x.png"
+    png.write_bytes(b"\x89PNG fake")
+    gemini(_gemini_response())
+    LLM("gemini/gemini-img").generate_with_resource("x", png)
+    [row] = _rows()
+    # 1000 prompt * $1/M + 400 image * $10/M + (100 text + 50 thoughts) * $2/M
+    assert row["usd"] == pytest.approx(0.0053)
+    assert row["usd_source"] == "rates"
+
+  def test_attribute_bag_usage_is_converted(self, gemini, tmp_path):
+    """A snake_case attribute object (not the SDK class) still lands camelCase."""
+    from types import SimpleNamespace
+
+    png = tmp_path / "x.png"
+    png.write_bytes(b"\x89PNG fake")
+    usage = SimpleNamespace(prompt_token_count=258, candidates_token_count=3)
+    gemini(SimpleNamespace(text="ok", usage_metadata=usage))
+    LLM("gemini/gemini-flash-latest").generate_with_resource("x", png)
+    [row] = _rows()
+    assert row["usage"] == {"promptTokenCount": 258, "candidatesTokenCount": 3}
+    assert "request_id" not in row

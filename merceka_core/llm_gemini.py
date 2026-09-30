@@ -39,6 +39,43 @@ def _gemini_client():
   return genai.Client(http_options=types.HttpOptions(timeout=600_000))
 
 
+def _usage_dict(usage_metadata) -> dict:
+  """``usage_metadata`` as the REST ``usageMetadata`` dict costs.py prices.
+
+  Validating through the SDK's own type converts the SDK object (or any object
+  or dict with its fields) to the camelCase REST names (``promptTokenCount``,
+  ``candidatesTokensDetails[].tokenCount``, ...); JSON mode turns the modality
+  enums into their ``"IMAGE"``/``"TEXT"`` strings. Anything unreadable yields an
+  empty dict, so the call is still counted.
+  """
+  if usage_metadata is None:
+    return {}
+  try:
+    from google.genai import types
+
+    usage = types.GenerateContentResponseUsageMetadata.model_validate(usage_metadata)
+    return usage.model_dump(mode="json", by_alias=True, exclude_none=True)
+  except Exception:  # noqa: BLE001 — metering must never fail the metered call.
+    return {}
+
+
+def _record_usage(model: str, response) -> None:
+  """Meter one ``generate_content`` response in the cost ledger.
+
+  Called before the response is parsed, so a charged call whose output cannot
+  be parsed is still recorded. Gemini states no cost, so ``usd`` is left to
+  the rate table.
+  """
+  from merceka_core import costs as _costs
+
+  _costs.record(
+    source="google-direct",
+    model=f"google/{model}",
+    usage=_usage_dict(getattr(response, "usage_metadata", None)),
+    request_id=getattr(response, "response_id", None),
+  )
+
+
 def _gemini_poll_until_active(client, file_obj, timeout_s: float, poll_interval_s: float):
   """Block until ``file_obj.state.name == 'ACTIVE'`` or raise.
 
@@ -152,6 +189,7 @@ def _gemini_video_call(
         _logger.warning("Gemini %s, retrying in %.2fs", type(exc).__name__, delay)
         time.sleep(delay)
 
+    _record_usage(model_alias, response)
     text = getattr(response, "text", None) or ""
     return llm._parse_response(text)
   finally:
@@ -223,6 +261,7 @@ def _gemini_image_call(llm, message: str, resource_path, **kwargs):
       _logger.warning("Gemini image %s, retrying in %.2fs", type(exc).__name__, delay)
       time.sleep(delay)
 
+  _record_usage(model, response)
   text = getattr(response, "text", None) or ""
   if not text and llm.output_schema is not None:
     # Blocked/empty response would surface as a confusing ValidationError.
@@ -311,6 +350,7 @@ def _generate_with_search_grounding_sync(
       )
       time.sleep(delay)
 
+  _record_usage(model, response)
   text = getattr(response, "text", None) or ""
   try:
     grounding = _extract_grounding(response)
