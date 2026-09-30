@@ -100,6 +100,49 @@ def _gemini_poll_until_active(client, file_obj, timeout_s: float, poll_interval_
     current = client.files.get(name=current.name)
 
 
+# Client errors: the request itself is wrong (bad argument, bad or unauthorised
+# key, unknown model), so every retry fails the same way.
+_CLIENT_ERROR_STATUS_CODES = frozenset({400, 401, 403, 404})
+
+
+def _generate_content(client, label: str, **gc_kwargs):
+  """``client.models.generate_content`` with the shared retry policy.
+
+  Retries 429/5xx and connection resets. Client errors (400/401/403/404) raise
+  the terminal :class:`VideoUploadError`, because retrying cannot fix them.
+  Everything else, including exhausted retries, raises the transient
+  :class:`VideoBackendError`.
+  """
+  for attempt in range(_RETRY_MAX_ATTEMPTS):
+    try:
+      return client.models.generate_content(**gc_kwargs)
+    except Exception as exc:  # noqa: BLE001 — bridge SDK errors to our taxonomy.
+      status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+      if status in _CLIENT_ERROR_STATUS_CODES:
+        raise VideoUploadError(
+          f"{label} generate_content rejected the request ({status}): {exc}"
+        ) from exc
+      is_retryable = status in _RETRY_STATUS_CODES or isinstance(
+        exc, (ConnectionResetError, ConnectionRefusedError)
+      )
+      if not is_retryable or attempt == _RETRY_MAX_ATTEMPTS - 1:
+        raise VideoBackendError(f"{label} generate_content failed: {exc}") from exc
+      delay = _retry_delay(attempt)
+      _logger.warning("%s %s, retrying in %.2fs", label, type(exc).__name__, delay)
+      time.sleep(delay)
+  raise RuntimeError("retry loop exhausted without return")  # unreachable
+
+
+def _delete_uploads(client, names: list[str]) -> None:
+  """Best-effort delete of uploaded files. Never raises: cleanup must not mask
+  the error that ended the call."""
+  for name in names:
+    try:
+      client.files.delete(name=name)
+    except Exception:  # noqa: BLE001 — hygiene, not critical.
+      _logger.warning("Gemini file delete failed for %s", name)
+
+
 def _build_video_config(max_tokens=None, system_prompt: str = "", **extra):
   """Translate common slab kwargs into a google-genai GenerateContentConfig.
 
@@ -158,46 +201,32 @@ def _gemini_video_call(
     **kwargs,
   )
 
-  uploaded = []
+  uploaded = []  # ACTIVE file objects, in upload order: the generate_content contents
+  to_delete: list[str] = []  # every file the Files API accepted, ACTIVE or not
   try:
     for p in paths:
       try:
         file_obj = client.files.upload(file=str(p))
       except Exception as exc:  # pragma: no cover — SDK-specific errors.
         raise VideoUploadError(f"upload failed for {p}: {exc}") from exc
+      # Queue the delete before polling, so an upload that never becomes
+      # ACTIVE (FAILED or poll timeout) is still removed.
+      if file_obj.name:
+        to_delete.append(file_obj.name)
       active = _gemini_poll_until_active(client, file_obj, timeout_s, poll_interval_s)
       uploaded.append(active)
 
     contents = [*uploaded, message]
-
-    # Apply retry around generate_content for transient 5xx/429.
-    for attempt in range(_RETRY_MAX_ATTEMPTS):
-      try:
-        gc_kwargs: dict = {"model": model_alias, "contents": contents, **remaining_kwargs}
-        if config is not None:
-          gc_kwargs["config"] = config
-        response = client.models.generate_content(**gc_kwargs)
-        break
-      except Exception as exc:  # noqa: BLE001 — bridge to our taxonomy.
-        status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
-        is_retryable = status in _RETRY_STATUS_CODES or isinstance(
-          exc, (ConnectionResetError, ConnectionRefusedError)
-        )
-        if not is_retryable or attempt == _RETRY_MAX_ATTEMPTS - 1:
-          raise VideoBackendError(f"Gemini generate_content failed: {exc}") from exc
-        delay = _retry_delay(attempt)
-        _logger.warning("Gemini %s, retrying in %.2fs", type(exc).__name__, delay)
-        time.sleep(delay)
+    gc_kwargs: dict = {"model": model_alias, "contents": contents, **remaining_kwargs}
+    if config is not None:
+      gc_kwargs["config"] = config
+    response = _generate_content(client, "Gemini", **gc_kwargs)
 
     _record_usage(model_alias, response)
     text = getattr(response, "text", None) or ""
     return llm._parse_response(text)
   finally:
-    for f in uploaded:
-      try:
-        client.files.delete(name=f.name)
-      except Exception:  # pragma: no cover — hygiene, not critical.
-        _logger.debug("Gemini file delete failed for %s", getattr(f, "name", "?"))
+    _delete_uploads(client, to_delete)
 
 _IMAGE_MIME_FALLBACK = {
   ".png": "image/png",
@@ -216,8 +245,9 @@ def _gemini_image_call(llm, message: str, resource_path, **kwargs):
   Called by ``LLM.generate_with_resource`` for ``gemini/`` models. Unlike
   the video path, images ride inline on the request, so there is no
   upload/poll/delete lifecycle. Retries transient failures via the shared
-  retry policy; raises :class:`VideoBackendError` (the shared Gemini
-  transport error) when retries are exhausted or the error is terminal.
+  retry policy; raises :class:`VideoUploadError` when the request is rejected
+  (400/401/403/404) and :class:`VideoBackendError` (the shared transient Gemini
+  error) when retries are exhausted or the failure is unclassified.
   """
   import mimetypes
 
@@ -241,25 +271,11 @@ def _gemini_image_call(llm, message: str, resource_path, **kwargs):
   part = types.Part.from_bytes(data=path.read_bytes(), mime_type=mime_type)
 
   client = _gemini_client()
-  response = None
-  for attempt in range(_RETRY_MAX_ATTEMPTS):
-    try:
-      # Unknown kwargs reach generate_content and fail loudly (video-path parity).
-      gc_kwargs: dict = {"model": model, "contents": [part, message], **remaining_kwargs}
-      if config is not None:
-        gc_kwargs["config"] = config
-      response = client.models.generate_content(**gc_kwargs)
-      break
-    except Exception as exc:  # noqa: BLE001 — bridge SDK errors to our taxonomy.
-      status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
-      is_retryable = status in _RETRY_STATUS_CODES or isinstance(
-        exc, (ConnectionResetError, ConnectionRefusedError)
-      )
-      if not is_retryable or attempt == _RETRY_MAX_ATTEMPTS - 1:
-        raise VideoBackendError(f"Gemini image generate_content failed: {exc}") from exc
-      delay = _retry_delay(attempt)
-      _logger.warning("Gemini image %s, retrying in %.2fs", type(exc).__name__, delay)
-      time.sleep(delay)
+  # Unknown kwargs reach generate_content and fail loudly (video-path parity).
+  gc_kwargs: dict = {"model": model, "contents": [part, message], **remaining_kwargs}
+  if config is not None:
+    gc_kwargs["config"] = config
+  response = _generate_content(client, "Gemini image", **gc_kwargs)
 
   _record_usage(model, response)
   text = getattr(response, "text", None) or ""
@@ -328,27 +344,9 @@ def _generate_with_search_grounding_sync(
     config_kwargs["system_instruction"] = system_prompt
   config = types.GenerateContentConfig(**config_kwargs)
 
-  response = None
-  for attempt in range(_RETRY_MAX_ATTEMPTS):
-    try:
-      response = client.models.generate_content(
-        model=model, contents=prompt, config=config,
-      )
-      break
-    except Exception as exc:  # noqa: BLE001 — bridge to our taxonomy.
-      status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
-      is_retryable = status in _RETRY_STATUS_CODES or isinstance(
-        exc, (ConnectionResetError, ConnectionRefusedError)
-      )
-      if not is_retryable or attempt == _RETRY_MAX_ATTEMPTS - 1:
-        raise VideoBackendError(
-          f"Gemini search-grounded generate_content failed: {exc}"
-        ) from exc
-      delay = _retry_delay(attempt)
-      _logger.warning(
-        "Gemini search-grounded %s, retrying in %.2fs", type(exc).__name__, delay,
-      )
-      time.sleep(delay)
+  response = _generate_content(
+    client, "Gemini search-grounded", model=model, contents=prompt, config=config,
+  )
 
   _record_usage(model, response)
   text = getattr(response, "text", None) or ""
@@ -383,6 +381,7 @@ async def generate_with_search_grounding(
     timeout_s: Reserved; the underlying client uses its own timeout.
 
   Raises:
+    VideoUploadError: The request was rejected (400/401/403/404).
     VideoBackendError: On non-retryable 5xx / persistent transport errors.
   """
   import asyncio

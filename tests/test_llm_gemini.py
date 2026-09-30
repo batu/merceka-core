@@ -21,6 +21,7 @@ from merceka_core.llm_gemini import (
   _extract_grounding,
   _gemini_poll_until_active,
   _gemini_video_call,
+  _generate_with_search_grounding_sync,
 )
 from merceka_core.retry import _RETRY_MAX_ATTEMPTS
 
@@ -53,13 +54,15 @@ def clock(monkeypatch):
 
 
 class FakeFiles:
-  def __init__(self, get_states=None):
+  def __init__(self, get_states=None, upload_states=None):
     self.get_states = list(get_states or [])
+    self.upload_states = list(upload_states or [])
     self.get_calls = []
     self.deleted = []
 
   def upload(self, file):
-    return _file_obj(name=f"files/{file}", state="ACTIVE")
+    state = self.upload_states.pop(0) if self.upload_states else "ACTIVE"
+    return _file_obj(name=f"files/{file}", state=state)
 
   def get(self, name):
     self.get_calls.append(name)
@@ -254,19 +257,80 @@ class TestGeminiVideoCall:
     assert len(models.calls) == 2
     assert len(clock.sleeps) == 1  # backoff went through the fake clock
 
-  def test_non_retryable_error_raises_backend_error_and_still_deletes(
-    self, clock, monkeypatch, video,
-  ):
-    fatal = Exception("400 bad request")
-    fatal.status_code = 400
-    client = FakeClient(models=FakeModels([fatal]))
+  @pytest.mark.parametrize("status", [400, 401, 403, 404])
+  def test_client_errors_are_terminal_and_still_delete(self, clock, monkeypatch, video, status):
+    """A bad request, key, permission or model name fails the same way every
+    time: it is the terminal VideoUploadError, not the transient VideoBackendError."""
+    fatal = Exception(f"{status} client error")
+    fatal.status_code = status
+    models = FakeModels([fatal])
+    client = FakeClient(models=models)
     monkeypatch.setattr(llm_gemini, "_gemini_client", lambda: client)
 
-    with pytest.raises(VideoBackendError, match="generate_content failed"):
+    with pytest.raises(VideoUploadError, match=f"rejected the request \\({status}\\)"):
       _gemini_video_call(FakeLLM(), "hi", video, timeout_s=10, poll_interval_s=1)
 
+    assert len(models.calls) == 1
     assert client.files.deleted == [f"files/{video}"]
     assert clock.sleeps == []
+
+  def test_sdk_client_error_is_terminal(self, clock, monkeypatch, video):
+    from google.genai import errors
+
+    bad_key = errors.ClientError(
+      401, {"error": {"code": 401, "message": "API key not valid", "status": "UNAUTHENTICATED"}})
+    client = FakeClient(models=FakeModels([bad_key]))
+    monkeypatch.setattr(llm_gemini, "_gemini_client", lambda: client)
+
+    with pytest.raises(VideoUploadError, match="API key not valid"):
+      _gemini_video_call(FakeLLM(), "hi", video, timeout_s=10, poll_interval_s=1)
+
+  def test_upload_that_never_becomes_active_is_deleted(self, clock, monkeypatch, video):
+    """Regression: a file was queued for deletion only after polling succeeded."""
+    files = FakeFiles(upload_states=["PROCESSING"])  # get() keeps reporting PROCESSING
+    monkeypatch.setattr(llm_gemini, "_gemini_client", lambda: FakeClient(files=files))
+
+    with pytest.raises(VideoUploadError, match="did not reach ACTIVE"):
+      _gemini_video_call(FakeLLM(), "hi", video, timeout_s=5, poll_interval_s=1)
+
+    assert files.deleted == [f"files/{video}"]
+
+  def test_failed_upload_is_deleted(self, clock, monkeypatch, video):
+    files = FakeFiles(upload_states=["PROCESSING"], get_states=["FAILED"])
+    monkeypatch.setattr(llm_gemini, "_gemini_client", lambda: FakeClient(files=files))
+
+    with pytest.raises(VideoUploadError, match="FAILED"):
+      _gemini_video_call(FakeLLM(), "hi", video, timeout_s=5, poll_interval_s=1)
+
+    assert files.deleted == [f"files/{video}"]
+
+  def test_every_upload_is_deleted_when_a_later_one_times_out(self, clock, monkeypatch, tmp_path):
+    first, second = tmp_path / "a.mp4", tmp_path / "b.mp4"
+    first.write_bytes(b"a")
+    second.write_bytes(b"b")
+    files = FakeFiles(upload_states=["ACTIVE", "PROCESSING"])
+    monkeypatch.setattr(llm_gemini, "_gemini_client", lambda: FakeClient(files=files))
+
+    with pytest.raises(VideoUploadError):
+      _gemini_video_call(FakeLLM(), "hi", [first, second], timeout_s=5, poll_interval_s=1)
+
+    assert files.deleted == [f"files/{first}", f"files/{second}"]
+
+  def test_cleanup_failure_does_not_mask_the_upload_error(self, clock, monkeypatch, video):
+    files = FakeFiles(upload_states=["PROCESSING"])
+    attempts = []
+
+    def failing_delete(name):
+      attempts.append(name)
+      raise RuntimeError("delete failed")
+
+    files.delete = failing_delete
+    monkeypatch.setattr(llm_gemini, "_gemini_client", lambda: FakeClient(files=files))
+
+    with pytest.raises(VideoUploadError, match="did not reach ACTIVE"):
+      _gemini_video_call(FakeLLM(), "hi", video, timeout_s=5, poll_interval_s=1)
+
+    assert attempts == [f"files/{video}"]
 
   def test_retries_exhausted_raises_backend_error(self, clock, monkeypatch, video):
     def transient():
@@ -284,6 +348,38 @@ class TestGeminiVideoCall:
     # N attempts sleep N-1 backoffs before the final attempt raises.
     assert len(clock.sleeps) == _RETRY_MAX_ATTEMPTS - 1
     assert client.files.deleted == [f"files/{video}"]
+
+
+# --- _generate_with_search_grounding_sync error classification ---
+
+class TestSearchGroundingErrors:
+  def _call(self):
+    return _generate_with_search_grounding_sync(
+      prompt="q", system_prompt="", model="gemini-2.5-pro", max_tokens=0, timeout_s=1,
+    )
+
+  def test_client_error_is_terminal(self, clock, monkeypatch):
+    fatal = Exception("403 permission denied")
+    fatal.status_code = 403
+    models = FakeModels([fatal])
+    monkeypatch.setattr(llm_gemini, "_gemini_client", lambda: FakeClient(models=models))
+
+    with pytest.raises(VideoUploadError, match="rejected the request \\(403\\)"):
+      self._call()
+    assert len(models.calls) == 1
+
+  def test_server_errors_exhaust_to_backend_error(self, clock, monkeypatch):
+    def transient():
+      exc = Exception("503")
+      exc.status_code = 503
+      return exc
+
+    models = FakeModels([transient() for _ in range(_RETRY_MAX_ATTEMPTS)])
+    monkeypatch.setattr(llm_gemini, "_gemini_client", lambda: FakeClient(models=models))
+
+    with pytest.raises(VideoBackendError, match="search-grounded generate_content failed"):
+      self._call()
+    assert len(models.calls) == _RETRY_MAX_ATTEMPTS
 
 
 # --- _extract_grounding ---

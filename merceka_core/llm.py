@@ -1259,7 +1259,8 @@ class LLM:
       poll_interval_s: Seconds between ``files.get`` polls.
 
     Raises:
-      VideoUploadError: File FAILED or exceeded ``timeout_s``.
+      VideoUploadError: File FAILED or exceeded ``timeout_s``, or the request
+        was rejected (400/401/403/404). Uploaded files are deleted either way.
       VideoNotFoundError: Path does not exist on disk.
       VideoBackendError: 5xx / transient inference failure.
     """
