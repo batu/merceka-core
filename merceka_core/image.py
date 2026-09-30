@@ -10,6 +10,7 @@ __all__ = [
 import base64
 import io
 import json
+import logging
 import math
 import os
 import re
@@ -18,6 +19,8 @@ import httpx
 from PIL import Image
 
 from merceka_core import costs as _costs
+
+_logger = logging.getLogger(__name__)
 
 
 def _image_to_base64_uri(image: Image.Image) -> str:
@@ -215,17 +218,27 @@ def _generate_openai(
     item = data["data"][0]
     if "b64_json" in item:
       raw = base64.b64decode(item["b64_json"])
-      return Image.open(io.BytesIO(raw)).convert(target_mode)
-    # Some responses use a URL instead of b64_json.
-    url = item["url"]
-    with httpx.Client(timeout=120) as client:
-      r = client.get(url)
-      r.raise_for_status()
-      return Image.open(io.BytesIO(r.content)).convert(target_mode)
+      result = Image.open(io.BytesIO(raw)).convert(target_mode)
+    else:
+      # Some responses use a URL instead of b64_json.
+      url = item["url"]
+      with httpx.Client(timeout=120) as client:
+        r = client.get(url)
+        r.raise_for_status()
+        result = Image.open(io.BytesIO(r.content)).convert(target_mode)
   except (KeyError, IndexError) as e:
     raise RuntimeError(
       f"No image in OpenAI response: {e}\nResponse: {json.dumps(data, indent=2)[:500]}"
     ) from e
+  if transparent and result.getchannel("A").getextrema() == (255, 255):
+    # Still RGBA, so callers keep their type, but "RGBA" alone no longer proves
+    # there is a cut-out: callers with a matting fallback need to hear about it.
+    _logger.warning(
+      "OpenAI %s returned a fully opaque image for a transparent request; "
+      "the alpha channel carries no cut-out",
+      model,
+    )
+  return result
 
 
 _OPENAI_CUSTOM_SIZE_MAX_EDGE = 3840
@@ -691,7 +704,8 @@ def generate_image(
     aspect_ratio: Aspect ratio string (e.g., "1:1", "9:16", "16:9").
     image_size: Resolution tier ("1K", "2K", "4K") — OpenAI maps to WxH.
     transparent: Request a transparent background. OpenAI: native alpha via
-      `background: "transparent"` (RGBA result). OpenRouter: prompt-requested;
+      `background: "transparent"` (RGBA result; a warning is logged when the
+      model nonetheless returns every pixel opaque). OpenRouter: prompt-requested;
       alpha is preserved only when the model actually returns it — callers
       needing guaranteed alpha must check the result mode and fall back to
       matting.

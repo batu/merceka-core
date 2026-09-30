@@ -116,6 +116,28 @@ def test_generate_openai_default_payload_unchanged(monkeypatch):
   assert img.mode == "RGB"
 
 
+def test_transparent_request_with_fully_opaque_output_warns(monkeypatch, caplog):
+  # The API answered a transparent request with alpha 255 everywhere. The RGBA
+  # result is kept, but callers relying on real alpha must be told.
+  monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+  _CapturingClient.response_payload = _openai_b64("RGB", (0, 0, 255))
+  with caplog.at_level("WARNING", logger="merceka_core.image"):
+    with patch("merceka_core.image.httpx.Client", _CapturingClient):
+      img = _generate_openai("a coin", "gpt-image-2", "1:1", "1K", transparent=True)
+  assert img.mode == "RGBA"
+  assert img.getchannel("A").getextrema() == (255, 255)
+  assert "fully opaque" in caplog.text
+
+
+def test_transparent_request_with_real_alpha_does_not_warn(monkeypatch, caplog):
+  monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+  _CapturingClient.response_payload = _openai_b64("RGBA", (0, 0, 255, 30))
+  with caplog.at_level("WARNING", logger="merceka_core.image"):
+    with patch("merceka_core.image.httpx.Client", _CapturingClient):
+      _generate_openai("a coin", "gpt-image-2", "1:1", "1K", transparent=True)
+  assert "fully opaque" not in caplog.text
+
+
 def test_openai_prefix_falls_back_to_openrouter_without_key(monkeypatch):
   monkeypatch.delenv("OPENAI_API_KEY", raising=False)
   monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
