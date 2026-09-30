@@ -36,5 +36,16 @@ class VideoNotFoundError(FileNotFoundError):
   """Video path does not exist on disk."""
 
 
+class LLMResponseError(Exception):
+  """The provider answered without a usable completion.
+
+  Raised when an OpenRouter body carries an ``error`` object instead of
+  ``choices`` (OpenRouter reports errors that occur while the model generates
+  with HTTP 200), and when a response has no content (for example, reasoning
+  used up ``max_tokens``). Never retried, because the provider processed and may
+  have billed the request. Participates in the ``LLM.generate`` fallback cascade.
+  """
+
+
 class GpuLockTimeout(TimeoutError):
   """Timed out waiting to acquire the cross-process GPU file lock."""

@@ -11,6 +11,7 @@ import pytest
 
 import merceka_core.llm as llm_module
 from merceka_core import costs
+from merceka_core.errors import LLMResponseError
 from merceka_core.llm import LLM
 
 USAGE = {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.0012}
@@ -141,7 +142,7 @@ class TestOpenRouterLedger:
     """A charged call whose body cannot be parsed is still metered."""
     body = {"id": "gen-broken", "usage": dict(USAGE)}  # no "choices"
     _install_async_client(monkeypatch, [body])
-    with pytest.raises(KeyError):
+    with pytest.raises(LLMResponseError):
       asyncio.run(LLM("openrouter/x").agenerate("x"))
     [row] = _rows()
     assert row["request_id"] == "gen-broken" and row["usd"] == 0.0012
@@ -160,7 +161,7 @@ class TestOpenRouterLedger:
 
   def test_tool_loop_row_is_written_before_parsing(self, monkeypatch):
     _install_urlopen(monkeypatch, [{"id": "gen-err", "usage": dict(USAGE)}])
-    with pytest.raises(KeyError):
+    with pytest.raises(LLMResponseError):
       LLM("openrouter/x", tools=[lookup]).generate("x")
     assert [row["request_id"] for row in _rows()] == ["gen-err"]
 

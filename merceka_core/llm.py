@@ -103,6 +103,7 @@ from merceka_core.messages import (  # noqa: E402, F401 — re-exported for back
 )
 from merceka_core import _cli
 from merceka_core.errors import (  # noqa: F401 — VideoNotFoundError/VideoUploadError re-exported
+  LLMResponseError,
   VideoBackendError,
   VideoNotFoundError,
   VideoUploadError,
@@ -141,6 +142,7 @@ _FALLBACK_ERRORS = (
   urllib.error.URLError,
   VideoBackendError,
   ResponseError,
+  LLMResponseError,
 )
 
 # Per-call kwargs a fallback on another transport must not receive.
@@ -607,7 +609,7 @@ class LLM:
     with urlopen(request, timeout=timeout) as response:
       body = json.load(response)
     self._record_openrouter_usage(payload["model"], body)
-    msg = body["choices"][0]["message"]
+    msg = self._openrouter_choice(body)["message"]
     # Normalize: ensure arguments is a dict
     if msg.get("tool_calls"):
       for tc in msg["tool_calls"]:
@@ -631,7 +633,7 @@ class LLM:
       response.raise_for_status()
       body = response.json()
     self._record_openrouter_usage(payload["model"], body)
-    msg = body["choices"][0]["message"]
+    msg = self._openrouter_choice(body)["message"]
     if msg.get("tool_calls"):
       for tc in msg["tool_calls"]:
         args = tc["function"].get("arguments")
@@ -794,8 +796,29 @@ class LLM:
 
     return headers, payload, timeout
 
+  @staticmethod
+  def _openrouter_choice(body: dict) -> dict:
+    """The first choice of an OpenRouter completion body.
+
+    OpenRouter reports errors that occur while the model generates with HTTP 200
+    and an ``error`` object in place of ``choices``.
+    """
+    choices = body.get("choices")
+    if not choices:
+      error = body.get("error")
+      if error:
+        raise LLMResponseError(f"OpenRouter returned an error instead of a completion: {error}")
+      raise LLMResponseError(f"OpenRouter response has no choices (keys: {sorted(body)})")
+    return choices[0]
+
   def _parse_openrouter_body(self, body: dict) -> str | OutputSchema:
-    return self._parse_response(body["choices"][0]["message"]["content"])
+    choice = self._openrouter_choice(body)
+    content = choice["message"].get("content")
+    if content is None:
+      raise LLMResponseError(
+        f"OpenRouter returned no content (finish_reason={choice.get('finish_reason')!r})"
+      )
+    return self._parse_response(content)
 
   @staticmethod
   def _record_openrouter_usage(model: str, body: dict) -> None:
@@ -937,7 +960,8 @@ class LLM:
 
   def _parse_response(self, content) -> str | OutputSchema:
     """Parse raw response content, validating against schema if set."""
-    assert content is not None, "No content was returned"
+    if content is None:
+      raise LLMResponseError(f"{self.model_name} returned no content")
     if self.output_schema:
       if isinstance(content, str):
         return self.output_schema.model_validate_json(content)

@@ -255,3 +255,127 @@ class TestCascadeCatchesProviderFailures:
     monkeypatch.setattr(llm_module, "ollama_chat", ollama_500)
     with pytest.raises(ollama.ResponseError):
       LLM("gemma4:26b").generate("q")
+
+
+class _Urlopen:
+  """urlopen stand-in returning ``bodies`` in order (JSON-encoded)."""
+
+  def __init__(self, bodies):
+    self.bodies = list(bodies)
+    self.models = []
+
+  def __call__(self, request, timeout=None):
+    import json
+
+    del timeout
+    self.models.append(json.loads(request.data)["model"])
+    body = json.dumps(self.bodies.pop(0)).encode()
+
+    class Response:
+      def __enter__(self):
+        return self
+
+      def __exit__(self, *exc):
+        return False
+
+      def read(self, *_args):
+        return body
+
+    return Response()
+
+
+_ERROR_BODY = {"error": {"code": 502, "message": "Provider returned error: upstream overloaded"}}
+_NO_CONTENT_BODY = {
+  "id": "gen-empty",
+  "choices": [{"message": {"role": "assistant", "content": None}, "finish_reason": "length"}],
+  "usage": {"cost": 0.01},
+}
+_OK_BODY = {"choices": [{"message": {"role": "assistant", "content": "fallback answer"}}]}
+
+
+class TestProviderResponseErrors:
+  @pytest.fixture(autouse=True)
+  def _key(self, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+
+  def test_error_body_raises_a_typed_error(self, monkeypatch):
+    """Regression (review R10): KeyError('choices'), outside the cascade."""
+    from merceka_core.errors import LLMResponseError
+
+    monkeypatch.setattr(llm_module, "urlopen", _Urlopen([_ERROR_BODY]))
+    with pytest.raises(LLMResponseError, match="upstream overloaded"):
+      LLM("openrouter/x").generate("q")
+
+  def test_error_body_falls_back_without_retrying(self, monkeypatch):
+    fake = _Urlopen([_ERROR_BODY, _OK_BODY])
+    monkeypatch.setattr(llm_module, "urlopen", fake)
+    assert LLM("openrouter/x", fallback="openrouter/y").generate("q") == "fallback answer"
+    assert fake.models == ["x", "y"]  # the processed request is not sent again
+
+  def test_missing_content_raises_with_the_finish_reason(self, monkeypatch):
+    """Regression (review R13): a bare assert, skipped under python -O."""
+    from merceka_core.errors import LLMResponseError
+
+    monkeypatch.setattr(llm_module, "urlopen", _Urlopen([_NO_CONTENT_BODY]))
+    with pytest.raises(LLMResponseError, match="finish_reason='length'"):
+      LLM("openrouter/x").generate("q", max_tokens=400)
+
+  def test_missing_content_falls_back(self, monkeypatch):
+    monkeypatch.setattr(llm_module, "urlopen", _Urlopen([_NO_CONTENT_BODY, _OK_BODY]))
+    assert LLM("openrouter/x", fallback="openrouter/y").generate("q") == "fallback answer"
+
+  def test_async_error_body_falls_back(self, monkeypatch):
+    bodies = [_ERROR_BODY, _OK_BODY]
+
+    class FakeResponse:
+      def __init__(self, body):
+        self._body = body
+
+      def raise_for_status(self):
+        return None
+
+      def json(self):
+        return self._body
+
+    class FakeAsyncClient:
+      def __init__(self, *_args, **_kwargs):
+        pass
+
+      async def __aenter__(self):
+        return self
+
+      async def __aexit__(self, *exc):
+        return False
+
+      async def post(self, *_args, **_kwargs):
+        return FakeResponse(bodies.pop(0))
+
+    monkeypatch.setattr(llm_module.httpx, "AsyncClient", FakeAsyncClient)
+    llm = LLM("openrouter/x", fallback="openrouter/y")
+    assert asyncio.run(llm.agenerate("q")) == "fallback answer"
+
+  def test_tool_loop_error_body_raises_a_typed_error(self, monkeypatch):
+    from merceka_core.errors import LLMResponseError
+
+    monkeypatch.setattr(llm_module, "urlopen", _Urlopen([_ERROR_BODY]))
+    with pytest.raises(LLMResponseError):
+      LLM("openrouter/x", tools=[lookup]).generate("q")
+
+  def test_ollama_missing_content_raises_a_typed_error(self, monkeypatch):
+    from merceka_core.errors import LLMResponseError
+
+    monkeypatch.setattr(
+      llm_module, "ollama_chat",
+      lambda **_kwargs: SimpleNamespace(message=SimpleNamespace(content=None)))
+    with pytest.raises(LLMResponseError, match="no content"):
+      LLM("gemma4:26b").generate("q")
+
+  def test_error_body_is_still_metered(self, monkeypatch):
+    """Recorded before parsing: whether OpenRouter billed it is unknown offline."""
+    from merceka_core import costs
+
+    monkeypatch.setattr(llm_module, "urlopen", _Urlopen([_NO_CONTENT_BODY]))
+    with pytest.raises(Exception):
+      LLM("openrouter/x").generate("q")
+    rows = costs.ledger_path().read_text().splitlines()
+    assert len(rows) == 1 and '"usd": 0.01' in rows[0]
