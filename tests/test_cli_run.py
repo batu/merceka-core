@@ -103,3 +103,11 @@ def test_env_and_cwd_reach_the_child(tmp_path):
 
   assert result.stdout.split() == [str(workdir.resolve()), "seen"]
 
+
+def test_provider_cli_names_resolve_to_the_suite_tripwire():
+  """conftest puts fake provider CLIs first on PATH; a test that reaches one fails."""
+  import shutil
+
+  for name in ("claude", "codex", "pi", "grok", "gemini"):
+    found = shutil.which(name)
+    assert found is not None and "cli-tripwire" in found, f"{name} -> {found}"
