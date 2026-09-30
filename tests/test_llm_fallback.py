@@ -379,3 +379,41 @@ class TestProviderResponseErrors:
       LLM("openrouter/x").generate("q")
     rows = costs.ledger_path().read_text().splitlines()
     assert len(rows) == 1 and '"usd": 0.01' in rows[0]
+
+
+class TestAsyncFallbackConstruction:
+  """Building a local fallback runs _verify, a blocking Ollama HTTP call (and a
+  model pull when missing). Regression (review R11): it ran on the event loop."""
+
+  @pytest.fixture
+  def verify_threads(self, monkeypatch):
+    import threading
+
+    seen = {}
+    monkeypatch.setattr(
+      LLM, "_verify", lambda self: seen.setdefault(self.model_name, threading.get_ident()))
+    return seen
+
+  @pytest.mark.asyncio
+  async def test_cascade_builds_the_fallback_off_the_event_loop(
+    self, monkeypatch, verify_threads, ollama_calls,
+  ):
+    import threading
+
+    async def failing(self, *_args, **_kwargs):
+      raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(LLM, "_acloud_call", failing)
+    llm = LLM("openrouter/x", fallback="gemma4:26b")
+    assert await llm.agenerate("q") == "local answer"
+    assert verify_threads["gemma4:26b"] != threading.get_ident()
+
+  @pytest.mark.asyncio
+  async def test_tools_fallback_is_built_off_the_event_loop(
+    self, verify_threads, ollama_calls,
+  ):
+    import threading
+
+    llm = LLM("claude/sonnet", tools=[lookup], fallback="gemma4:26b")
+    assert await llm.agenerate("q") == "local answer"
+    assert verify_threads["gemma4:26b"] != threading.get_ident()

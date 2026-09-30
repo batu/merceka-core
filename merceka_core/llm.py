@@ -950,10 +950,14 @@ class LLM:
 
   async def agenerate(self, message: str, **kwargs) -> str | OutputSchema:
     """Async one-shot generation. Does not maintain conversation history."""
+    import asyncio
+
     try:
       return await self._agenerate_primary(message, **kwargs)
     except _FALLBACK_ERRORS as e:
-      target = self._cascade_target(kwargs)
+      # Building a local fallback runs _verify (a blocking Ollama request, or
+      # a model pull), so it happens in a worker thread, not on the event loop.
+      target = await asyncio.to_thread(self._cascade_target, kwargs)
       if target is None:
         raise
       _logger.warning(
@@ -969,7 +973,7 @@ class LLM:
     messages = [create_message(self.system_prompt, "system"), create_message(message, "user")]
     backend = self._select_backend()
     if backend == _BACKEND_TOOLS_FALLBACK:
-      fb, fb_kwargs = self._tools_fallback_call(kwargs)
+      fb, fb_kwargs = await asyncio.to_thread(self._tools_fallback_call, kwargs)
       return await fb._agenerate_primary(message, **fb_kwargs)
     if backend == _BACKEND_CLAUDE:
       return await asyncio.to_thread(self._claude_call, message, **kwargs)
