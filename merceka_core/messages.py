@@ -11,7 +11,8 @@ import inspect
 import mimetypes
 import re as _re
 from pathlib import Path
-from typing import Callable, Literal, Optional, get_type_hints
+from types import UnionType
+from typing import Callable, Literal, Optional, Union, get_args, get_origin, get_type_hints
 
 from pydantic import BaseModel
 
@@ -110,7 +111,12 @@ def create_ollama_vision_message(
 
 
 def _python_type_to_json(hint) -> str:
-  """Map a Python type annotation to a JSON Schema type string."""
+  """Map a Python type annotation to a JSON Schema type string.
+
+  ``X | None`` / ``Optional[X]`` map to ``X``'s type: the parameter's schema
+  type describes the value a model should send. Other unions fall back to
+  ``"string"``.
+  """
   _TYPE_MAP = {
     str: "string",
     int: "integer",
@@ -118,6 +124,11 @@ def _python_type_to_json(hint) -> str:
     bool: "boolean",
     list: "array",
   }
+  args = get_args(hint)
+  if get_origin(hint) in (Union, UnionType) and type(None) in args:
+    non_none = [arg for arg in args if arg is not type(None)]
+    if len(non_none) == 1:
+      hint = non_none[0]
   origin = getattr(hint, "__origin__", None)
   if origin is list:
     return "array"
