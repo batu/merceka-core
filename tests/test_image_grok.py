@@ -166,3 +166,21 @@ def test_failed_run_is_recorded(grok):
 
   [row] = _ledger_rows()
   assert row["meta"] == {"status": "error"}
+
+
+@pytest.mark.usefixtures("grok")
+def test_unsupported_options_are_warned_not_silently_dropped(caplog):
+  """Regression (review 9): grok ignored transparent and image_size silently."""
+  with caplog.at_level("WARNING", logger="merceka_core.image"):
+    img = generate_image("a cat", model="grok/imagine", transparent=True, image_size="4K")
+  assert img.mode == "RGB"  # the documented signal for callers' matting fallback
+  messages = " ".join(r.getMessage() for r in caplog.records)
+  assert "cannot produce transparency" in messages
+  assert "ignores image_size='4K'" in messages
+
+
+@pytest.mark.usefixtures("grok")
+def test_default_options_log_no_warning(caplog):
+  with caplog.at_level("WARNING", logger="merceka_core.image"):
+    generate_image("a cat", model="grok/imagine")
+  assert not [r for r in caplog.records if r.levelname == "WARNING"]

@@ -750,7 +750,11 @@ def generate_image(
   """Generate an image from a text prompt.
 
   Dispatches by model prefix:
-  - `openai/...` → OpenAI's direct image API (gpt-image-2, etc).
+  - `grok/...` → the grok CLI (prompt and aspect ratio only; see below).
+  - `openai/...` → OpenAI's direct image API (gpt-image-2, etc) when
+    OPENAI_API_KEY is set, else OpenRouter.
+  - `google/...` → Google's direct API when GEMINI_API_KEY/GOOGLE_API_KEY is
+    set, else OpenRouter.
   - Anything else → OpenRouter chat-completions with image modality.
 
   Args:
@@ -758,6 +762,7 @@ def generate_image(
     model: OpenRouter model id OR `openai/<openai-model>`.
     aspect_ratio: Aspect ratio string (e.g., "1:1", "9:16", "16:9").
     image_size: Resolution tier ("1K", "2K", "4K") — OpenAI maps to WxH.
+      Ignored by grok/ models (a warning is logged).
     transparent: Request a transparent background. OpenAI: native alpha via
       `background: "transparent"` (RGBA result; a warning is logged when the
       model nonetheless returns every pixel opaque). OpenRouter: prompt-requested;
@@ -769,6 +774,13 @@ def generate_image(
     PIL Image — RGBA when `transparent` produced real alpha, RGB otherwise.
   """
   if model.startswith("grok/"):
+    # The grok CLI takes only a prompt: no size tier and no alpha channel. Say so
+    # instead of silently returning a different image; the RGB result tells
+    # transparent callers to fall back to matting, as documented above.
+    if transparent:
+      _logger.warning("%s cannot produce transparency; returning an opaque RGB image", model)
+    if image_size != "1K":
+      _logger.warning("%s ignores image_size=%r; the CLI picks the resolution", model, image_size)
     return _generate_grok(prompt, model, aspect_ratio)
   if model.startswith("openai/") and os.environ.get("OPENAI_API_KEY"):
     return _generate_openai(
