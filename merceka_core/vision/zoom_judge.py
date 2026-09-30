@@ -171,7 +171,8 @@ def _tool_result(
     result["is_error"] = True
     return result
   try:
-    box = tuple(int(tool_input[key]) for key in ("x1", "y1", "x2", "y2"))
+    x1, y1, x2, y2 = (int(tool_input[key]) for key in ("x1", "y1", "x2", "y2"))
+    box = (x1, y1, x2, y2)
     crop = zoom_crop(
       originals[index],
       (views[index].width, views[index].height),
