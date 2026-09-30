@@ -850,6 +850,11 @@ def edit_image(
   w, h = image.size
   ar = _nearest_aspect_ratio(w, h)
   img_size = "1K" if max(w, h) <= 1024 else "2K"
+  image_config = {"aspect_ratio": ar, "image_size": img_size}
+  if quality:
+    # OpenRouter passes image_config through to the provider; providers
+    # without a quality knob ignore it.
+    image_config["quality"] = quality
 
   payload = {
     "model": model,
@@ -863,10 +868,7 @@ def edit_image(
       }
     ],
     "modalities": ["image", "text"],
-    "image_config": {
-      "aspect_ratio": ar,
-      "image_size": img_size,
-    },
+    "image_config": image_config,
     # Ask the biller to state the exact cost of this call in the response.
     "usage": {"include": True},
   }

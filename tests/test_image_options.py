@@ -10,7 +10,7 @@ import pytest
 from PIL import Image
 
 from merceka_core import image as image_module
-from merceka_core.image import generate_image
+from merceka_core.image import edit_image, generate_image
 
 
 def _png_b64(size=(8, 8)) -> str:
@@ -100,3 +100,30 @@ def test_google_direct_omits_tiers_flash_lite_cannot_serve(google_direct):
   generate_image("p", model="google/gemini-3.1-flash-lite-image-preview", image_size="4K")
 
   assert "imageSize" not in _image_config(google_direct)
+
+
+def _openrouter_body(size=(8, 8)) -> dict:
+  uri = f"data:image/png;base64,{_png_b64(size)}"
+  return {"choices": [{"message": {"images": [{"image_url": {"url": uri}}]}}]}
+
+
+@pytest.fixture
+def openrouter_only(monkeypatch, fake_client):
+  # No OpenAI key: openai/ ids fall through to OpenRouter.
+  monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+  monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+  monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+  return fake_client(_openrouter_body())
+
+
+def test_openai_fallback_to_openrouter_keeps_quality(openrouter_only):
+  # fabrikav2's sticker lane asks sunburst for quality="low".
+  edit_image(Image.new("RGB", (8, 8)), "p", model="openai/gpt-image-2.5-sunburst", quality="low")
+
+  assert openrouter_only.posts[0][1]["json"]["image_config"]["quality"] == "low"
+
+
+def test_openrouter_edit_without_quality_sends_none(openrouter_only):
+  edit_image(Image.new("RGB", (8, 8)), "p", model="openai/gpt-image-2.5-sunburst")
+
+  assert "quality" not in openrouter_only.posts[0][1]["json"]["image_config"]
