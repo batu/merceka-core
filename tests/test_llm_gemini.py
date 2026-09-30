@@ -212,6 +212,26 @@ class TestGeminiVideoCall:
     assert config.max_output_tokens == 256
     assert config.system_instruction == "answer tersely"
 
+  def test_output_schema_is_enforced_at_the_api_level(self, clock, monkeypatch, video):
+    """Regression (review R18): the image path sent a response schema, the
+    video path did not, so the model could answer in free text or a code fence."""
+    from merceka_core.llm import LLM, OutputSchema
+
+    class Verdict(OutputSchema):
+      approved: bool = False
+
+    models = FakeModels([SimpleNamespace(text='{"approved": true}')])
+    monkeypatch.setattr(llm_gemini, "_gemini_client", lambda: FakeClient(models=models))
+    monkeypatch.setattr(LLM, "_verify", lambda self: None)
+
+    out = LLM("gemini/gemini-flash-latest", output_schema=Verdict).generate_with_video(
+      "judge", video, poll_interval_s=1)
+
+    assert isinstance(out, Verdict) and out.approved is True
+    config = models.calls[0]["config"]
+    assert config.response_mime_type == "application/json"
+    assert config.response_schema is Verdict
+
   def test_multiple_videos_all_uploaded_and_deleted(self, clock, monkeypatch, tmp_path):
     first = tmp_path / "a.mp4"
     second = tmp_path / "b.mp4"

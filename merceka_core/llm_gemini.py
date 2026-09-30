@@ -194,6 +194,11 @@ def _gemini_video_call(
   client = _gemini_client()
   model_alias = llm.model_name.removeprefix("gemini/")
 
+  # Enforce structured output at the API level, as the image path does.
+  output_schema = getattr(llm, "output_schema", None)
+  if output_schema is not None:
+    kwargs.setdefault("response_mime_type", "application/json")
+    kwargs.setdefault("response_schema", output_schema)
   # Extract caller kwargs that google-genai doesn't accept as top-level.
   config, remaining_kwargs = _build_video_config(
     max_tokens=kwargs.pop("max_tokens", None),
