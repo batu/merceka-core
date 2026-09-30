@@ -87,6 +87,30 @@ def test_scrubbed_env_keep_and_overrides(monkeypatch):
   assert env["ANTHROPIC_API_KEY"] == ""
 
 
+@pytest.mark.usefixtures("fake_dotenv")
+def test_provider_key_reads_without_exporting(monkeypatch):
+  assert _env.provider_key("OPENROUTER_API_KEY") == "sk-or-from-file"
+  assert "OPENROUTER_API_KEY" not in os.environ
+  monkeypatch.setenv("OPENROUTER_API_KEY", "")
+  assert _env.provider_key("OPENROUTER_API_KEY") is None
+  monkeypatch.delenv("OPENROUTER_API_KEY")
+  monkeypatch.setenv("PYTHON_DOTENV_DISABLED", "true")
+  assert _env.provider_key("OPENROUTER_API_KEY") is None
+
+
+def test_scrubbed_env_never_drops_essentials(tmp_path, monkeypatch):
+  path = tmp_path / ".env"
+  path.write_text("PATH=/tmp/evil\nHOME=/tmp/evil\n")
+  monkeypatch.setattr(_env, "_find_dotenv", lambda start: path)
+  _env._dotenv_values.cache_clear()
+  try:
+    env = _env.scrubbed_env()
+  finally:
+    _env._dotenv_values.cache_clear()
+  assert env["PATH"] == os.environ["PATH"]
+  assert env["HOME"] == os.environ["HOME"]
+
+
 def test_import_does_not_reinject_blanked_keys(tmp_path):
   """Regression for the 2026-09-30 review: a blanked key must survive import."""
   script = tmp_path / "probe.py"

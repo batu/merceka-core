@@ -11,6 +11,8 @@ Now:
   ``PROVIDER_KEYS``), and only when they are absent from the environment. Consumers
   still see these keys in ``os.environ`` after importing the LLM modules; slab,
   videototext and the fabrika level editor check them there.
+- :func:`provider_key` reads one credential without touching ``os.environ``. It is
+  for keys that must not be exported to the process, such as ``ANTHROPIC_API_KEY``.
 - To turn a provider off, set its variable to an empty string, or set
   ``PYTHON_DOTENV_DISABLED=1`` to skip ``.env`` loading entirely. Unsetting a
   variable (``env -u``) does not work: an absent key is filled from ``.env``.
@@ -26,11 +28,11 @@ import re
 from collections.abc import Iterable
 from pathlib import Path
 
-__all__ = ["PROVIDER_KEYS", "load_provider_keys", "scrubbed_env"]
+__all__ = ["PROVIDER_KEYS", "load_provider_keys", "provider_key", "scrubbed_env"]
 
 # Credentials and settings the library itself reads from the environment.
 # ANTHROPIC_API_KEY is deliberately absent: exporting it would switch Claude CLI
-# children from subscription auth to API billing.
+# children from subscription auth to API billing. Use provider_key() for it.
 PROVIDER_KEYS = (
   "OPENROUTER_API_KEY",
   "OPENROUTER_HTTP_REFERER",
@@ -48,17 +50,33 @@ _TRUTHY = {"1", "true", "t", "yes", "y"}
 _SECRET_SEGMENT = re.compile(
   r"(?:^|_)(?:KEY|KEYS|TOKEN|TOKENS|SECRET|SECRETS|PASSWORD|PASSWD|PASS|CREDENTIAL|CREDENTIALS)(?:_|$)"
 )
+# Never withheld, even if a .env happens to define them: CLIs cannot start without them.
+_ESSENTIAL = frozenset({"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "TERM"})
 
 
 def load_provider_keys() -> None:
   """Copy ``PROVIDER_KEYS`` from the package ``.env`` into ``os.environ`` when absent."""
-  if os.environ.get("PYTHON_DOTENV_DISABLED", "").casefold() in _TRUTHY:
+  if _dotenv_disabled():
     return
   values = _dotenv_values()
   for name in PROVIDER_KEYS:
     value = values.get(name)
     if name not in os.environ and value is not None:
       os.environ[name] = value
+
+
+def provider_key(name: str) -> str | None:
+  """Return credential ``name`` without exporting it.
+
+  The environment wins whenever the variable is set; an empty value means the
+  provider is disabled. Otherwise the package ``.env`` is consulted, unless
+  ``PYTHON_DOTENV_DISABLED`` is truthy.
+  """
+  if name in os.environ:
+    return os.environ[name] or None
+  if _dotenv_disabled():
+    return None
+  return _dotenv_values().get(name) or None
 
 
 def scrubbed_env(keep: Iterable[str] = (), **overrides: str) -> dict[str, str]:
@@ -68,7 +86,7 @@ def scrubbed_env(keep: Iterable[str] = (), **overrides: str) -> dict[str, str]:
   ``*_TOKEN``, ``*_PASSWORD``, ...) and every name defined in the package ``.env``,
   unless the name is listed in ``keep``. ``overrides`` are applied last.
   """
-  kept = set(keep)
+  kept = set(keep) | _ESSENTIAL
   withheld = set(_dotenv_values())
   env = {
     name: value
@@ -77,6 +95,10 @@ def scrubbed_env(keep: Iterable[str] = (), **overrides: str) -> dict[str, str]:
   }
   env.update(overrides)
   return env
+
+
+def _dotenv_disabled() -> bool:
+  return os.environ.get("PYTHON_DOTENV_DISABLED", "").casefold() in _TRUTHY
 
 
 @functools.cache

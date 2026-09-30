@@ -12,7 +12,6 @@ import inspect
 import json
 import math
 import mimetypes
-import os
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -22,14 +21,13 @@ from typing import Any, Callable
 import httpx
 import shutil
 
-from merceka_core import _cli
+from merceka_core import _cli, _env
 from merceka_core.vision import zoom_judge as _zoom_judge
 import subprocess
 import tempfile as _tempfile
 
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits"
-_ENV_FALLBACK_PATH = Path("/Users/base/dev/appletolye/.env")
 
 JUDGE_REGISTRY: list[dict[str, Any]] = [
   {
@@ -270,7 +268,7 @@ def critique(
   api_key = _openrouter_api_key()
   if not api_key:
     raise RuntimeError(
-      f"OPENROUTER_API_KEY is not configured in the environment or {_ENV_FALLBACK_PATH}"
+      "OPENROUTER_API_KEY is not configured in the environment or the package .env"
     )
 
   roster = _normalize_judges(judges)
@@ -1127,23 +1125,6 @@ def _anthropic_api_key() -> str | None:
 
 
 def _api_key(name: str) -> str | None:
-  key = os.getenv(name)
-  if key:
-    return key
-  return _env_file_key(_ENV_FALLBACK_PATH, name)
-
-
-def _env_file_key(path: Path, target_name: str = "OPENROUTER_API_KEY") -> str | None:
-  try:
-    lines = path.read_text().splitlines()
-  except OSError:
-    return None
-  for line in lines:
-    stripped = line.strip()
-    if not stripped or stripped.startswith("#") or "=" not in stripped:
-      continue
-    name, value = stripped.split("=", 1)
-    name = name.removeprefix("export ").strip()
-    if name == target_name:
-      return value.strip().strip("\"'") or None
-  return None
+  # The package .env is the same file llm.py loads; a hardcoded Mac path broke
+  # on Ubuntu, and an explicitly blank variable now disables the judge.
+  return _env.provider_key(name)
