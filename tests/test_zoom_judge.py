@@ -220,6 +220,22 @@ def test_opaque_zoom_crop_has_no_checkerboard_note():
   assert red > 240 and green < 20 and blue < 20
 
 
+def test_zoom_tool_coordinates_always_refer_to_the_full_view():
+  # Review repro r6 A: the tool said "zoom again on the result", but every box maps
+  # onto the full view, so a second zoom in crop pixels showed an unrelated region.
+  description = zoom_judge._ZOOM_TOOL["description"]
+  assert "on the result" not in description
+  assert "full view" in description
+  client = _FakeClient([_tool_use_response((0, 0, 32, 32)), _final_response()])
+
+  zoom_judge.call_zoom_judge(
+    ZOOM_JUDGE, [_png_bytes()], None, "judge this", api_key="sk-ant-test", client=client
+  )
+
+  label, _crop = _returned_crop(client)
+  assert "full-view coordinates" in label
+
+
 @pytest.mark.parametrize(
   ("stop_reason", "reason"), [("max_tokens", "max-tokens"), ("refusal", "refusal")]
 )

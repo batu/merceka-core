@@ -53,8 +53,10 @@ _ZOOM_TOOL = {
     "whenever text, edges, glyphs, or details are too small to judge "
     "confidently in the full view. The region is cropped from the image's "
     "full-resolution original and scaled up to fill the image budget. "
-    "Coordinates are absolute pixels in the image as you see it, origin at "
-    "the top-left corner. Zoom again on the result for even finer detail."
+    "Coordinates are always absolute pixels in the numbered image's full view, "
+    "at the dimensions stated next to it, origin at the top-left corner; they "
+    "never refer to a magnified result. For finer detail, zoom again with a "
+    "smaller box in those full-view coordinates."
   ),
   "input_schema": {
     "type": "object",
@@ -247,7 +249,7 @@ def _tool_result(
     result["is_error"] = True
     return result
   flat, transparent = _flatten_transparency(crop)
-  label = f"Magnified view of image {index}, region {list(box)}:"
+  label = f"Magnified view of image {index}, region {list(box)} in full-view coordinates:"
   if transparent:
     label += " transparent pixels are drawn over a grey checkerboard."
   # JPEG keeps accumulated tool results well under the API request size limit.
