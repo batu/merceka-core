@@ -194,3 +194,100 @@ class TestLLMGenerateWithResource:
     assert llm.use_openrouter is True
     # The actual call would need an API key and would hit the network
 
+
+
+class TestResourceFallback:
+  """generate_with_resource/agenerate_with_resource honour fallback= (review item 8)."""
+
+  @pytest.fixture
+  def png(self, tmp_path: Path) -> Path:
+    path = tmp_path / "shot.png"
+    path.write_bytes(b"\x89PNG fake")
+    return path
+
+  @pytest.fixture
+  def cloud(self, monkeypatch):
+    """_cloud_call fake: the primary (openrouter/primary) fails, others answer."""
+    calls = []
+
+    def fake(self, messages, **kwargs):
+      calls.append((self.model_name, messages, kwargs))
+      if self.model_name == "openrouter/primary":
+        raise ConnectionError("down")
+      return f"from {self.model_name}"
+
+    monkeypatch.setattr(LLM, "_cloud_call", fake)
+    return calls
+
+  def test_primary_failure_falls_back_with_the_same_resource(self, png, cloud):
+    llm = LLM("openrouter/primary", fallback="openrouter/fb")
+    assert llm.generate_with_resource("what?", png, temperature=0.0) == "from openrouter/fb"
+    model, messages, kwargs = cloud[1]
+    assert model == "openrouter/fb"
+    assert messages[-1]["content"][1]["type"] == "image_url"  # the image went too
+    assert kwargs == {"temperature": 0.0}
+
+  def test_async_primary_failure_falls_back(self, png, monkeypatch):
+    import asyncio
+
+    async def fake(self, messages, **kwargs):
+      if self.model_name == "openrouter/primary":
+        raise ConnectionError("down")
+      return f"from {self.model_name}"
+
+    monkeypatch.setattr(LLM, "_acloud_call", fake)
+    llm = LLM("openrouter/primary", fallback="openrouter/fb")
+    assert asyncio.run(llm.agenerate_with_resource("what?", png)) == "from openrouter/fb"
+
+  def test_transient_gemini_failure_falls_back(self, png, monkeypatch, cloud):
+    from merceka_core import llm_gemini
+    from merceka_core.errors import VideoBackendError
+
+    def gemini_down(*_args, **_kwargs):
+      raise VideoBackendError("503")
+
+    monkeypatch.setattr(llm_gemini, "_gemini_image_call", gemini_down)
+    monkeypatch.setattr("merceka_core.llm._gemini_image_call", gemini_down)
+    llm = LLM("gemini/gemini-flash-latest", fallback="openrouter/fb")
+    assert llm.generate_with_resource("what?", png) == "from openrouter/fb"
+
+  def test_terminal_gemini_failure_does_not_fall_back(self, png, monkeypatch, cloud):
+    from merceka_core.errors import VideoUploadError
+
+    def bad_key(*_args, **_kwargs):
+      raise VideoUploadError("401")
+
+    monkeypatch.setattr("merceka_core.llm._gemini_image_call", bad_key)
+    llm = LLM("gemini/gemini-flash-latest", fallback="openrouter/fb")
+    with pytest.raises(VideoUploadError):
+      llm.generate_with_resource("what?", png)
+    assert cloud == []
+
+  def test_no_fallback_raises(self, png, cloud):
+    with pytest.raises(ConnectionError):
+      LLM("openrouter/primary").generate_with_resource("what?", png)
+
+  def test_missing_resource_raises_without_trying_the_fallback(self, tmp_path, cloud):
+    llm = LLM("openrouter/primary", fallback="openrouter/fb")
+    with pytest.raises(FileNotFoundError):
+      llm.generate_with_resource("what?", tmp_path / "missing.png")
+    assert cloud == []
+
+  def test_gemini_fallback_gets_only_gemini_config_kwargs(self, png, monkeypatch, cloud):
+    seen = {}
+
+    def gemini(llm, message, resource_path, **kwargs):
+      seen["kwargs"] = kwargs
+      return "from gemini"
+
+    monkeypatch.setattr("merceka_core.llm._gemini_image_call", gemini)
+    llm = LLM("openrouter/primary", fallback="gemini/gemini-flash-latest")
+    out = llm.generate_with_resource(
+      "what?", png, temperature=0.0, max_tokens=400, provider={"order": ["a"]}, timeout=30)
+    assert out == "from gemini"
+    assert seen["kwargs"] == {"temperature": 0.0, "max_tokens": 400}
+
+  def test_claude_fallback_is_not_used_for_a_resource(self, png, cloud):
+    llm = LLM("openrouter/primary", fallback="claude/sonnet")
+    with pytest.raises(ConnectionError):
+      llm.generate_with_resource("what?", png)

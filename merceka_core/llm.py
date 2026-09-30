@@ -153,6 +153,15 @@ _CLI_KWARGS = frozenset({"timeout", "images"})
 _OLLAMA_KWARGS = frozenset({"options", "keep_alive", "stream", "logprobs", "top_logprobs"})
 # The Ollama kwargs OpenRouter has no counterpart for.
 _OLLAMA_ONLY_KWARGS = frozenset({"options", "keep_alive"})
+# What a Gemini fallback accepts (llm_gemini._build_video_config), and the part of
+# it OpenRouter and Ollama have no counterpart for.
+_GEMINI_KWARGS = frozenset({
+  "max_tokens", "temperature", "top_p", "top_k",
+  "stop_sequences", "response_mime_type", "response_schema", "safety_settings",
+})
+_GEMINI_ONLY_KWARGS = frozenset({
+  "stop_sequences", "response_mime_type", "response_schema", "safety_settings",
+})
 # OpenRouter sampling kwargs and their names in Ollama's ``options``.
 _OLLAMA_OPTIONS = {
   "temperature": "temperature",
@@ -405,8 +414,11 @@ class LLM:
       return None
     if fb.use_claude or fb.use_codex:
       return fb, dict(kwargs)
+    if fb.use_gemini:
+      return fb, {k: v for k, v in kwargs.items() if k in _GEMINI_KWARGS}
     if fb.use_openrouter:
-      return fb, {k: v for k, v in kwargs.items() if k not in _CLI_KWARGS | _OLLAMA_ONLY_KWARGS}
+      dropped = _CLI_KWARGS | _OLLAMA_ONLY_KWARGS | _GEMINI_ONLY_KWARGS
+      return fb, {k: v for k, v in kwargs.items() if k not in dropped}
     fb_kwargs = {k: v for k, v in kwargs.items() if k in _OLLAMA_KWARGS}
     options = {_OLLAMA_OPTIONS[k]: v for k, v in kwargs.items() if k in _OLLAMA_OPTIONS}
     if options:
@@ -512,6 +524,38 @@ class LLM:
     Returns:
       Model response as string or OutputSchema.
     """
+    try:
+      return self._resource_primary(message, resource_path, **kwargs)
+    except _FALLBACK_ERRORS as e:
+      target = self._resource_fallback(resource_path, kwargs)
+      if target is None:
+        raise
+      _logger.warning(
+        "Primary LLM failed (%s), falling back to %s", type(e).__name__, self.fallback
+      )
+      fb, fb_kwargs = target
+      return fb.generate_with_resource(message, resource_path, **fb_kwargs)
+
+  def _resource_fallback(
+    self, resource_path: Path | str, kwargs: dict,
+  ) -> tuple["LLM", dict] | None:
+    """The fallback for a failed resource call, or None to re-raise.
+
+    None without a fallback, when the resource itself is missing (the fallback
+    would fail the same way), when the fallback is a Claude CLI model (it takes
+    no attachments), or when it cannot honour the call's kwargs.
+    """
+    if not self.fallback or not Path(resource_path).exists():
+      return None
+    target = self._fallback_call(kwargs)
+    if target is None or target[0].use_claude:
+      return None
+    return target
+
+  def _resource_primary(
+    self, message: str, resource_path: Path | str, **kwargs,
+  ) -> str | OutputSchema:
+    """generate_with_resource on this model, without the fallback."""
     if self.use_claude:
       raise ValueError(
         "generate_with_resource is not supported for Claude CLI models — "
@@ -550,6 +594,25 @@ class LLM:
     Gemini, Codex CLI) in a worker thread so they don't block the event loop.
     Claude CLI is not supported.
     """
+    import asyncio
+
+    try:
+      return await self._aresource_primary(message, resource_path, **kwargs)
+    except _FALLBACK_ERRORS as e:
+      # A local fallback's constructor blocks (Ollama _verify): worker thread.
+      target = await asyncio.to_thread(self._resource_fallback, resource_path, kwargs)
+      if target is None:
+        raise
+      _logger.warning(
+        "Primary LLM failed (%s), falling back to %s", type(e).__name__, self.fallback
+      )
+      fb, fb_kwargs = target
+      return await fb.agenerate_with_resource(message, resource_path, **fb_kwargs)
+
+  async def _aresource_primary(
+    self, message: str, resource_path: Path | str, **kwargs,
+  ) -> str | OutputSchema:
+    """agenerate_with_resource on this model, without the fallback."""
     import asyncio
 
     if self.use_claude:
