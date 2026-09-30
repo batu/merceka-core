@@ -70,6 +70,7 @@ class CodexAgentProvider:
       self._command(request, json_output=True),
       cwd=str(request.roots[0]),
       env=_cli.codex_env(),
+      timeout=self.timeout_seconds,
       label="Codex stream",
     )
     raw_events: list[RawProviderEvent] = []

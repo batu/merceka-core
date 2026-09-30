@@ -61,6 +61,7 @@ class ClaudeCodeAgentProvider:
       self._command(request, stream=True),
       cwd=str(request.roots[0]),
       env=self._env(),
+      timeout=self.timeout_seconds,
       label="Claude Code stream",
     )
     raw_events: list[RawProviderEvent] = []

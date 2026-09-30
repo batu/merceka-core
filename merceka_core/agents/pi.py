@@ -63,6 +63,7 @@ class PiAgentProvider:
       self._command(request),
       cwd=str(request.roots[0]),
       env=scrubbed_env(),
+      timeout=self.timeout_seconds,
       label="Pi stream",
     )
     raw_events: list[RawProviderEvent] = []

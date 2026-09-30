@@ -16,12 +16,20 @@ import json
 import os
 import signal
 import subprocess
-from typing import Any
+import threading
+import time
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 from merceka_core.agent import ProviderFailure, RawProviderEvent
 
 # How long a CLI gets to exit after SIGTERM before its process group is killed.
 TERMINATE_GRACE_SECONDS = 5.0
+# How long to wait for stderr to reach EOF once the CLI has exited. A descendant
+# can keep the pipe open; the error text is diagnostic, so it is not worth a hang.
+STDERR_GRACE_SECONDS = 1.0
+
+_T = TypeVar("_T")
 
 
 def raw_event_from_line(line: str, provider: str) -> RawProviderEvent:
@@ -88,13 +96,20 @@ async def run(
 class Stream:
   """A CLI whose stdout is read line by line while it runs.
 
-  Blocking calls run in threads, off the event loop. The prompt is written
-  inside the caller's cleanup scope, so a CLI that dies at once is still torn
-  down. Always ``await close()`` when done.
+  stderr is drained on a thread from the start, so a chatty CLI never blocks on
+  a full pipe. Every wait (sending the prompt, each line, the exit) counts
+  against one deadline of ``timeout`` seconds; running past it raises
+  ProviderFailure. Blocking calls run in threads, off the event loop. The
+  prompt is written inside the caller's cleanup scope, so a CLI that dies at
+  once is still torn down. Always ``await close()`` when done.
   """
 
-  def __init__(self, cmd: list[str], *, cwd: str, env: dict[str, str], label: str) -> None:
+  def __init__(
+    self, cmd: list[str], *, cwd: str, env: dict[str, str], timeout: float, label: str
+  ) -> None:
     self.label = label
+    self.timeout = timeout
+    self._deadline = time.monotonic() + timeout
     self._prompt_delivered = False
     self.process = start(cmd, cwd=cwd, env=env)
     if self.process.stdin is None or self.process.stdout is None or self.process.stderr is None:
@@ -102,7 +117,7 @@ class Stream:
       raise ProviderFailure(f"{label} did not expose stdio pipes")
     self._stdin = self.process.stdin
     self._stdout = self.process.stdout
-    self._stderr = self.process.stderr
+    self._stderr = _Drain(self.process.stderr)
 
   async def send(self, text: str) -> None:
     """Write the prompt and close stdin.
@@ -110,16 +125,16 @@ class Stream:
     A CLI that exits before reading it is not reported here: its exit status
     and stderr, read by ``finish()``, say why.
     """
-    self._prompt_delivered = await asyncio.to_thread(_write_and_close, self._stdin, text)
+    self._prompt_delivered = await self._bounded(_write_and_close, self._stdin, text)
 
   async def readline(self) -> str:
     """The next line of stdout, or "" at EOF."""
-    return await asyncio.to_thread(self._stdout.readline)
+    return await self._bounded(self._stdout.readline)
 
   async def finish(self) -> tuple[int, str]:
     """Wait for the CLI to exit; return its exit status and stderr."""
-    returncode = await asyncio.to_thread(self.process.wait)
-    stderr = await asyncio.to_thread(self._stderr.read)
+    returncode = await self._bounded(self.process.wait)
+    stderr = await asyncio.to_thread(self._stderr.text, STDERR_GRACE_SECONDS)
     if returncode == 0 and not self._prompt_delivered:
       detail = stderr.strip() or "no error output"
       raise ProviderFailure(f"{self.label} exited before reading its prompt: {detail}")
@@ -134,7 +149,41 @@ class Stream:
       terminate_process(self.process)
     close_pipe(self._stdin)
     close_pipe(self._stdout)
-    close_pipe(self._stderr)
+    # A pipe cannot be closed while the drain thread is blocked reading it.
+    if self._stderr.finished(STDERR_GRACE_SECONDS):
+      close_pipe(self.process.stderr)
+
+  async def _bounded(self, fn: Callable[..., _T], *args: Any) -> _T:
+    remaining = self._deadline - time.monotonic()
+    if remaining <= 0:
+      raise ProviderFailure(f"{self.label} timed out after {self.timeout:g}s")
+    try:
+      return await asyncio.wait_for(asyncio.to_thread(fn, *args), remaining)
+    except TimeoutError:
+      raise ProviderFailure(f"{self.label} timed out after {self.timeout:g}s") from None
+
+
+class _Drain:
+  """Reads a pipe to EOF on a daemon thread."""
+
+  def __init__(self, pipe: Any) -> None:
+    self._text = ""
+    self._thread = threading.Thread(target=self._read, args=(pipe,), daemon=True)
+    self._thread.start()
+
+  def _read(self, pipe: Any) -> None:
+    try:
+      self._text = pipe.read()
+    except (OSError, ValueError):
+      pass
+
+  def finished(self, timeout: float) -> bool:
+    self._thread.join(timeout)
+    return not self._thread.is_alive()
+
+  def text(self, timeout: float) -> str:
+    self._thread.join(timeout)
+    return self._text
 
 
 def _write_and_close(pipe: Any, text: str) -> bool:

@@ -250,3 +250,79 @@ async def test_child_that_exits_before_reading_the_prompt_is_a_provider_failure(
   assert child.returncode == 3
   assert child.stdout is not None and child.stdout.closed
   assert child.stderr is not None and child.stderr.closed
+
+
+# --- stream deadline and stderr ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_name", sorted(PROVIDERS))
+async def test_stream_that_goes_silent_times_out(provider_name, fake_cli, spawned, tmp_path):
+  binary = fake_cli("""
+    import json, sys, time
+    sys.stdin.read()
+    print(json.dumps({"type": "started"}), flush=True)
+    time.sleep(60)
+  """)
+  provider = PROVIDERS[provider_name](binary, 1)
+  started = time.monotonic()
+
+  with pytest.raises(ProviderFailure, match="timed out after 1s"):
+    await asyncio.wait_for(_drain(provider.stream(_request(tmp_path))), 10)
+
+  assert time.monotonic() - started < 5
+  assert spawned[0].returncode is not None
+
+
+@pytest.mark.asyncio
+async def test_stream_deadline_covers_the_whole_stream_not_each_line(fake_cli, tmp_path):
+  # A line every 0.3 s never trips a per-read timeout; the overall one must fire.
+  binary = fake_cli("""
+    import json, sys, time
+    sys.stdin.read()
+    while True:
+      print(json.dumps({"type": "tick"}), flush=True)
+      time.sleep(0.3)
+  """)
+  started = time.monotonic()
+
+  with pytest.raises(ProviderFailure, match="timed out after 1s"):
+    await asyncio.wait_for(_drain(PROVIDERS["pi"](binary, 1).stream(_request(tmp_path))), 10)
+
+  assert time.monotonic() - started < 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_name", sorted(PROVIDERS))
+async def test_stream_survives_a_child_that_floods_stderr(provider_name, fake_cli, tmp_path):
+  # 300 KB of stderr before any stdout fills the pipe buffer; unless stderr is
+  # read while stdout is, the child blocks on write and the stream never ends.
+  binary = fake_cli("""
+    import json, sys
+    sys.stdin.read()
+    sys.stderr.write("x" * 300_000)
+    sys.stderr.flush()
+    print(json.dumps({"type": "result", "subtype": "success"}), flush=True)
+  """)
+  provider = PROVIDERS[provider_name](binary, 30)
+
+  events = await asyncio.wait_for(_drain(provider.stream(_request(tmp_path))), 10)
+
+  assert events[-1].type == "complete"
+
+
+@pytest.mark.asyncio
+async def test_stream_failure_reports_the_drained_stderr(fake_cli, tmp_path):
+  binary = fake_cli("""
+    import sys
+    sys.stdin.read()
+    sys.stderr.write("x" * 300_000 + "the real error")
+    sys.exit(2)
+  """)
+
+  with pytest.raises(ProviderFailure, match="the real error"):
+    await asyncio.wait_for(_drain(PROVIDERS["codex"](binary, 30).stream(_request(tmp_path))), 10)
+
+
+async def _drain(stream) -> list:
+  return [event async for event in stream]
