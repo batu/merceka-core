@@ -424,6 +424,7 @@ class LLM:
     )
     with urlopen(request, timeout=120) as response:
       body = json.load(response)
+    self._record_openrouter_usage(payload["model"], body)
     msg = body["choices"][0]["message"]
     # Normalize: ensure arguments is a dict
     if msg.get("tool_calls"):
@@ -447,6 +448,7 @@ class LLM:
       )
       response.raise_for_status()
       body = response.json()
+    self._record_openrouter_usage(payload["model"], body)
     msg = body["choices"][0]["message"]
     if msg.get("tool_calls"):
       for tc in msg["tool_calls"]:
@@ -605,6 +607,25 @@ class LLM:
   def _parse_openrouter_body(self, body: dict) -> str | OutputSchema:
     return self._parse_response(body["choices"][0]["message"]["content"])
 
+  @staticmethod
+  def _record_openrouter_usage(model: str, body: dict) -> None:
+    """Meter one OpenRouter response in the cost ledger.
+
+    Called before the body is parsed, so a charged call whose body cannot be
+    parsed is still recorded exactly once. ``usage.cost`` is OpenRouter's own
+    figure (the request sets ``usage.include``); ``id`` is the generation id.
+    """
+    from merceka_core import costs as _costs
+
+    usage = body.get("usage") or {}
+    _costs.record(
+      source="openrouter",
+      model=model,
+      usage=usage,
+      usd=usage.get("cost"),
+      request_id=body.get("id"),
+    )
+
   def _openrouter_call(self, messages: list[dict], **kwargs) -> str | OutputSchema:
     headers, payload = self._build_openrouter_request(messages, **kwargs)
     data = json.dumps(payload).encode("utf-8")
@@ -619,15 +640,7 @@ class LLM:
       try:
         with urlopen(request, timeout=120) as response:
           body = json.load(response)
-        from merceka_core import costs as _costs
-
-        usage = body.get("usage") or {}
-        _costs.record(
-          source="openrouter",
-          model=payload["model"],
-          usage=usage,
-          usd=usage.get("cost"),
-        )
+        self._record_openrouter_usage(payload["model"], body)
         return self._parse_openrouter_body(body)
       except urllib.error.HTTPError as exc:
         if exc.code not in _RETRY_STATUS_CODES or attempt == _RETRY_MAX_ATTEMPTS - 1:
@@ -668,6 +681,7 @@ class LLM:
           )
           response.raise_for_status()
           body = response.json()
+        self._record_openrouter_usage(payload["model"], body)
         return self._parse_openrouter_body(body)
       except httpx.HTTPStatusError as exc:
         if (
