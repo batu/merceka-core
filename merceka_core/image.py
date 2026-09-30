@@ -471,6 +471,13 @@ def _inpaint_openai(
     raise RuntimeError("OPENAI_API_KEY not set in environment")
 
   original_size = image.size
+  # size picks the supported shape nearest the input aspect. There is no
+  # padding path for masks: an aspect none of the three sizes serves would be
+  # charged and then refused by the aspect guard, so refuse it first.
+  w, h = image.size
+  aspect = w / h if h else 1.0
+  size = "1536x1024" if aspect > 1.25 else "1024x1536" if aspect < 0.8 else "1024x1024"
+  _require_servable_aspect(size, original_size, model)
   image_buf = io.BytesIO()
   image.convert("RGBA").save(image_buf, format="PNG")
 
@@ -482,12 +489,8 @@ def _inpaint_openai(
   # tuned for latency-sensitive previews and leaked into final art: JPEG
   # noise straddles the level-editor's diff-extract threshold (torn subject
   # masks) and the sizeless request forced an aspect-distorting 1024² round
-  # trip on non-square crops. size picks the supported shape nearest the
-  # input aspect; input_fidelity=high asks the model to preserve unmasked
-  # input, which is the entire point of a masked edit.
-  w, h = image.size
-  aspect = w / h if h else 1.0
-  size = "1536x1024" if aspect > 1.25 else "1024x1536" if aspect < 0.8 else "1024x1024"
+  # trip on non-square crops. input_fidelity=high asks the model to preserve
+  # unmasked input, which is the entire point of a masked edit.
   form = {
     "model": model.removeprefix("openai/"),
     "prompt": prompt,

@@ -14,7 +14,7 @@ from PIL import Image
 
 from merceka_core import costs
 from merceka_core import image as image_module
-from merceka_core.image import edit_image
+from merceka_core.image import edit_image, inpaint
 
 OPENAI_EDITS = "https://api.openai.com/v1/images/edits"
 BLUE = (0, 0, 255)
@@ -160,3 +160,30 @@ def test_resize_to_input_false_returns_the_model_size(openai_edits):
 
   assert fake.posts[0][1]["data"]["size"] == "1536x1024"
   assert result.size == (1536, 1024)
+
+
+# --- masked edits (inpaint with an openai/ model) ---
+
+
+def test_masked_edit_with_an_unservable_aspect_fails_before_the_paid_call(openai_edits):
+  # Masked edits use three fixed sizes; 1100x1000 is within 2% of none of them.
+  fake = openai_edits()
+  size = (1100, 1000)
+
+  with pytest.raises(ValueError, match="before the paid call"):
+    inpaint(Image.new("RGB", size), Image.new("L", size, 255), "p", model="openai/gpt-image-2.5-sunburst")
+
+  assert fake.posts == []
+  assert _ledger_rows() == []
+
+
+def test_masked_edit_with_a_servable_aspect_is_sent(openai_edits):
+  fake = openai_edits()
+  size = (1500, 1000)
+
+  result = inpaint(Image.new("RGB", size), Image.new("L", size, 255), "p", model="openai/gpt-image-2.5-sunburst")
+
+  assert fake.posts[0][1]["data"]["size"] == "1536x1024"
+  assert "mask" in fake.posts[0][1]["files"]
+  assert result.size == size
+  assert len(_ledger_rows()) == 1
