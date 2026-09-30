@@ -273,6 +273,44 @@ def test_parse_clamps_scores():
   assert parse_judge_response('{"score": -12, "defects": []}')["score"] == 0
 
 
+@pytest.mark.parametrize(
+  ("raw", "expected"),
+  [
+    ("critical", "blocker"),
+    ("HIGH", "blocker"),
+    ("Blocker ", "blocker"),
+    (" medium", "major"),
+    ("Major", "major"),
+    ("low", "minor"),
+    ("minor", "minor"),
+    ("severe", "minor"),
+    (None, "minor"),
+  ],
+)
+def test_severity_synonyms_normalize_case_and_whitespace_insensitively(raw, expected):
+  # Review repro r2 D: "critical", "high" and "Blocker " were downgraded to minor.
+  defect = {"key": "layout", "region": "banner", "defect": "off", "direction": "fix"}
+  if raw is not None:
+    defect["severity"] = raw
+
+  parsed = parse_judge_response(json.dumps({"score": 90, "defects": [defect]}))
+
+  assert parsed["defects"][0]["severity"] == expected
+
+
+def test_unanimous_critical_defect_fails_as_a_consensus_blocker(monkeypatch):
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  critical = _content(88, ["layout"], severity="critical")
+  client = _client_for([critical, critical, critical])
+
+  result = run_critique(
+    [PNG_BYTES], judges=[_judge("j1"), _judge("j2"), _judge("j3")], floor=80, client=client
+  )
+
+  assert result["consensus"] == ["layout"]
+  assert result["verdict"] == "fail"
+
+
 def test_critique_median_payload_and_reference(monkeypatch, tmp_path):
   monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
   reference = tmp_path / "ref.png"

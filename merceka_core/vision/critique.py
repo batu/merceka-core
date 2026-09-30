@@ -101,7 +101,17 @@ FINDING_KEYS = [
   "other",
 ]
 SEVERITY_RANK = {"blocker": 3, "major": 2, "minor": 1}
-_SEVERITIES = set(SEVERITY_RANK)
+# Severity words models use, matched case- and whitespace-insensitively. Anything
+# else is minor.
+_SEVERITY_ALIASES = {
+  "blocker": "blocker",
+  "critical": "blocker",
+  "high": "blocker",
+  "major": "major",
+  "medium": "major",
+  "minor": "minor",
+  "low": "minor",
+}
 _MAX_TEXT = 400
 RECURRING_CHECKS = [
   {
@@ -248,7 +258,9 @@ def critique(
   majority of participants flag a blocker under the same defect key, or (with
   ``recurring_checks_gate``) when a majority of participants fail the same
   recurring check for the same subject. Majority means ``ceil(n / 2)`` of the n
-  participating judges.
+  participating judges. Defect consensus matches on the finding key only: judges
+  that report the same blocker under different keys (say "background" and
+  "extra-element" for one opaque box) do not agree.
 
   Args:
     images: One or more image paths or raw image bytes to judge.
@@ -817,9 +829,7 @@ def _normalize_defect(raw: Any) -> dict[str, str]:
     if reference or ours:
       direction = f"reference: {reference or ''}; ours: {ours or ''}"
   key = _normalize_key(raw.get("key") or defect_text)
-  severity = str(raw.get("severity", "minor")).lower()
-  if severity not in _SEVERITIES:
-    severity = "minor"
+  severity = _SEVERITY_ALIASES.get(str(raw.get("severity", "minor")).strip().lower(), "minor")
 
   return {
     "key": key,
