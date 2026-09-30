@@ -1,5 +1,10 @@
 {
-  "_source": "USD per 1M tokens by usage field. Google image models from https://ai.google.dev/gemini-api/docs/pricing fetched 2026-09-30: input $0.50 (text/image), output $3 (text and thinking) and $60 (images) for 3.1 Flash Image; $0.25 / $1.50 / $30 for 3.1 Flash Lite Image. outputImageTokens/outputTextTokens are derived by costs.py from usageMetadata. OpenAI image models from https://developers.openai.com/api/docs/pricing fetched 2026-09-11 (text in $5, image in $8, image out $30 per 1M; dotted keys read usage.input_tokens_details).",
+  "_source": "USD per 1M tokens by usage field. Google image models from https://ai.google.dev/gemini-api/docs/pricing fetched 2026-09-30: input $0.50 (text/image), output $3 (text and thinking) and $60 (images) for 3.1 Flash Image (stable and -preview ids); $0.25 / $1.50 / $30 for 3.1 Flash Lite Image. outputImageTokens/outputTextTokens are derived by costs.py from usageMetadata. OpenAI image models from https://developers.openai.com/api/docs/pricing fetched 2026-09-11 (text in $5, image in $8, image out $30 per 1M; dotted keys read usage.input_tokens_details).",
+  "google/gemini-3.1-flash-image": {
+    "promptTokenCount": 0.5,
+    "outputImageTokens": 60.0,
+    "outputTextTokens": 3.0
+  },
   "google/gemini-3.1-flash-image-preview": {
     "promptTokenCount": 0.5,
     "outputImageTokens": 60.0,

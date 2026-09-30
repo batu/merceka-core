@@ -155,3 +155,12 @@ def test_attribution_context_tags_records(tmp_path, monkeypatch):
   rows = _rows(tmp_path / "ledger.jsonl")
   assert rows[0]["meta"] == {"sessionId": "level_a", "operation": "extract", "birdId": "bird_1"}
   assert "meta" not in rows[1]
+
+
+def test_stable_gemini_flash_image_id_is_priced_like_the_preview():
+  """Callers use both google/gemini-3.1-flash-image and its -preview id; the
+  stable id had no rate, so its google-direct rows were stored unpriced."""
+  stable = costs._usd_from_rates("google/gemini-3.1-flash-image", GEMINI_IMAGE_USAGE)
+  preview = costs._usd_from_rates("google/gemini-3.1-flash-image-preview", GEMINI_IMAGE_USAGE)
+  assert stable is not None
+  assert stable == preview
