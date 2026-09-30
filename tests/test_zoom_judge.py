@@ -170,6 +170,54 @@ def test_critique_parses_zoom_judge_verdict(monkeypatch):
   assert result["participated"] == ["anthropic/claude-fable-5-zoom"]
 
 
+def _rgba_png_bytes() -> bytes:
+  # Transparent canvas with an opaque white square in the middle (review repro r4 G).
+  image = Image.new("RGBA", (200, 200), (0, 0, 0, 0))
+  image.paste(Image.new("RGBA", (50, 50), (255, 255, 255, 255)), (75, 75))
+  buf = io.BytesIO()
+  image.save(buf, format="PNG")
+  return buf.getvalue()
+
+
+def _returned_crop(client) -> tuple[str, Image.Image]:
+  tool_result = client.requests[1]["json"]["messages"][2]["content"][0]
+  label, block = tool_result["content"]
+  assert block["source"]["media_type"] == "image/jpeg"
+  return label["text"], Image.open(io.BytesIO(base64.b64decode(block["source"]["data"])))
+
+
+def test_zoom_crop_draws_transparency_on_a_checkerboard_not_black():
+  client = _FakeClient([_tool_use_response((60, 60, 140, 140)), _final_response()])
+
+  result = zoom_judge.call_zoom_judge(
+    ZOOM_JUDGE, [_rgba_png_bytes()], None, "judge this", api_key="sk-ant-test", client=client
+  )
+
+  assert result["ok"] is True
+  label, crop = _returned_crop(client)
+  assert "checkerboard" in label
+  gray = crop.convert("L")
+  # The top-left eighth of the crop is fully transparent in the source.
+  margin = gray.crop((0, 0, gray.width // 8, gray.height // 8))
+  low, high = margin.getextrema()
+  assert low > 50  # convert("RGB") used to paint this black (0)
+  assert high - low > 30  # a pattern, not a flat fill
+  assert gray.getpixel((gray.width // 2, gray.height // 2)) > 240  # opaque white stays white
+
+
+def test_opaque_zoom_crop_has_no_checkerboard_note():
+  client = _FakeClient([_tool_use_response((0, 0, 32, 32)), _final_response()])
+
+  zoom_judge.call_zoom_judge(
+    ZOOM_JUDGE, [_png_bytes()], None, "judge this", api_key="sk-ant-test", client=client
+  )
+
+  label, crop = _returned_crop(client)
+  assert "checkerboard" not in label
+  red, green, blue = crop.convert("RGB").getpixel((crop.width // 2, crop.height // 2))
+  assert red > 240 and green < 20 and blue < 20
+
+
 @pytest.mark.parametrize(
   ("stop_reason", "reason"), [("max_tokens", "max-tokens"), ("refusal", "refusal")]
 )

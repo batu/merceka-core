@@ -38,6 +38,10 @@ _MAX_OUTPUT_TOKENS = 4096
 _FINAL_STOP_REASONS = frozenset({"end_turn", "stop_sequence"})
 # Modes Pillow can write as PNG; anything else (CMYK, YCbCr, LAB, ...) is converted.
 _PNG_MODES = frozenset({"1", "L", "LA", "I", "I;16", "P", "RGB", "RGBA"})
+# Crop backdrop for transparent pixels: mid greys contrast with light and dark edges.
+_CHECKER_CELL = 32
+_CHECKER_LIGHT = (160, 160, 160, 255)
+_CHECKER_DARK = (96, 96, 96, 255)
 
 _ZOOM_TOOL = {
   "name": "zoom",
@@ -225,12 +229,42 @@ def _tool_result(
     result["content"] = [{"type": "text", "text": f"Error: {exc}"}]
     result["is_error"] = True
     return result
+  flat, transparent = _flatten_transparency(crop)
+  label = f"Magnified view of image {index}, region {list(box)}:"
+  if transparent:
+    label += " transparent pixels are drawn over a grey checkerboard."
   # JPEG keeps accumulated tool results well under the API request size limit.
   result["content"] = [
-    {"type": "text", "text": f"Magnified view of image {index}, region {list(box)}:"},
-    _image_block(crop.convert("RGB"), "image/jpeg"),
+    {"type": "text", "text": label},
+    _image_block(flat, "image/jpeg"),
   ]
   return result
+
+
+def _flatten_transparency(crop: Image.Image) -> tuple[Image.Image, bool]:
+  """An RGB copy for JPEG, with transparent pixels drawn over a grey checkerboard.
+
+  ``convert("RGB")`` alone paints transparent pixels black, which looks exactly
+  like the opaque box the banner-transparency check looks for.
+  """
+  rgba = crop.convert("RGBA")
+  if rgba.getchannel("A").getextrema()[0] == 255:
+    return crop.convert("RGB"), False
+  board = _checkerboard(rgba.size)
+  board.alpha_composite(rgba)
+  return board.convert("RGB"), True
+
+
+def _checkerboard(size: tuple[int, int]) -> Image.Image:
+  width, height = size
+  cols = -(-width // _CHECKER_CELL)
+  rows = -(-height // _CHECKER_CELL)
+  cells = Image.new("RGBA", (cols, rows))
+  cells.putdata(
+    [_CHECKER_DARK if (x + y) % 2 else _CHECKER_LIGHT for y in range(rows) for x in range(cols)]
+  )
+  board = cells.resize((cols * _CHECKER_CELL, rows * _CHECKER_CELL), Image.Resampling.NEAREST)
+  return board.crop((0, 0, width, height))
 
 
 def _image_block(image: Image.Image, mime_type: str) -> dict[str, Any]:
