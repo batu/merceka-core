@@ -1054,6 +1054,7 @@ class LLM:
     if content is None:
       raise LLMResponseError(f"{self.model_name} returned no content")
     if self.output_schema:
+      _reject_schema_mismatch(self.output_schema, content)
       if isinstance(content, str):
         return self.output_schema.model_validate_json(content)
       return self.output_schema.model_validate(content)
@@ -1453,6 +1454,43 @@ def _with_default_tag(model_name: str) -> str:
   Only a colon in the last path segment is a tag (``host:port/model`` is not).
   """
   return model_name if ":" in model_name.rsplit("/", 1)[-1] else f"{model_name}:latest"
+
+
+def _reject_schema_mismatch(schema: type[BaseModel], content) -> None:
+  """Raise ValidationError when a JSON object shares no key with ``schema``.
+
+  A schema whose fields all have defaults validates any object, so a wrapped
+  answer such as ``{"result": {...}}`` became an all-default instance and the
+  answer was silently lost. A strict schema raises ValidationError for the same
+  response, so callers already handle this error. Empty objects and RootModels
+  (whose keys are data, not field names) are left to pydantic.
+  """
+  from pydantic import RootModel, ValidationError
+  from pydantic_core import PydanticCustomError
+
+  if issubclass(schema, RootModel):
+    return
+  data = content
+  if isinstance(content, str):
+    try:
+      data = json.loads(content)
+    except json.JSONDecodeError:
+      return  # model_validate_json reports invalid JSON
+  if not isinstance(data, dict) or not data:
+    return
+  names = set(schema.model_fields)
+  names |= {f.alias for f in schema.model_fields.values() if isinstance(f.alias, str)}
+  if names.isdisjoint(data):
+    keys = ", ".join(sorted(map(str, data))[:10])
+    raise ValidationError.from_exception_data(schema.__name__, [{
+      "type": PydanticCustomError(
+        "schema_mismatch",
+        "response has none of the schema's fields (got keys: {keys})",
+        {"keys": keys},
+      ),
+      "loc": (),
+      "input": data,
+    }])
 
 
 # Gemini surface moved to merceka_core.llm_gemini; re-exported for back-compat.
