@@ -247,6 +247,47 @@ class TestFallbackFidelity:
     assert captured["rounds"] == 7
 
 
+# --- stream_generate: non-Claude primaries answer as one chunk from themselves ---
+
+STREAM_TABLE = [
+  ("openrouter/primary", "gemma4:26b", "openrouter"),
+  ("gemma4:26b", "openrouter/fb", "local"),
+  ("codex/gpt-5", "openrouter/fb", "codex"),
+]
+
+
+class TestStreamDispatch:
+  @pytest.mark.parametrize("model,fallback,expected", STREAM_TABLE)
+  def test_primary_serves_the_stream(self, monkeypatch, model, fallback, expected):
+    """Regression: every non-Claude primary used to stream from its fallback."""
+    llm = LLM(model, fallback=fallback)
+    hits = _spy_transports(monkeypatch, llm)
+    assert list(llm.stream_generate("hi")) == ["ok"]
+    assert hits == [(expected, model)]
+
+  def test_fallback_runs_once_when_the_primary_fails(self, monkeypatch):
+    llm = LLM("openrouter/primary", fallback="gemma4:26b")
+    hits = _spy_transports(monkeypatch, llm)
+
+    def failing_cloud(self, *_args, **_kwargs):
+      hits.append(("openrouter", self.model_name))
+      raise ConnectionError("down")
+
+    monkeypatch.setattr(LLM, "_cloud_call", failing_cloud)
+    assert list(llm.stream_generate("hi")) == ["ok"]
+    assert hits == [("openrouter", "openrouter/primary"), ("local", "gemma4:26b")]
+
+  def test_primary_failure_without_fallback_raises(self, monkeypatch):
+    llm = LLM("openrouter/primary")
+
+    def failing_cloud(self, *_args, **_kwargs):
+      raise ConnectionError("down")
+
+    monkeypatch.setattr(LLM, "_cloud_call", failing_cloud)
+    with pytest.raises(ConnectionError):
+      list(llm.stream_generate("hi"))
+
+
 # --- astream_generate: async-native handoff ---
 
 class TestAstream:

@@ -1052,27 +1052,30 @@ class LLM:
   def stream_generate(self, message: str, **kwargs):
     """Stream tokens from the primary model. Sync generator.
 
-    Falls back to yielding the full response as one chunk for
-    non-Claude models.
+    Claude CLI models stream token deltas. Other models have no token stream:
+    the primary's full response is yielded as one chunk, and the fallback
+    answers only when the primary fails (``generate``'s own cascade).
     """
-    if self.use_claude:
-      streamed = False
-      try:
-        with contextlib.closing(self._claude_stream(message, **kwargs)) as stream:
-          for chunk in stream:
-            streamed = True
-            yield chunk
-        return
-      except (FileNotFoundError, OSError, subprocess.CalledProcessError) as e:
-        # Once chunks reached the consumer, a fallback answer would be appended
-        # to a partial one, so the failure is raised instead.
-        if not self.fallback or streamed:
-          raise
-        _logger.warning("Claude stream failed (%s), falling back", type(e).__name__)
+    if not self.use_claude:
+      yield self.generate(message, **kwargs)
+      return
 
-    # Fallback: generate full response and yield as one chunk
-    fb = self._fallback_llm(self.fallback or self.model_name)
-    yield fb.generate(message, **kwargs)
+    streamed = False
+    try:
+      with contextlib.closing(self._claude_stream(message, **kwargs)) as stream:
+        for chunk in stream:
+          streamed = True
+          yield chunk
+      return
+    except (FileNotFoundError, OSError, subprocess.CalledProcessError) as e:
+      # Once chunks reached the consumer, a fallback answer would be appended
+      # to a partial one, so the failure is raised instead.
+      if not self.fallback or streamed:
+        raise
+      _logger.warning("Claude stream failed (%s), falling back", type(e).__name__)
+
+    # The fallback answers as one chunk.
+    yield self._fallback_llm().generate(message, **kwargs)
 
   async def astream_generate(self, message: str, **kwargs):
     """Async streaming generator. Runs the sync stream in a worker thread."""
