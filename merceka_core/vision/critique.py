@@ -489,7 +489,12 @@ def _call_codex_cli_judge(
   spec: str | None,
   recurring_check_units: list[str],
 ) -> dict[str, Any]:
-  """Run one judge through the local `codex` CLI (vision via -i attachments)."""
+  """Run one judge through the local `codex` CLI (vision via -i attachments).
+
+  The judge runs read-only in a scratch working directory, so the calling
+  repo's AGENTS.md never reaches it, and its answer is read from
+  ``--output-last-message`` instead of being cut out of the stdout transcript.
+  """
   binary = shutil.which("codex") or "/opt/homebrew/bin/codex"
   prompt = _prompt_with_spec(spec, reference, recurring_check_units)
   ordered: list[str | Path | bytes | bytearray | memoryview] = []
@@ -500,34 +505,35 @@ def _call_codex_cli_judge(
     prompt += "\n\nAttached images are OURS, in order."
   ordered.extend(images)
 
-  args = [binary, "exec", "-m", judge["model"],
-          "-c", f"model_reasoning_effort={judge.get('effort', 'high')}"]
-  temps: list[str] = []
   try:
-    for item in ordered:
-      if isinstance(item, (bytes, bytearray, memoryview)):
-        handle = _tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        handle.write(bytes(item))
-        handle.close()
-        temps.append(handle.name)
-        args.extend(["-i", handle.name])
-      else:
-        args.extend(["-i", str(item)])
-    args.append("-")
-    completed = subprocess.run(
-      args, input=prompt, capture_output=True, text=True, timeout=600,
-      env=_cli.codex_env(),
-    )
+    with _tempfile.TemporaryDirectory(prefix="critique-codex-") as workdir:
+      attachments: list[str] = []
+      for index, item in enumerate(ordered):
+        if isinstance(item, (bytes, bytearray, memoryview)):
+          path = Path(workdir, f"image-{index}.png")
+          path.write_bytes(bytes(item))
+          attachments.append(str(path))
+        else:
+          # Relative paths would otherwise resolve against the scratch cwd.
+          attachments.append(str(Path(item).resolve()))
+      last_message = Path(workdir, "last-message.txt")
+      cmd = _cli.codex_exec_command(judge["model"], cd=workdir, images=attachments, binary=binary)
+      # codex_exec_command applies reasoning effort only to alias models; the
+      # judge names both a model and an effort.
+      cmd[2:2] = [
+        "-c", f'model_reasoning_effort="{judge.get("effort", "high")}"',
+        "--output-last-message", str(last_message),
+      ]
+      completed = subprocess.run(
+        cmd, input=prompt, capture_output=True, text=True, timeout=600,
+        cwd=workdir, env=_cli.codex_env(),
+      )
+      if completed.returncode != 0:
+        return {"ok": False, "reason": "cli-error"}
+      text = last_message.read_text() if last_message.exists() else ""
   except (OSError, subprocess.TimeoutExpired):
     return {"ok": False, "reason": "cli-error"}
-  finally:
-    for name in temps:
-      Path(name).unlink(missing_ok=True)
 
-  if completed.returncode != 0:
-    return {"ok": False, "reason": "cli-error"}
-  # codex exec prints the answer, a "tokens used" line, then echoes the answer.
-  text = completed.stdout.split("tokens used", 1)[0]
   try:
     parsed = parse_judge_response(text, recurring_check_units=recurring_check_units)
   except (TypeError, ValueError, json.JSONDecodeError):
