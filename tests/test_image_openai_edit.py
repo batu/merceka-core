@@ -146,3 +146,17 @@ def test_unservable_aspect_fails_before_the_paid_call(openai_edits):
 
   assert fake.posts == []
   assert _ledger_rows() == []
+
+
+def test_resize_to_input_false_returns_the_model_size(openai_edits):
+  # pixelsmith sends a reference canvas of any aspect and keeps the model's own
+  # output size, so neither the aspect refusal nor the resize applies.
+  fake = openai_edits()
+
+  result = edit_image(
+    Image.new("RGB", (300, 100), BLUE), "p",
+    model="openai/gpt-image-2.5-sunburst", resize_to_input=False,
+  )
+
+  assert fake.posts[0][1]["data"]["size"] == "1536x1024"
+  assert result.size == (1536, 1024)

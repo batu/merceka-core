@@ -276,13 +276,18 @@ def _pad_to_multiple_of_16(image: Image.Image) -> tuple[Image.Image, tuple[int, 
 
 
 def _edit_openai(
-  image: Image.Image, prompt: str, model: str, quality: str | None = None
+  image: Image.Image,
+  prompt: str,
+  model: str,
+  quality: str | None = None,
+  resize_to_input: bool = True,
 ) -> Image.Image:
   """Edit one image via OpenAI's image edits endpoint.
 
   Sends multipart/form-data with the image file + prompt. The returned
   image is resized back to the input's dimensions so downstream
-  compositing (which assumes identical crop sizes) keeps working.
+  compositing (which assumes identical crop sizes) keeps working. With
+  ``resize_to_input=False`` the model's own output size is returned.
   """
   api_key = os.environ.get("OPENAI_API_KEY")
   if not api_key:
@@ -311,7 +316,8 @@ def _edit_openai(
   size = _openai_native_edit_size(model, w, h) or _openai_size(ar, "1K", model)
   # The fixed sizes cover three aspects. Anything else would be charged and then
   # refused by the aspect guard below, so refuse before the paid call.
-  _require_servable_aspect(size, image.size, model)
+  if resize_to_input:
+    _require_servable_aspect(size, image.size, model)
 
   files = {"image": ("input.png", buf.getvalue(), "image/png")}
   form = {
@@ -357,6 +363,8 @@ def _edit_openai(
 
   if image.size != original_size and result.size == image.size:
     result = result.crop(content_box)
+  if not resize_to_input:
+    return result
   return _resize_to_input_guarded(result, original_size)
 
 
@@ -773,7 +781,10 @@ def edit_image(
       result = _resize_to_input_guarded(result, image.size)
     return result
   if model.startswith("openai/") and os.environ.get("OPENAI_API_KEY"):
-    return _edit_openai(image, prompt, model.removeprefix("openai/"), quality=quality)
+    return _edit_openai(
+      image, prompt, model.removeprefix("openai/"), quality=quality,
+      resize_to_input=resize_to_input,
+    )
   if (
     model.startswith("google/")
     and os.environ.get("GOOGLE_API_KEY")
