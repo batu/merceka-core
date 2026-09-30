@@ -8,13 +8,6 @@ Core utilities for merceka projects.
 pip install merceka-core
 ```
 
-Optional WhatsApp bot tooling is split into an extra so base consumers
-do not install FastHTML unless they need it:
-
-```bash
-pip install "merceka-core[wa-bot]"
-```
-
 ## Usage
 
 ```python
