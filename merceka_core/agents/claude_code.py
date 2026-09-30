@@ -67,6 +67,7 @@ class ClaudeCodeAgentProvider:
     raw_events: list[RawProviderEvent] = []
     text_chunks: list[str] = []
     completed = False
+    failure: str | None = None
     try:
       await stream.send(request.message)
       while True:
@@ -92,9 +93,14 @@ class ClaudeCodeAgentProvider:
 
         if _cli.is_claude_result_event(payload):
           completed = True
+          failure = _result_failure(payload)
           break
 
       returncode, stderr = await stream.finish()
+      if failure is not None:
+        # Checked before the exit code: the CLI prints in-run failures as the
+        # result on stdout, so its stderr is often empty.
+        raise ProviderFailure(f"Claude Code stream failed: {failure}")
       if returncode != 0:
         message = stderr.strip() or f"exit {returncode}"
         raise ProviderFailure(f"Claude Code stream failed with exit {returncode}: {message}")
@@ -127,3 +133,27 @@ class ClaudeCodeAgentProvider:
 
   def _env(self) -> dict[str, str]:
     return _cli.claude_env()
+
+
+def _result_failure(payload: dict[str, Any]) -> str | None:
+  """Why a stream-json ``result`` event reports a failed run, else None.
+
+  ``is_error`` is set on every ``error_*`` subtype (max turns, budget, an
+  error during execution), with the detail in ``errors``. It is also set on a
+  ``success`` result whose final model request failed, with the API error in
+  ``result``.
+  """
+  if not payload.get("is_error"):
+    return None
+  errors = payload.get("errors")
+  details = [str(error) for error in errors if error] if isinstance(errors, list) else []
+  result = payload.get("result")
+  if isinstance(result, str) and result.strip():
+    details.append(result.strip())
+  subtype = payload.get("subtype")
+  if isinstance(subtype, str) and subtype.startswith("error"):
+    return f"{subtype}: {'; '.join(details)}" if details else subtype
+  if details:
+    return "; ".join(details)
+  status = payload.get("api_error_status")
+  return f"final request failed (HTTP {status})" if status else "final request failed"

@@ -184,6 +184,7 @@ class FakePopen:
     return self.returncode
 
   def wait(self, timeout: float | None = None) -> int:
+    del timeout  # accepted like Popen.wait; the fake exits at once
     self.wait_called = True
     self.returncode = self._exit_code
     return self.returncode
@@ -234,6 +235,101 @@ async def test_claude_agent_stream_nonzero_exit_raises_failure(tmp_path: Path):
   with patch("subprocess.Popen", return_value=process):
     with pytest.raises(ProviderFailure, match="stream failed"):
       [event async for event in provider.stream(_request(tmp_path))]
+
+
+async def _stream_until_failure(provider: ClaudeCodeAgentProvider, request: AgentRequest):
+  """The events a stream yields before it raises."""
+  events = []
+  with pytest.raises(ProviderFailure) as failure:
+    async for event in provider.stream(request):
+      events.append(event)
+  events.append(failure.value)
+  return events
+
+
+def _text_delta_line(text: str) -> str:
+  return _stream_line({
+    "type": "stream_event",
+    "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": text}},
+  })
+
+
+# stream-json result shapes, from the Agent SDK's SDKResultMessage / ResultMessage.
+@pytest.mark.asyncio
+async def test_claude_agent_stream_error_subtype_result_raises_failure(tmp_path: Path):
+  process = FakePopen([
+    _text_delta_line("Let me check "),
+    _stream_line({
+      "type": "result",
+      "subtype": "error_max_turns",
+      "is_error": True,
+      "num_turns": 3,
+      "stop_reason": "tool_use",
+      "errors": ["Reached maximum number of turns (3)"],
+    }),
+  ])
+  provider = ClaudeCodeAgentProvider(model="sonnet")
+
+  with patch("subprocess.Popen", return_value=process):
+    events = await _stream_until_failure(provider, _request(tmp_path))
+
+  assert "error_max_turns" in str(events[-1])
+  assert "Reached maximum number of turns (3)" in str(events[-1])
+  assert not any(isinstance(event, AgentComplete) for event in events)
+  assert process.wait_called
+
+
+@pytest.mark.asyncio
+async def test_claude_agent_stream_failed_request_result_raises_failure(tmp_path: Path):
+  # subtype "success" with is_error: the loop finished but its last API call failed.
+  process = FakePopen([
+    _stream_line({
+      "type": "result",
+      "subtype": "success",
+      "is_error": True,
+      "api_error_status": 529,
+      "result": "API Error: 529 Overloaded",
+    }),
+  ])
+  provider = ClaudeCodeAgentProvider(model="sonnet")
+
+  with patch("subprocess.Popen", return_value=process):
+    with pytest.raises(ProviderFailure, match="529 Overloaded"):
+      [event async for event in provider.stream(_request(tmp_path))]
+
+
+@pytest.mark.asyncio
+async def test_claude_agent_stream_failure_prefers_result_text_to_exit_code(tmp_path: Path):
+  # Failures inside the run are printed as the result on stdout, with an
+  # empty stderr, so "exit 1" alone says nothing.
+  process = FakePopen([
+    _stream_line({
+      "type": "result",
+      "subtype": "success",
+      "is_error": True,
+      "result": "Invalid API key · Please run /login",
+    }),
+  ], returncode=1)
+  provider = ClaudeCodeAgentProvider(model="sonnet")
+
+  with patch("subprocess.Popen", return_value=process):
+    with pytest.raises(ProviderFailure, match="Invalid API key"):
+      [event async for event in provider.stream(_request(tmp_path))]
+
+
+@pytest.mark.asyncio
+async def test_claude_agent_stream_successful_result_completes(tmp_path: Path):
+  process = FakePopen([
+    _text_delta_line("Page 3."),
+    _stream_line({"type": "result", "subtype": "success", "is_error": False, "result": "Page 3."}),
+  ])
+  provider = ClaudeCodeAgentProvider(model="sonnet")
+
+  with patch("subprocess.Popen", return_value=process):
+    events = [event async for event in provider.stream(_request(tmp_path))]
+
+  assert isinstance(events[-1], AgentComplete)
+  assert events[-1].result.text == "Page 3."
 
 
 @pytest.mark.asyncio
