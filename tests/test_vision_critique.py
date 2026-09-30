@@ -347,6 +347,110 @@ def test_missing_recurring_checks_are_recorded_as_skipped(monkeypatch):
   assert [check["id"] for check in result["recurring_checks"]] == RECURRING_CHECK_IDS
   assert all(check["pass"] is None for check in result["recurring_checks"])
   assert all("skipped: model omitted recurring_checks" in check["evidence"] for check in result["recurring_checks"])
+  assert result["failed_recurring_checks"] == []
+  assert result["verdict"] == "pass"
+
+
+def _checks_failing(failing: set[str], unit: str = "OURS 1") -> list[dict]:
+  return [
+    {"id": check_id, "pass": check_id not in failing, "evidence": f"{unit} x=1 y=1"}
+    for check_id in RECURRING_CHECK_IDS
+  ]
+
+
+def test_unanimous_recurring_check_failure_fails_the_verdict(monkeypatch):
+  # Review repro r2 B: 3/3 judges failing every check at score 92 used to pass.
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  failing = _content_with_recurring_checks(92, _checks_failing(set(RECURRING_CHECK_IDS)))
+  client = _client_for([failing, failing, failing])
+
+  result = run_critique(
+    [PNG_BYTES], judges=[_judge("j1"), _judge("j2"), _judge("j3")], client=client
+  )
+
+  assert result["score"] == 92
+  assert result["consensus"] == []
+  assert result["failed_recurring_checks"] == RECURRING_CHECK_IDS
+  assert result["verdict"] == "fail"
+
+
+def test_majority_recurring_check_failure_fails_the_verdict(monkeypatch):
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  client = _client_for(
+    [
+      _content_with_recurring_checks(95, _checks_failing({"banner-transparency"})),
+      _content_with_recurring_checks(95, _checks_failing({"banner-transparency"})),
+      _content_with_recurring_checks(95, _checks_failing(set())),
+    ]
+  )
+
+  result = run_critique(
+    [PNG_BYTES], judges=[_judge("j1"), _judge("j2"), _judge("j3")], client=client
+  )
+
+  assert result["failed_recurring_checks"] == ["banner-transparency"]
+  assert result["verdict"] == "fail"
+
+
+def test_minority_recurring_check_failure_keeps_the_verdict(monkeypatch):
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  client = _client_for(
+    [
+      _content_with_recurring_checks(95, _checks_failing({"banner-transparency"})),
+      _content_with_recurring_checks(95, _checks_failing(set())),
+      # An omitted check is not a failure vote, but the judge still counts.
+      _content(95),
+    ]
+  )
+
+  result = run_critique(
+    [PNG_BYTES], judges=[_judge("j1"), _judge("j2"), _judge("j3")], client=client
+  )
+
+  assert result["failed_recurring_checks"] == []
+  assert result["verdict"] == "pass"
+  banner = next(c for c in result["recurring_checks"] if c["id"] == "banner-transparency")
+  assert banner["pass"] is False  # the per-subject table still shows any failure
+
+
+def test_recurring_check_failures_on_different_subjects_are_not_consensus(monkeypatch):
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  hud_fails = _checks_failing({"banner-transparency"}, "hud") + _checks_failing(set(), "cta")
+  cta_fails = _checks_failing(set(), "hud") + _checks_failing({"banner-transparency"}, "cta")
+  all_pass = _checks_failing(set(), "hud") + _checks_failing(set(), "cta")
+  client = _client_for(
+    [
+      _content_with_recurring_checks(95, hud_fails),
+      _content_with_recurring_checks(95, cta_fails),
+      _content_with_recurring_checks(95, all_pass),
+    ]
+  )
+
+  result = run_critique(
+    [PNG_BYTES],
+    recurring_check_units=["hud", "cta"],
+    judges=[_judge("j1"), _judge("j2"), _judge("j3")],
+    client=client,
+  )
+
+  assert result["failed_recurring_checks"] == []
+  assert result["verdict"] == "pass"
+
+
+def test_recurring_checks_gate_off_restores_score_and_blocker_verdict(monkeypatch):
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  failing = _content_with_recurring_checks(92, _checks_failing({"asset-identity"}))
+  client = _client_for([failing, failing])
+
+  result = run_critique(
+    [PNG_BYTES],
+    judges=[_judge("j1"), _judge("j2")],
+    recurring_checks_gate=False,
+    client=client,
+  )
+
+  assert result["failed_recurring_checks"] == ["asset-identity"]
+  assert result["verdict"] == "pass"
 
 
 def test_openrouter_list_content_is_parsed(monkeypatch):

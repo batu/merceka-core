@@ -235,8 +235,15 @@ def critique(
   timeout: float = 60.0,
   client: httpx.Client | None = None,
   quorum: int | None = None,
+  recurring_checks_gate: bool = True,
 ) -> dict[str, Any]:
   """Run a multi-model visual critique and aggregate participating judges.
+
+  The verdict is ``"fail"`` when the median score is below ``floor``, when a
+  majority of participants flag a blocker under the same defect key, or (with
+  ``recurring_checks_gate``) when a majority of participants fail the same
+  recurring check for the same subject. Majority means ``ceil(n / 2)`` of the n
+  participating judges.
 
   Args:
     images: One or more image paths or raw image bytes to judge.
@@ -260,6 +267,11 @@ def critique(
       1, so a panel that lost most of its judges (expired CLI login, HTTP
       errors, parse failures) raises instead of letting the survivors decide
       alone. Pass ``quorum=1`` to accept any non-empty panel.
+    recurring_checks_gate: When True (the default), a recurring check that a
+      majority of participants fail for the same subject fails the verdict.
+      These checks cover defects that keep recurring, so they gate like a
+      consensus blocker. Pass False to restore the score-and-blocker verdict;
+      ``failed_recurring_checks`` is reported either way.
 
   Returns:
     A dict with score, verdict, defects, per_model, consensus, participated,
@@ -267,6 +279,9 @@ def critique(
     ``roster_size`` (enabled judges) and ``degraded`` (True when any enabled
     judge was skipped). Judges disabled in the roster are listed in skipped
     but do not count toward the roster or degrade the panel.
+    ``recurring_checks`` shows, per subject and check, a failure if any judge
+    reported one; ``failed_recurring_checks`` lists the check ids that failed
+    by majority.
 
   Raises:
     RuntimeError: When fewer than ``quorum`` judges produced a parseable score.
@@ -373,13 +388,16 @@ def critique(
     _public_recurring_check(c) for c in _aggregate_recurring_checks(participant_results, check_units)
   ]
   consensus_blocker = _has_consensus_blocker(consensus, participant_results)
-  verdict = "fail" if score < floor or consensus_blocker else "pass"
+  failed_recurring_checks = _failed_recurring_checks(participant_results)
+  recurring_fail = recurring_checks_gate and bool(failed_recurring_checks)
+  verdict = "fail" if score < floor or consensus_blocker or recurring_fail else "pass"
 
   return {
     "score": score,
     "verdict": verdict,
     "defects": defects,
     "recurring_checks": recurring_checks,
+    "failed_recurring_checks": failed_recurring_checks,
     "per_model": per_model,
     "consensus": consensus,
     "participated": participated,
@@ -1089,17 +1107,11 @@ def _aggregate_recurring_checks(
   recurring_check_units: list[str],
 ) -> list[dict[str, Any]]:
   checks_by_slot: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
-  max_slot_by_id: Counter[str] = Counter()
   for result in results:
-    counts: Counter[str] = Counter()
-    for check in result["recurring_checks"]:
-      check_id = check["id"]
-      slot = counts[check_id]
-      counts[check_id] += 1
-      max_slot_by_id[check_id] = max(max_slot_by_id[check_id], slot + 1)
-      checks_by_slot[(check_id, slot)].append(check)
+    for slot_key, check in _slot_recurring_checks(result["recurring_checks"]).items():
+      checks_by_slot[slot_key].append(check)
 
-  slot_count = max([len(recurring_check_units), *max_slot_by_id.values()] or [1])
+  slot_count = max([len(recurring_check_units), *(slot + 1 for _id, slot in checks_by_slot)])
   aggregated = []
   for slot in range(slot_count):
     unit = (
@@ -1112,6 +1124,35 @@ def _aggregate_recurring_checks(
         _aggregate_recurring_check_slot(check_id, unit, checks_by_slot.get((check_id, slot), []))
       )
   return aggregated
+
+
+def _slot_recurring_checks(
+  checks: list[dict[str, Any]],
+) -> dict[tuple[str, int], dict[str, Any]]:
+  """Map one judge's checks onto (check id, subject index) slots, by emission order."""
+  slots: dict[tuple[str, int], dict[str, Any]] = {}
+  counts: Counter[str] = Counter()
+  for check in checks:
+    slot = counts[check["id"]]
+    counts[check["id"]] += 1
+    slots[(check["id"], slot)] = check
+  return slots
+
+
+def _failed_recurring_checks(results: list[dict[str, Any]]) -> list[str]:
+  """Check ids that a majority of participants failed for the same subject.
+
+  The threshold is ``ceil(n / 2)`` participants, as for defect consensus. A judge
+  that omitted or skipped a check casts no failure vote but still counts in n.
+  """
+  threshold = math.ceil(len(results) / 2)
+  fail_votes: Counter[tuple[str, int]] = Counter()
+  for result in results:
+    for slot_key, check in _slot_recurring_checks(result["recurring_checks"]).items():
+      if check["pass"] is False:
+        fail_votes[slot_key] += 1
+  failed = {check_id for (check_id, _slot), votes in fail_votes.items() if votes >= threshold}
+  return [check_id for check_id in RECURRING_CHECK_IDS if check_id in failed]
 
 
 def _aggregate_recurring_check_slot(
