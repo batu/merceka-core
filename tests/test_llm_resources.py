@@ -94,6 +94,72 @@ class TestCreateMessageWithResource:
 class TestLLMGenerateWithResource:
   """Tests for LLM.generate_with_resource method."""
 
+  def test_codex_image_goes_to_codex_exec_with_i_flag(self, tmp_path: Path, monkeypatch):
+    """Regression: codex/ models were sent to ollama_chat(model="codex/...")."""
+    import merceka_core.llm as llm_module
+
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"\x89PNG fake")
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+      seen["cmd"], seen["input"] = cmd, kwargs["input"]
+
+      class Result:
+        returncode = 0
+        stdout = "an arrow"
+        stderr = ""
+      return Result()
+
+    def ollama_trap(**_kwargs):
+      raise AssertionError("codex model must not reach Ollama")
+
+    monkeypatch.setattr(llm_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(llm_module, "ollama_chat", ollama_trap)
+    llm = LLM("codex/gpt-5", system_prompt="SYS")
+    assert llm.generate_with_resource("what is this?", png) == "an arrow"
+    i = seen["cmd"].index("-i")
+    assert seen["cmd"][i + 1] == str(png)
+    assert seen["input"] == "SYS\n\nwhat is this?"
+
+  def test_codex_async_image_goes_to_codex_exec(self, tmp_path: Path, monkeypatch):
+    import asyncio
+
+    import merceka_core.llm as llm_module
+
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"\x89PNG fake")
+    seen = []
+
+    def fake_run(cmd, **_kwargs):
+      seen.append(cmd)
+
+      class Result:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+      return Result()
+
+    monkeypatch.setattr(llm_module.subprocess, "run", fake_run)
+    assert asyncio.run(LLM("codex/default").agenerate_with_resource("x", png)) == "ok"
+    assert str(png) in seen[0]
+
+  def test_codex_non_image_resource_raises(self, tmp_path: Path, monkeypatch):
+    """codex exec attaches images only (-i); a PDF has no route."""
+    import asyncio
+
+    import merceka_core.llm as llm_module
+
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    monkeypatch.setattr(
+      llm_module.subprocess, "run", lambda *_args, **_kwargs: pytest.fail("ran codex"))
+    llm = LLM("codex/gpt-5")
+    with pytest.raises(ValueError, match="codex"):
+      llm.generate_with_resource("x", pdf)
+    with pytest.raises(ValueError, match="codex"):
+      asyncio.run(llm.agenerate_with_resource("x", pdf))
+
   def test_raises_for_local_model(self, tmp_path: Path):
     """Should raise error when used with local (non-openrouter) model."""
     # Note: This would try to download the model if it doesn't exist,

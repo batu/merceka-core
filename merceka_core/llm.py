@@ -386,8 +386,9 @@ class LLM:
   ) -> str | OutputSchema:
     """One-shot generation with an attached file (image/PDF).
 
-    Supports OpenRouter cloud models and local Ollama vision models. Claude
-    CLI is not supported (the CLI takes stdin text only). Does not maintain
+    Supports OpenRouter cloud models, Gemini, local Ollama vision models, and
+    Codex CLI models for images (``codex exec -i``). Claude CLI is not
+    supported (the CLI takes stdin text only). Does not maintain
     conversation history.
 
     Args:
@@ -403,6 +404,9 @@ class LLM:
         "generate_with_resource is not supported for Claude CLI models — "
         "the CLI accepts stdin text only. Use an openrouter, gemini, or ollama model."
       )
+
+    if self.use_codex:
+      return self._codex_call(message, images=[self._codex_image(resource_path)], **kwargs)
 
     if self.use_gemini:
       return _gemini_image_call(self, message, resource_path, **kwargs)
@@ -429,9 +433,9 @@ class LLM:
   ) -> str | OutputSchema:
     """Async one-shot generation with an attached file (image/PDF).
 
-    Mirrors :meth:`generate_with_resource` but runs the local Ollama call in a
-    worker thread so it doesn't block the event loop. Supports OpenRouter and
-    local Ollama vision models; Claude CLI is not supported.
+    Mirrors :meth:`generate_with_resource` but runs the blocking calls (Ollama,
+    Gemini, Codex CLI) in a worker thread so they don't block the event loop.
+    Claude CLI is not supported.
     """
     import asyncio
 
@@ -440,6 +444,10 @@ class LLM:
         "agenerate_with_resource is not supported for Claude CLI models — "
         "the CLI accepts stdin text only. Use an openrouter, gemini, or ollama model."
       )
+
+    if self.use_codex:
+      image = self._codex_image(resource_path)
+      return await asyncio.to_thread(self._codex_call, message, images=[image], **kwargs)
 
     if self.use_gemini:
       return await asyncio.to_thread(_gemini_image_call, self, message, resource_path, **kwargs)
@@ -458,6 +466,22 @@ class LLM:
     return await asyncio.to_thread(self._local_call, messages, **kwargs)
 
   # --- Raw call methods (return full message dict for tool loop) ---
+
+  def _codex_image(self, resource_path: Path | str) -> str:
+    """``resource_path`` as a ``codex exec -i`` image, or ValueError.
+
+    codex attaches images only, so other resources (PDFs) have no route.
+    """
+    import mimetypes
+
+    mime_type, _ = mimetypes.guess_type(str(resource_path))
+    if not (mime_type or "").startswith("image/"):
+      raise ValueError(
+        f"{self.model_name!r}: codex exec attaches images only (-i), not "
+        f"{mime_type or 'unknown type'} files like {Path(resource_path).name!r}. "
+        "Use an openrouter or gemini model for other resources."
+      )
+    return str(resource_path)
 
   def _local_call_raw(self, messages: list[dict], **kwargs) -> dict:
     """Call local Ollama and return normalized message dict."""
