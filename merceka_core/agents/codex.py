@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import tempfile
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -67,19 +66,18 @@ class CodexAgentProvider:
     return self._stream(request)
 
   async def _stream(self, request: AgentRequest) -> AsyncIterator[AgentStreamEvent]:
-    cmd = self._command(request, json_output=True)
-    process = _process.start(cmd, cwd=str(request.roots[0]), env=_cli.codex_env())
-    if process.stdin is None or process.stdout is None or process.stderr is None:
-      raise ProviderFailure("Codex stream did not expose stdio pipes")
-
-    process.stdin.write(self._prompt(request))
-    process.stdin.close()
-
+    stream = _process.Stream(
+      self._command(request, json_output=True),
+      cwd=str(request.roots[0]),
+      env=_cli.codex_env(),
+      label="Codex stream",
+    )
     raw_events: list[RawProviderEvent] = []
     text_chunks: list[str] = []
     try:
+      await stream.send(self._prompt(request))
       while True:
-        line = await asyncio.to_thread(process.stdout.readline)
+        line = await stream.readline()
         if line == "":
           break
         line = line.strip()
@@ -97,23 +95,13 @@ class CodexAgentProvider:
             text_chunks.append(text)
             yield AgentTextDelta(content=text)
 
-      returncode = await asyncio.to_thread(process.wait)
-      stderr = await asyncio.to_thread(process.stderr.read)
+      returncode, stderr = await stream.finish()
       if returncode != 0:
         message = stderr.strip() or f"exit {returncode}"
         raise ProviderFailure(f"Codex stream failed with exit {returncode}: {message}")
       yield AgentComplete(result=AgentResult(text="".join(text_chunks), raw_events=tuple(raw_events)))
-    except GeneratorExit:
-      _process.terminate_process(process)
-      raise
-    except asyncio.CancelledError:
-      _process.terminate_process(process)
-      raise
     finally:
-      if process.returncode is None:
-        _process.terminate_process(process)
-      _process.close_pipe(process.stdout)
-      _process.close_pipe(process.stderr)
+      await stream.close()
 
   def _command(self, request: AgentRequest, *, json_output: bool) -> list[str]:
     model = "" if self.model in DEFAULT_CODEX_MODEL_ALIASES else self.model

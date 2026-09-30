@@ -85,6 +85,73 @@ async def run(
   return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
 
 
+class Stream:
+  """A CLI whose stdout is read line by line while it runs.
+
+  Blocking calls run in threads, off the event loop. The prompt is written
+  inside the caller's cleanup scope, so a CLI that dies at once is still torn
+  down. Always ``await close()`` when done.
+  """
+
+  def __init__(self, cmd: list[str], *, cwd: str, env: dict[str, str], label: str) -> None:
+    self.label = label
+    self._prompt_delivered = False
+    self.process = start(cmd, cwd=cwd, env=env)
+    if self.process.stdin is None or self.process.stdout is None or self.process.stderr is None:
+      terminate_process(self.process)
+      raise ProviderFailure(f"{label} did not expose stdio pipes")
+    self._stdin = self.process.stdin
+    self._stdout = self.process.stdout
+    self._stderr = self.process.stderr
+
+  async def send(self, text: str) -> None:
+    """Write the prompt and close stdin.
+
+    A CLI that exits before reading it is not reported here: its exit status
+    and stderr, read by ``finish()``, say why.
+    """
+    self._prompt_delivered = await asyncio.to_thread(_write_and_close, self._stdin, text)
+
+  async def readline(self) -> str:
+    """The next line of stdout, or "" at EOF."""
+    return await asyncio.to_thread(self._stdout.readline)
+
+  async def finish(self) -> tuple[int, str]:
+    """Wait for the CLI to exit; return its exit status and stderr."""
+    returncode = await asyncio.to_thread(self.process.wait)
+    stderr = await asyncio.to_thread(self._stderr.read)
+    if returncode == 0 and not self._prompt_delivered:
+      detail = stderr.strip() or "no error output"
+      raise ProviderFailure(f"{self.label} exited before reading its prompt: {detail}")
+    return returncode, stderr
+
+  async def close(self) -> None:
+    """Stop the process group if the CLI is still running, and close the pipes."""
+    await asyncio.to_thread(self._close)
+
+  def _close(self) -> None:
+    if self.process.returncode is None:
+      terminate_process(self.process)
+    close_pipe(self._stdin)
+    close_pipe(self._stdout)
+    close_pipe(self._stderr)
+
+
+def _write_and_close(pipe: Any, text: str) -> bool:
+  """Write ``text`` and close the pipe; False when the reader was already gone."""
+  try:
+    pipe.write(text)
+  except BrokenPipeError:
+    delivered = False
+  else:
+    delivered = True
+  try:
+    pipe.close()  # Closes the descriptor even when the final flush fails.
+  except BrokenPipeError:
+    delivered = False
+  return delivered
+
+
 def terminate_process(process: subprocess.Popen[str]) -> None:
   """Stop the process group: SIGTERM, then SIGKILL once the grace period is over.
 

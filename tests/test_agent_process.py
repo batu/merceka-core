@@ -170,3 +170,83 @@ async def test_run_starts_the_cli_in_its_own_process_group(
 
   _, pgid, _, pid = str(failure.value).rsplit(maxsplit=3)
   assert pgid == pid == str(spawned[0].pid)
+
+
+# --- tearing a stream down ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_name", sorted(PROVIDERS))
+async def test_closing_a_stream_does_not_block_the_event_loop(
+  provider_name, fake_cli, spawned, tmp_path
+):
+  # A child that ignores SIGTERM: stopping it takes the full grace period plus
+  # a SIGKILL, and none of that may run on the event loop.
+  binary = fake_cli("""
+    import json, signal, sys, time
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    sys.stdin.read()
+    print(json.dumps({"type": "started"}), flush=True)
+    time.sleep(5)
+  """)
+  provider = PROVIDERS[provider_name](binary, 30)
+  gaps: list[float] = []
+
+  async def heartbeat():
+    last = time.monotonic()
+    while True:
+      await asyncio.sleep(0.02)
+      now = time.monotonic()
+      gaps.append(now - last)
+      last = now
+
+  beat = asyncio.create_task(heartbeat())
+  stream = provider.stream(_request(tmp_path))
+  await anext(stream)
+  started = time.monotonic()
+  await stream.aclose()
+  closed_after = time.monotonic() - started
+  await asyncio.sleep(0.1)  # let the heartbeat record any stall during the close
+  beat.cancel()
+
+  assert max(gaps) < 0.3
+  assert closed_after < 3
+  assert spawned[0].returncode is not None  # the stubborn child is gone, and reaped
+
+
+@pytest.mark.asyncio
+async def test_closing_a_stream_stops_the_whole_process_group(fake_cli, tmp_path):
+  pid_file = tmp_path / "grandchild.pid"
+  binary = fake_cli(_wrapper_with_grandchild(pid_file, announce=True))
+  stream = PROVIDERS["codex"](binary, 30).stream(_request(tmp_path))
+  await anext(stream)
+  grandchild = _read_pid(pid_file)
+  try:
+    await stream.aclose()
+
+    assert _dies_within(grandchild, 3)
+  finally:
+    _kill_if_alive(grandchild)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_name", sorted(PROVIDERS))
+async def test_child_that_exits_before_reading_the_prompt_is_a_provider_failure(
+  provider_name, fake_cli, spawned, tmp_path
+):
+  # The prompt is larger than a pipe buffer, so writing it fails with EPIPE
+  # once the child is gone.
+  binary = fake_cli("""
+    import sys
+    print("not logged in", file=sys.stderr)
+    sys.exit(3)
+  """)
+  provider = PROVIDERS[provider_name](binary, 30)
+
+  with pytest.raises(ProviderFailure, match="not logged in"):
+    [event async for event in provider.stream(_request(tmp_path, "x" * 1_000_000))]
+
+  child = spawned[0]
+  assert child.returncode == 3
+  assert child.stdout is not None and child.stdout.closed
+  assert child.stderr is not None and child.stderr.closed

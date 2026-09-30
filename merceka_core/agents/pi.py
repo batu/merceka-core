@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -60,19 +59,18 @@ class PiAgentProvider:
     return self._stream(request)
 
   async def _stream(self, request: AgentRequest) -> AsyncIterator[AgentStreamEvent]:
-    cmd = self._command(request)
-    process = _process.start(cmd, cwd=str(request.roots[0]), env=scrubbed_env())
-    if process.stdin is None or process.stdout is None or process.stderr is None:
-      raise ProviderFailure("Pi stream did not expose stdio pipes")
-
-    process.stdin.write(self._prompt(request))
-    process.stdin.close()
-
+    stream = _process.Stream(
+      self._command(request),
+      cwd=str(request.roots[0]),
+      env=scrubbed_env(),
+      label="Pi stream",
+    )
     raw_events: list[RawProviderEvent] = []
     text_chunks: list[str] = []
     try:
+      await stream.send(self._prompt(request))
       while True:
-        line = await asyncio.to_thread(process.stdout.readline)
+        line = await stream.readline()
         if line == "":
           break
         line = line.strip()
@@ -90,24 +88,14 @@ class PiAgentProvider:
             text_chunks.append(text)
             yield AgentTextDelta(content=text)
 
-      returncode = await asyncio.to_thread(process.wait)
-      stderr = await asyncio.to_thread(process.stderr.read)
+      returncode, stderr = await stream.finish()
       if returncode != 0:
         message = stderr.strip() or f"exit {returncode}"
         raise ProviderFailure(f"Pi stream failed with exit {returncode}: {message}")
       text = self._final_text(tuple(raw_events)) or "".join(text_chunks)
       yield AgentComplete(result=AgentResult(text=text, raw_events=tuple(raw_events)))
-    except GeneratorExit:
-      _process.terminate_process(process)
-      raise
-    except asyncio.CancelledError:
-      _process.terminate_process(process)
-      raise
     finally:
-      if process.returncode is None:
-        _process.terminate_process(process)
-      _process.close_pipe(process.stdout)
-      _process.close_pipe(process.stderr)
+      await stream.close()
 
   def _command(self, request: AgentRequest) -> list[str]:
     cmd = [self.pi_binary, "-p", "--mode", "json", "--no-session", "--model", self.model]

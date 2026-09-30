@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -58,20 +57,19 @@ class ClaudeCodeAgentProvider:
     return self._stream(request)
 
   async def _stream(self, request: AgentRequest) -> AsyncIterator[AgentStreamEvent]:
-    cmd = self._command(request, stream=True)
-    process = _process.start(cmd, cwd=str(request.roots[0]), env=self._env())
-    if process.stdin is None or process.stdout is None or process.stderr is None:
-      raise ProviderFailure("Claude Code stream did not expose stdio pipes")
-
-    process.stdin.write(request.message)
-    process.stdin.close()
-
+    stream = _process.Stream(
+      self._command(request, stream=True),
+      cwd=str(request.roots[0]),
+      env=self._env(),
+      label="Claude Code stream",
+    )
     raw_events: list[RawProviderEvent] = []
     text_chunks: list[str] = []
     completed = False
     try:
+      await stream.send(request.message)
       while True:
-        line = await asyncio.to_thread(process.stdout.readline)
+        line = await stream.readline()
         if line == "":
           break
         line = line.strip()
@@ -95,8 +93,7 @@ class ClaudeCodeAgentProvider:
           completed = True
           break
 
-      returncode = await asyncio.to_thread(process.wait)
-      stderr = await asyncio.to_thread(process.stderr.read)
+      returncode, stderr = await stream.finish()
       if returncode != 0:
         message = stderr.strip() or f"exit {returncode}"
         raise ProviderFailure(f"Claude Code stream failed with exit {returncode}: {message}")
@@ -109,17 +106,8 @@ class ClaudeCodeAgentProvider:
         raw_events.append(completion_event)
         yield AgentRawProviderEvent(raw_event=completion_event)
       yield AgentComplete(result=AgentResult(text="".join(text_chunks), raw_events=tuple(raw_events)))
-    except GeneratorExit:
-      _process.terminate_process(process)
-      raise
-    except asyncio.CancelledError:
-      _process.terminate_process(process)
-      raise
     finally:
-      if not completed and process.returncode is None:
-        _process.terminate_process(process)
-      _process.close_pipe(process.stdout)
-      _process.close_pipe(process.stderr)
+      await stream.close()
 
   def _command(self, request: AgentRequest, *, stream: bool) -> list[str]:
     tools = WRITE_TOOLS if request.profile == AgentProfile.WRITE else READ_ONLY_TOOLS

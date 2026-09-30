@@ -271,3 +271,25 @@ async def test_claude_agent_stream_closes_process_when_generator_closes(tmp_path
 
   assert (process.pid, signal.SIGTERM) in signals
   assert process.stdout.closed and process.stderr.closed
+
+
+class BrokenStdin(io.StringIO):
+  def write(self, text: str) -> int:
+    raise BrokenPipeError(32, "Broken pipe")
+
+
+@pytest.mark.asyncio
+async def test_claude_agent_stream_prompt_write_failure_still_tears_down(tmp_path: Path, signals):
+  # Card 03 A: the child died before reading the prompt. The write used to
+  # happen before the cleanup try block, so BrokenPipeError escaped and the
+  # child and its pipes were left behind.
+  process = FakePopen([], returncode=1, stderr="auth expired")
+  process.stdin = BrokenStdin()
+  provider = ClaudeCodeAgentProvider(model="sonnet")
+
+  with patch("subprocess.Popen", return_value=process):
+    with pytest.raises(ProviderFailure, match="auth expired"):
+      [event async for event in provider.stream(_request(tmp_path))]
+
+  assert process.wait_called
+  assert process.stdin.closed and process.stdout.closed and process.stderr.closed
