@@ -725,10 +725,11 @@ def parse_judge_response(
   The verdict is the last JSON object in ``text`` that fits the response schema:
   a finite numeric ``score`` (a number, or a string holding one), a ``defects``
   list and ``recurring_checks``, which must be a list when present. The whole
-  text is tried first, then fenced ```json blocks, then every balanced top-level
-  object, so narration with braces, a draft before the final answer or a
-  trailing note cannot displace the verdict. A verdict that omits
-  ``recurring_checks`` still counts; its checks are recorded as skipped.
+  text is tried first; otherwise fenced ```json blocks and balanced top-level
+  objects are candidates, ordered by position, so narration with braces, a
+  draft before the final answer or a trailing note cannot displace the verdict.
+  A verdict that omits ``recurring_checks`` still counts; its checks are
+  recorded as skipped.
 
   Raises:
     ValueError: When no object fits the schema. There is no prose fallback;
@@ -761,27 +762,33 @@ def _extract_verdict(text: str) -> dict[str, Any] | None:
     whole = None
   if _is_verdict(whole):
     return whole
-  for candidates in (_fenced_objects(text), _balanced_objects(text)):
-    verdicts = [obj for obj in candidates if _is_verdict(obj)]
-    if verdicts:
-      return verdicts[-1]
-  return None
+  # Fenced blocks and bare objects compete by position, so a final answer
+  # outranks an earlier draft however each one is formatted.
+  candidates = {**_balanced_objects(text), **_fenced_objects(text)}
+  verdicts = [obj for _start, obj in sorted(candidates.items()) if _is_verdict(obj)]
+  return verdicts[-1] if verdicts else None
 
 
-def _fenced_objects(text: str) -> list[Any]:
-  objects = []
-  for block in _FENCED_BLOCK.findall(text):
+def _fenced_objects(text: str) -> dict[int, Any]:
+  """JSON values of fenced blocks, keyed by where each value starts in ``text``."""
+  objects = {}
+  for match in _FENCED_BLOCK.finditer(text):
+    block = match.group(1)
     try:
-      objects.append(json.loads(block))
+      value = json.loads(block)
     except json.JSONDecodeError:
       continue
+    objects[match.start(1) + len(block) - len(block.lstrip())] = value
   return objects
 
 
-def _balanced_objects(text: str) -> list[Any]:
-  """Every top-level JSON object in ``text``, skipping spans that do not decode."""
+def _balanced_objects(text: str) -> dict[int, Any]:
+  """Every top-level JSON object in ``text``, keyed by its start offset.
+
+  Spans that do not decode are skipped.
+  """
   decoder = json.JSONDecoder()
-  objects = []
+  objects = {}
   index = text.find("{")
   while index != -1:
     try:
@@ -789,7 +796,7 @@ def _balanced_objects(text: str) -> list[Any]:
     except json.JSONDecodeError:
       index = text.find("{", index + 1)
       continue
-    objects.append(obj)
+    objects[index] = obj
     index = text.find("{", end)
   return objects
 

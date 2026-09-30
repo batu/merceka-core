@@ -220,6 +220,12 @@ def test_parse_takes_the_last_fenced_verdict():
   assert parse_judge_response(text)["score"] == 38
 
 
+def test_parse_prefers_a_later_unfenced_verdict_over_a_fenced_draft():
+  text = f"```json\n{_verdict(96)}\n```\nRevised after zooming: {_verdict(38)}"
+
+  assert parse_judge_response(text)["score"] == 38
+
+
 def test_parse_keeps_recurring_checks_despite_a_trailing_brace_note():
   # Review repro r6 C: every recurring check used to become None.
   checks = [
