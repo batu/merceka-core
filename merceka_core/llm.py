@@ -13,11 +13,13 @@ __all__ = [
 ]
 
 import contextlib
+import contextvars
 import json
 import logging
 import os
 import subprocess
 import tempfile
+import threading
 import httpx
 import time
 import urllib.error
@@ -202,6 +204,40 @@ def _stop_stream_process(process: subprocess.Popen, *, finished: bool) -> bool:
     except subprocess.TimeoutExpired:
       _logger.error("Claude CLI pid %s did not exit after SIGKILL", process.pid)
   return True
+
+
+class _StreamCancel:
+  """Lets astream_generate's consumer stop the CLI child of its producer thread.
+
+  The producer thread can block reading a stalled CLI, where no stop flag is
+  ever checked. Terminating the child ends that read with EOF, so the thread
+  finishes and the stream's own teardown reaps the child.
+  """
+
+  def __init__(self):
+    self._lock = threading.Lock()
+    self._process: subprocess.Popen | None = None
+    self.cancelled = False
+
+  def attach(self, process: subprocess.Popen) -> None:
+    with self._lock:
+      self._process = process
+      cancelled = self.cancelled
+    if cancelled:
+      process.terminate()
+
+  def cancel(self) -> None:
+    with self._lock:
+      self.cancelled = True
+      process = self._process
+    if process is not None and process.poll() is None:
+      process.terminate()
+
+
+# Set by astream_generate in its producer thread's context; None for sync streams.
+_stream_cancel: contextvars.ContextVar[_StreamCancel | None] = contextvars.ContextVar(
+  "merceka_llm_stream_cancel", default=None,
+)
 
 
 def _read_pipe_tail(pipe, limit: int) -> str:
@@ -1242,6 +1278,9 @@ class LLM:
         env=env,
         cwd=cwd,
       )
+      cancel = _stream_cancel.get()
+      if cancel is not None:
+        cancel.attach(process)
       finished = False  # stdout was read to a result event or to EOF
       result_seen = False
       result_error: str | None = None
@@ -1316,9 +1355,14 @@ class LLM:
       return
     except (FileNotFoundError, OSError, subprocess.CalledProcessError) as e:
       # Once chunks reached the consumer, a fallback answer would be appended
-      # to a partial one, so the failure is raised instead. The stream ignores
-      # Python tools, so this is a primary failure even with tools set.
-      target = self._fallback_call(kwargs) if self.fallback and not streamed else None
+      # to a partial one, so the failure is raised instead; nor is a paid
+      # fallback started for a consumer that abandoned the stream. The stream
+      # ignores Python tools, so this is a primary failure even with tools set.
+      cancel = _stream_cancel.get()
+      abandoned = cancel is not None and cancel.cancelled
+      if not self.fallback or streamed or abandoned:
+        raise
+      target = self._fallback_call(kwargs)
       if target is None:
         raise
       _logger.warning("Claude stream failed (%s), falling back", type(e).__name__)
@@ -1330,12 +1374,12 @@ class LLM:
   async def astream_generate(self, message: str, **kwargs):
     """Async streaming generator. Runs the sync stream in a worker thread."""
     import asyncio
-    import threading
 
     loop = asyncio.get_running_loop()
     q: asyncio.Queue = asyncio.Queue()
     sentinel = object()
     stop = threading.Event()  # set when the consumer abandons early
+    cancel = _StreamCancel()
 
     def _put(item):
       try:
@@ -1344,6 +1388,7 @@ class LLM:
         pass  # loop closed during teardown; nothing left to deliver to
 
     def _run():
+      _stream_cancel.set(cancel)  # inside the copied context below, so it doesn't leak
       try:
         for chunk in self.stream_generate(message, **kwargs):
           if stop.is_set():
@@ -1354,7 +1399,8 @@ class LLM:
       finally:
         _put(sentinel)
 
-    producer = loop.run_in_executor(None, _run)
+    # A copied context: the cancel handle, and cost attribution, reach the thread.
+    producer = loop.run_in_executor(None, contextvars.copy_context().run, _run)
     try:
       while True:
         item = await q.get()
@@ -1365,6 +1411,7 @@ class LLM:
         yield item
     finally:
       stop.set()  # bounds the finalizer wait to at most one in-flight chunk
+      cancel.cancel()  # a producer blocked reading a stalled CLI gets EOF
       await asyncio.shield(producer)
 
   def generate_with_video(

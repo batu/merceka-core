@@ -269,6 +269,12 @@ print(json.dumps(event), flush=True)
 time.sleep(600)  # a stalled CLI: no output, no exit
 """
 
+_SILENT_CLI = """
+import sys, time
+sys.stdin.read()
+time.sleep(600)  # a stalled CLI that never writes anything
+"""
+
 
 @pytest.fixture
 def real_cli(monkeypatch):
@@ -317,3 +323,71 @@ class TestClaudeStreamRealProcess:
       if started[0].poll() is None:
         started[0].kill()
         closer.join(timeout=10)
+
+  def test_abandoned_astream_terminates_a_stalled_child(self, real_cli):
+    """Card 03 B: the producer thread is blocked reading a stalled CLI, so the
+    consumer's teardown (aclose) waited on the child indefinitely."""
+    import asyncio
+
+    started = real_cli(_STALLED_CLI)
+
+    async def consume():
+      agen = LLM("claude/sonnet").astream_generate("q")
+      async for chunk in agen:
+        assert chunk == "tick"
+        break
+      await agen.aclose()
+
+    async def main():
+      try:
+        await asyncio.wait_for(consume(), timeout=5)
+      finally:
+        if started and started[0].poll() is None:
+          started[0].kill()  # unblock the producer thread if teardown failed
+
+    start = time.monotonic()
+    asyncio.run(main())
+    assert time.monotonic() - start < 5
+    assert started[0].returncode == -15  # terminated by the teardown, not killed above
+
+  def test_astream_cancelled_before_output_does_not_start_the_fallback(
+    self, real_cli, fallback_answer,
+  ):
+    import asyncio
+
+    started = real_cli(_SILENT_CLI)
+
+    async def main():
+      agen = LLM("claude/sonnet", fallback="openrouter/fb").astream_generate("q")
+      try:
+        with pytest.raises(asyncio.TimeoutError):
+          await asyncio.wait_for(agen.__anext__(), timeout=0.5)
+      finally:
+        if started and started[0].poll() is None:
+          started[0].kill()
+
+    asyncio.run(asyncio.wait_for(main(), timeout=10))
+    assert started[0].returncode == -15
+    assert fallback_answer == []
+
+  def test_astream_producer_keeps_cost_attribution(self, monkeypatch):
+    """The producer thread runs in a copy of the caller's context, so
+    costs.attribution() also covers spend inside a streamed fallback."""
+    import asyncio
+
+    from merceka_core import costs
+
+    seen = []
+
+    def stream(self, *_args, **_kwargs):
+      seen.append(costs._attribution_var.get())
+      yield "x"
+
+    monkeypatch.setattr(LLM, "stream_generate", stream)
+
+    async def main():
+      with costs.attribution({"session": "s1"}):
+        return [c async for c in LLM("claude/sonnet").astream_generate("q")]
+
+    assert asyncio.run(main()) == ["x"]
+    assert seen == [{"session": "s1"}]
