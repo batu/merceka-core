@@ -10,16 +10,22 @@ differences are explicit parameters below, not parallel copies.
 
 from __future__ import annotations
 
-import os
 from typing import Any
+
+from merceka_core._env import scrubbed_env
 
 __all__ = [
   "claude_command",
   "claude_env",
   "claude_stream_text_delta",
+  "codex_env",
   "codex_exec_command",
   "is_claude_result_event",
+  "scrubbed_env",
 ]
+
+# Read-only tools that locked-down Claude sessions confine to the working directories.
+_FENCED_READ_TOOLS = frozenset({"Read", "Grep", "Glob"})
 
 
 def claude_command(
@@ -32,7 +38,28 @@ def claude_command(
   accept_edits: bool = False,
   binary: str = "claude",
 ) -> list[str]:
-  """Build a `claude -p` command. The prompt is passed on stdin by the caller."""
+  """Build a `claude -p` command. The prompt is passed on stdin by the caller.
+
+  Without ``accept_edits`` (plain text calls and read-only agents), the session is
+  locked down:
+
+  - ``allowed_tools`` is the complete tool set (``--tools``). An empty list means no
+    tools at all.
+  - ``--permission-mode dontAsk`` denies anything that would prompt, instead of
+    inheriting the user's ``defaultMode``.
+  - Read, Grep and Glob are not pre-approved. Under ``dontAsk`` they run inside the
+    working directory and the ``--add-dir`` directories, and are denied everywhere
+    else, so a read-only session cannot open ``~/.ssh`` or a ``.env``. Other listed
+    tools are pre-approved as given.
+  - Only user-level settings load, so project hooks, env blocks and permission rules
+    from the working directory don't apply.
+  - No MCP servers connect.
+
+  ``--allowedTools`` on its own only pre-approves tools; it never removed the others.
+
+  With ``accept_edits`` (write agents), ``allowed_tools`` is pre-approved under
+  ``acceptEdits`` and the rest of the session keeps Claude Code's defaults.
+  """
   cmd = [binary, "-p", "--model", model]
   if stream:
     cmd.extend([
@@ -42,6 +69,18 @@ def claude_command(
     ])
   if accept_edits:
     cmd.extend(["--permission-mode", "acceptEdits"])
+    pre_approved = list(allowed_tools)
+  else:
+    cmd.extend([
+      "--permission-mode", "dontAsk",
+      "--setting-sources", "user",
+      "--strict-mcp-config",
+      "--disallowedTools", "mcp__*",
+      # --tools takes bare names; a scoped rule such as Bash(git log *) keeps its
+      # scope in --allowedTools below.
+      "--tools", ",".join(dict.fromkeys(tool.split("(", 1)[0] for tool in allowed_tools)),
+    ])
+    pre_approved = [tool for tool in allowed_tools if tool not in _FENCED_READ_TOOLS]
   if system_prompt:
     # --append-system-prompt (not --system-prompt): appends to Claude Code's
     # default prompt instead of replacing it. Full-replace strips the dynamic
@@ -52,15 +91,22 @@ def claude_command(
     cmd.extend(["--append-system-prompt", system_prompt])
   for d in add_dirs:
     cmd.extend(["--add-dir", str(d)])
-  if allowed_tools:
-    cmd.extend(["--allowedTools", ",".join(allowed_tools)])
+  if pre_approved:
+    cmd.extend(["--allowedTools", ",".join(pre_approved)])
   return cmd
 
 
 def claude_env() -> dict[str, str]:
-  """Environment for Claude CLI runs: blank the API key so the CLI uses
-  subscription auth instead of accidental API billing."""
-  return {**os.environ, "ANTHROPIC_API_KEY": ""}
+  """Environment for Claude CLI runs: credentials withheld, and the API key
+  blanked so the CLI uses subscription auth instead of accidental API billing.
+  ``CLAUDE_CODE_OAUTH_TOKEN`` is the subscription credential, so it is kept."""
+  return scrubbed_env(keep=("CLAUDE_CODE_OAUTH_TOKEN",), ANTHROPIC_API_KEY="")
+
+
+def codex_env() -> dict[str, str]:
+  """Environment for Codex CLI runs: credentials withheld, so the CLI uses its
+  ChatGPT login (``~/.codex/auth.json``) instead of an inherited API key."""
+  return scrubbed_env()
 
 
 def codex_exec_command(

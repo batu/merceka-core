@@ -60,7 +60,12 @@ class TestClaudeCall:
         mock_run.assert_called_once()
         args = mock_run.call_args
         cmd = args[0][0] if args[0] else args[1].get("args")
-        assert cmd == ["claude", "-p", "--model", "sonnet", "--append-system-prompt", "Be helpful"]
+        assert cmd == [
+            "claude", "-p", "--model", "sonnet",
+            "--permission-mode", "dontAsk", "--setting-sources", "user",
+            "--strict-mcp-config", "--disallowedTools", "mcp__*", "--tools", "",
+            "--append-system-prompt", "Be helpful",
+        ]
         assert args[1]["input"] == "Hi"
         assert args[1]["env"]["ANTHROPIC_API_KEY"] == ""
         assert result == "Hello!"

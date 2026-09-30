@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
+from merceka_core._env import scrubbed_env
 from merceka_core.agent import (
   AgentComplete,
   AgentProfile,
@@ -47,6 +48,7 @@ class PiAgentProvider:
       text=True,
       timeout=self.timeout_seconds,
       cwd=str(request.roots[0]),
+      env=scrubbed_env(),
     )
     raw_events = tuple(self._raw_events_from_stdout(result.stdout))
     if result.returncode != 0:
@@ -73,6 +75,7 @@ class PiAgentProvider:
       text=True,
       bufsize=1,
       cwd=str(request.roots[0]),
+      env=scrubbed_env(),
     )
     if process.stdin is None or process.stdout is None or process.stderr is None:
       raise ProviderFailure("Pi stream did not expose stdio pipes")

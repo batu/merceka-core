@@ -52,6 +52,7 @@ class CodexAgentProvider:
         text=True,
         timeout=self.timeout_seconds,
         cwd=str(request.roots[0]),
+        env=_cli.codex_env(),
       )
       raw_events = tuple(self._raw_events_from_stdout(result.stdout))
       if result.returncode != 0:
@@ -80,6 +81,7 @@ class CodexAgentProvider:
       text=True,
       bufsize=1,
       cwd=str(request.roots[0]),
+      env=_cli.codex_env(),
     )
     if process.stdin is None or process.stdout is None or process.stderr is None:
       raise ProviderFailure("Codex stream did not expose stdio pipes")

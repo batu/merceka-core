@@ -12,7 +12,6 @@ __all__ = [
   "generate_with_search_grounding",
 ]
 
-import dotenv
 import json
 import logging
 import os
@@ -21,12 +20,13 @@ import httpx
 import time
 import urllib.error
 
+from merceka_core import _env
+
+_env.load_provider_keys()
+
 _logger = logging.getLogger(__name__)
 
 CLAUDE_CLI_TIMEOUT = 120  # seconds
-
-
-dotenv.load_dotenv()
 
 
 from typing import Optional
@@ -72,20 +72,10 @@ from pathlib import Path
 from typing import Callable
 
 
-def _chat_one(model: str, message: str, think: Optional[bool] = None, **kwargs):
-  """Chat with the model."""
-  return ollama_chat(
-    model=model, think=think, messages=[create_message(message)], **kwargs
-  ).message.content
-
-
 from pydantic import BaseModel
 
 
 from ollama import ChatResponse
-import litellm
-
-litellm.suppress_debug_info = True  # Stop printing "Provider List" spam
 from urllib.request import Request, urlopen
 
 
@@ -865,6 +855,7 @@ class LLM:
       capture_output=True,
       text=True,
       timeout=timeout,
+      env=_cli.codex_env(),
     )
     if result.returncode != 0:
       raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)

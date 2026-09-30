@@ -40,12 +40,21 @@ async def test_claude_agent_run_builds_read_only_command(tmp_path: Path):
     "-p",
     "--model",
     "sonnet",
+    *[
+    "--permission-mode",
+    "dontAsk",
+    "--setting-sources",
+    "user",
+    "--strict-mcp-config",
+    "--disallowedTools",
+    "mcp__*",
+    "--tools",
+    "Read,Grep,Glob",
+  ],
     "--append-system-prompt",
     "Read before answering.",
     "--add-dir",
     str(tmp_path),
-    "--allowedTools",
-    "Read,Grep,Glob",
   ]
   assert mock_run.call_args.kwargs["input"] == "What is in the book?"
   assert mock_run.call_args.kwargs["cwd"] == str(tmp_path)
@@ -86,8 +95,13 @@ async def test_claude_agent_run_builds_write_command(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_claude_read_only_command_is_unchanged(tmp_path: Path):
-  """Regression guard: READ_ONLY must assemble the exact historical command line."""
+async def test_claude_read_only_command_is_locked_down(tmp_path: Path):
+  """READ_ONLY must restrict the tool set, not just pre-approve Read/Grep/Glob.
+
+  The historical command passed only ``--allowedTools Read,Grep,Glob``. That
+  pre-approves those tools but leaves Bash, Edit and Write available under the
+  user's ``defaultMode`` (``auto`` on both machines).
+  """
   provider = ClaudeCodeAgentProvider(model="sonnet")
 
   with patch("subprocess.run") as mock_run:
@@ -95,19 +109,16 @@ async def test_claude_read_only_command_is_unchanged(tmp_path: Path):
     await provider.run(_request(tmp_path))
 
   cmd = mock_run.call_args.args[0]
-  assert "--permission-mode" not in cmd
-  assert cmd == [
-    "claude",
-    "-p",
-    "--model",
-    "sonnet",
-    "--append-system-prompt",
-    "Read before answering.",
-    "--add-dir",
-    str(tmp_path),
-    "--allowedTools",
-    "Read,Grep,Glob",
-  ]
+  assert cmd[cmd.index("--tools") + 1] == "Read,Grep,Glob"
+  assert cmd[cmd.index("--permission-mode") + 1] == "dontAsk"
+  assert cmd[cmd.index("--setting-sources") + 1] == "user"
+  assert cmd[cmd.index("--disallowedTools") + 1] == "mcp__*"
+  assert "--strict-mcp-config" in cmd
+  # Read/Grep/Glob are not pre-approved: under dontAsk they stay confined to the
+  # working directories instead of reaching ~/.ssh or a .env elsewhere.
+  assert "--allowedTools" not in cmd
+  for tool in ("Bash", "Edit", "Write"):
+    assert tool not in cmd[cmd.index("--tools") + 1].split(",")
 
 
 @pytest.mark.asyncio

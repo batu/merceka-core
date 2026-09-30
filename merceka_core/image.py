@@ -548,7 +548,12 @@ def _grok_run(prompt: str, job_dir: str) -> tuple[str, dict]:
     "--sandbox", "workspace", "--always-approve", "--no-plan", "--no-subagents",
     "--disable-web-search", "--max-turns", "6", "--verbatim", "--output-format", "json",
   ]
-  proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_GROK_TIMEOUT_S)
+  from merceka_core._env import scrubbed_env
+
+  proc = subprocess.run(
+    cmd, capture_output=True, text=True, timeout=_GROK_TIMEOUT_S,
+    env=scrubbed_env(keep=("XAI_API_KEY",)),
+  )
   if proc.returncode != 0:
     raise RuntimeError(f"grok CLI failed ({proc.returncode}): {proc.stderr[-500:]}")
   try:

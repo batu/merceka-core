@@ -22,6 +22,7 @@ from typing import Any, Callable
 import httpx
 import shutil
 
+from merceka_core import _cli
 from merceka_core.vision import zoom_judge as _zoom_judge
 import subprocess
 import tempfile as _tempfile
@@ -468,6 +469,7 @@ def _call_codex_cli_judge(
     args.append("-")
     completed = subprocess.run(
       args, input=prompt, capture_output=True, text=True, timeout=600,
+      env=_cli.codex_env(),
     )
   except (OSError, subprocess.TimeoutExpired):
     return {"ok": False, "reason": "cli-error"}
@@ -531,18 +533,23 @@ def _call_claude_cli_judge(
       "Output ONLY the JSON object. No preamble, no commentary, no code fence."
     )
 
-    allow_dirs: list[str] = []
-    for parent in dict.fromkeys(str(p.parent) for p in paths):
-      allow_dirs.extend(["--add-dir", parent])
-
     with _tempfile.TemporaryDirectory(prefix="critique-claude-") as workdir:
+      # Same locked-down session as read-only agents: Read is the only tool, and
+      # it only reaches the scratch cwd and the images' directories.
+      cmd = _cli.claude_command(
+        judge["model"],
+        add_dirs=list(dict.fromkeys(str(p.parent) for p in paths)),
+        allowed_tools=("Read",),
+        binary=binary,
+      )
       completed = subprocess.run(
-        [binary, "-p", "--model", judge["model"], "--allowedTools", "Read", *allow_dirs],
+        cmd,
         input=prompt,
         capture_output=True,
         text=True,
         timeout=600,
         cwd=workdir,
+        env=_cli.claude_env(),
       )
   except (OSError, subprocess.TimeoutExpired):
     return {"ok": False, "reason": "cli-error"}

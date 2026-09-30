@@ -11,8 +11,7 @@ import logging
 import time
 from pathlib import Path
 
-import dotenv
-
+from merceka_core import _env
 from merceka_core.errors import (
   VideoBackendError,
   VideoNotFoundError,
@@ -27,7 +26,7 @@ from merceka_core.retry import (
 
 _logger = logging.getLogger(__name__)
 
-dotenv.load_dotenv()  # _gemini_client reads GOOGLE_API_KEY/GEMINI_API_KEY from env
+_env.load_provider_keys()  # _gemini_client reads GOOGLE_API_KEY/GEMINI_API_KEY from env
 
 
 def _gemini_client():
