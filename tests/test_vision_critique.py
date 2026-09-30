@@ -764,6 +764,77 @@ def test_unreachable_quorum_raises_before_any_judge_call(monkeypatch):
   assert client.calls == []  # type: ignore[attr-defined]
 
 
+def test_explicit_string_roster_keeps_registry_transports(monkeypatch):
+  # Review repro r1: plain ids lost cli/effort/api and went to OpenRouter as bare models.
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  fake_run = _fake_cli_run({"codex": (0, _content(40)), "claude": (0, _content(40))})
+  monkeypatch.setattr(critique_module.subprocess, "run", fake_run)
+  client = _client_for([_content(92)])
+
+  result = run_critique(
+    [PNG_BYTES],
+    judges=[
+      "codex/gpt-5.6-terra",
+      "anthropic/claude-fable-5",
+      "anthropic/claude-opus-5",
+      "google/gemini-3.6-flash",
+    ],
+    client=client,
+  )
+
+  assert result["participants"] == 4
+  assert result["score"] == 40
+  sent = [json.loads(request.content)["model"] for request in client.calls]  # type: ignore[attr-defined]
+  assert sent == ["google/gemini-3.6-flash"]
+  binaries = [Path(cmd[0]).name for cmd, _kwargs in fake_run.calls]  # type: ignore[attr-defined]
+  assert binaries == ["codex", "claude", "claude"]
+  codex_cmd = fake_run.calls[0][0]  # type: ignore[attr-defined]
+  assert any("model_reasoning_effort" in arg and "max" in arg for arg in codex_cmd)
+
+
+def test_explicit_roster_normalizes_like_the_default_roster():
+  from_registry = critique_module._normalize_judges(None)
+  explicit = critique_module._normalize_judges([judge["id"] for judge in from_registry])
+
+  assert explicit == from_registry
+
+
+@pytest.mark.parametrize(
+  "item",
+  [
+    "anthropic/claude-fable-5-zoom",
+    {"id": "anthropic/claude-fable-5-zoom", "enabled": True},
+  ],
+)
+def test_explicit_roster_enables_registry_judges_disabled_by_default(item):
+  (judge,) = critique_module._normalize_judges([item])
+
+  assert judge == {
+    "id": "anthropic/claude-fable-5-zoom",
+    "model": "claude-fable-5",
+    "api": "anthropic-zoom",
+    "enabled": True,
+  }
+
+
+def test_partial_dict_overrides_registry_fields():
+  (judge,) = critique_module._normalize_judges([{"id": "codex/gpt-5.6-terra", "effort": "low"}])
+
+  assert judge == {
+    "id": "codex/gpt-5.6-terra",
+    "model": "gpt-5.6-terra",
+    "cli": "codex",
+    "effort": "low",
+    "enabled": True,
+  }
+
+
+def test_unknown_string_judge_goes_to_openrouter_by_id():
+  (judge,) = critique_module._normalize_judges(["vendor/new-model"])
+
+  assert judge == {"id": "vendor/new-model", "model": "vendor/new-model", "enabled": True}
+
+
 def test_budget_floor_uses_openrouter_credits(monkeypatch):
   monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
 

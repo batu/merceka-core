@@ -251,7 +251,10 @@ def critique(
       against this target; otherwise they use ``spec`` as the target.
     spec: Optional written target/specification.
     judges: Optional judge roster. Items may be strings or dicts with
-      ``id``, ``model``, and optional ``enabled``.
+      ``id``, ``model``, and optional ``enabled``. A registry id, given as a
+      string or a partial dict, keeps the registry's model and transport
+      (``cli``, ``effort``, ``api``); fields set in the dict override them.
+      Listing a judge enables it unless its dict sets ``enabled: False``.
     budget_check: Optional callable run before each billable judge call. A
       falsy return skips the current and remaining judges with reason
       ``"budget"``.
@@ -992,35 +995,27 @@ def _normalize_judges(judges: list[str | dict[str, Any]] | None) -> list[dict[st
   source = judges if judges is not None else [j for j in JUDGE_REGISTRY if j.get("enabled", True)]
   normalized = []
   registry_by_id = {j["id"]: j for j in JUDGE_REGISTRY}
-  for item in source:
-    if isinstance(item, str):
-      registry_item = registry_by_id.get(item)
-      if registry_item and judges is None:
-        normalized.append(dict(registry_item))
-      else:
-        normalized.append(
-          {
-            "id": item,
-            "model": registry_item.get("model", item) if registry_item else item,
-            "enabled": True,
-          }
-        )
-      continue
-
-    model = item.get("model") or item.get("id")
-    judge_id = item.get("id") or model
+  for raw in source:
+    item: dict[str, Any] = {"id": raw} if isinstance(raw, str) else raw
+    # A registry id, as a plain string or a partial dict, keeps the registry's
+    # model and transport; fields the caller sets override them. Without this,
+    # "codex/gpt-5.6-terra" went to OpenRouter as a bare model id.
+    merged = {**registry_by_id.get(item.get("id") or "", {}), **item}
+    model = merged.get("model") or merged.get("id")
+    judge_id = merged.get("id") or model
     if not model or not judge_id:
-      raise ValueError(f"invalid judge registry item: {item!r}")
+      raise ValueError(f"invalid judge registry item: {raw!r}")
     normalized_item = {
       "id": str(judge_id),
       "model": str(model),
+      # Listing a judge enables it, even one the registry disables by default.
       "enabled": bool(item.get("enabled", True)),
     }
     # Transport selectors must survive normalization or dispatch falls back
     # to the default OpenRouter path.
     for transport_key in ("cli", "effort", "api"):
-      if transport_key in item:
-        normalized_item[transport_key] = item[transport_key]
+      if transport_key in merged:
+        normalized_item[transport_key] = merged[transport_key]
     normalized.append(normalized_item)
   return normalized
 
