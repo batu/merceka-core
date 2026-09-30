@@ -29,6 +29,7 @@ _env.load_provider_keys()
 _logger = logging.getLogger(__name__)
 
 CLAUDE_CLI_TIMEOUT = 120  # seconds
+OPENROUTER_HTTP_TIMEOUT = 120  # seconds, when neither LLM(timeout=) nor timeout= is given
 # Streaming Claude CLI teardown. A child whose output ended gets the grace period
 # to exit on its own; SIGTERM and then SIGKILL follow, each wait bounded, so an
 # abandoned or stuck stream can never block its consumer's teardown.
@@ -587,7 +588,7 @@ class LLM:
 
   def _cloud_call_raw(self, messages: list[dict], **kwargs) -> dict:
     """Call cloud model and return the raw assistant message dict."""
-    headers, payload = self._build_openrouter_request(messages, **kwargs)
+    headers, payload, timeout = self._build_openrouter_request(messages, **kwargs)
     if self._tool_schemas:
       payload["tools"] = self._tool_schemas
 
@@ -597,7 +598,7 @@ class LLM:
       headers=headers,
       method="POST",
     )
-    with urlopen(request, timeout=120) as response:
+    with urlopen(request, timeout=timeout) as response:
       body = json.load(response)
     self._record_openrouter_usage(payload["model"], body)
     msg = body["choices"][0]["message"]
@@ -611,11 +612,11 @@ class LLM:
 
   async def _acloud_call_raw(self, messages: list[dict], **kwargs) -> dict:
     """Async cloud call returning raw assistant message dict."""
-    headers, payload = self._build_openrouter_request(messages, **kwargs)
+    headers, payload, timeout = self._build_openrouter_request(messages, **kwargs)
     if self._tool_schemas:
       payload["tools"] = self._tool_schemas
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=timeout) as client:
       response = await client.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers=headers,
@@ -736,7 +737,15 @@ class LLM:
     """Async cloud call."""
     return await self._aopenrouter_call(messages, **kwargs)
 
-  def _build_openrouter_request(self, messages: list[dict], **kwargs) -> tuple[dict, dict]:
+  def _build_openrouter_request(
+    self, messages: list[dict], **kwargs,
+  ) -> tuple[dict, dict, float]:
+    """Headers, JSON payload and HTTP timeout (seconds) for one OpenRouter request.
+
+    ``timeout`` is a client setting, never part of the request body: the
+    per-call kwarg wins, then ``LLM(timeout=)``, then ``OPENROUTER_HTTP_TIMEOUT``.
+    """
+    timeout = kwargs.pop("timeout", None) or self.timeout or OPENROUTER_HTTP_TIMEOUT
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
       raise RuntimeError("OPENROUTER_API_KEY is not configured")
@@ -777,7 +786,7 @@ class LLM:
           plugins.append({"id": "response-healing"})
         payload["plugins"] = plugins
 
-    return headers, payload
+    return headers, payload, timeout
 
   def _parse_openrouter_body(self, body: dict) -> str | OutputSchema:
     return self._parse_response(body["choices"][0]["message"]["content"])
@@ -802,7 +811,7 @@ class LLM:
     )
 
   def _openrouter_call(self, messages: list[dict], **kwargs) -> str | OutputSchema:
-    headers, payload = self._build_openrouter_request(messages, **kwargs)
+    headers, payload, timeout = self._build_openrouter_request(messages, **kwargs)
     data = json.dumps(payload).encode("utf-8")
 
     for attempt in range(_RETRY_MAX_ATTEMPTS):
@@ -813,7 +822,7 @@ class LLM:
         method="POST",
       )
       try:
-        with urlopen(request, timeout=120) as response:
+        with urlopen(request, timeout=timeout) as response:
           body = json.load(response)
         self._record_openrouter_usage(payload["model"], body)
         return self._parse_openrouter_body(body)
@@ -845,11 +854,11 @@ class LLM:
   async def _aopenrouter_call(self, messages: list[dict], **kwargs) -> str | OutputSchema:
     import asyncio
 
-    headers, payload = self._build_openrouter_request(messages, **kwargs)
+    headers, payload, timeout = self._build_openrouter_request(messages, **kwargs)
 
     for attempt in range(_RETRY_MAX_ATTEMPTS):
       try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
           response = await client.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers=headers,
