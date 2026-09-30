@@ -172,6 +172,71 @@ class TestGenerateDispatch:
     assert hits == []
 
 
+# --- chat() uses the same decision and the same decision -> transport map ---
+
+CHAT_TABLE = [
+  ("claude/sonnet", None, None, "claude"),
+  ("codex/gpt-5", None, None, "codex"),
+  ("openrouter/x", None, None, "openrouter"),
+  ("gemma4:26b", None, None, "local"),
+  ("openrouter/x", TOOLS, None, "tool_loop"),
+  ("gemma4:26b", TOOLS, None, "tool_loop"),
+  ("claude/sonnet", TOOLS, ["WebSearch"], "claude"),
+  ("codex/gpt-5", TOOLS, ["WebSearch"], "codex"),
+]
+
+
+class TestChatDispatch:
+  @pytest.mark.parametrize("model,tools,allowed_tools,expected", CHAT_TABLE)
+  def test_chat_hits_the_generate_transport(
+    self, monkeypatch, model, tools, allowed_tools, expected,
+  ):
+    """Regression: codex/ chat() fell through to Ollama, and claude/codex with
+    tools + allowed_tools ran the Python tool loop against Ollama."""
+    llm = LLM(model, tools=tools, allowed_tools=allowed_tools)
+    hits = _spy_transports(monkeypatch, llm)
+    llm.generate("hi")
+    assert llm.chat("hi") == "ok"
+    assert hits == [(expected, model), (expected, model)]
+
+  @pytest.mark.parametrize("model", ["claude/sonnet", "codex/gpt-5"])
+  def test_cli_tools_with_fallback_chat_runs_the_fallback_tool_loop(self, monkeypatch, model):
+    llm = LLM(model, tools=TOOLS, fallback="openrouter/fb")
+    hits = _spy_transports(monkeypatch, llm)
+    assert llm.chat("hi") == "ok"
+    assert hits == [("tool_loop", "openrouter/fb")]
+
+  @pytest.mark.parametrize("model", ["claude/sonnet", "codex/gpt-5"])
+  def test_cli_tools_without_escape_raises_before_touching_history(self, monkeypatch, model):
+    llm = LLM(model, tools=TOOLS, system_prompt="sp")
+    hits = _spy_transports(monkeypatch, llm)
+    with pytest.raises(ValueError, match="allowed_tools"):
+      llm.chat("hi")
+    assert hits == []
+    assert llm.messages == [{"role": "system", "content": "sp"}]
+
+  def test_codex_chat_sends_history_and_records_replies(self, monkeypatch):
+    prompts = []
+
+    def fake_run(_cmd, **kwargs):
+      prompts.append(kwargs["input"])
+
+      class Result:
+        returncode = 0
+        stdout = f"reply {len(prompts)}"
+        stderr = ""
+      return Result()
+
+    monkeypatch.setattr(llm_module.subprocess, "run", fake_run)
+    llm = LLM("codex/gpt-5", system_prompt="SYS")
+    assert llm.chat("first") == "reply 1"
+    assert llm.chat("second") == "reply 2"
+    assert prompts[1] == "SYS\n\nuser: first\nassistant: reply 1\nuser: second"
+    assert [m["role"] for m in llm.messages] == [
+      "system", "user", "assistant", "user", "assistant"]
+    assert llm.messages[-1]["content"] == "reply 2"
+
+
 # --- fallback constructor fidelity ---
 
 class TestFallbackFidelity:

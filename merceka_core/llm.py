@@ -327,48 +327,52 @@ class LLM:
   def _generate_primary(self, message: str, **kwargs) -> str | OutputSchema:
     """Primary generation dispatch."""
     messages = [create_message(self.system_prompt, "system"), create_message(message, "user")]
-    backend = self._select_backend()
+    response, _ = self._run_backend(self._select_backend(), messages, message, **kwargs)
+    return response
+
+  def _run_backend(
+    self, backend: str, messages: list[dict], cli_prompt: str, **kwargs,
+  ) -> tuple[str | OutputSchema, list[dict] | None]:
+    """Map a ``_select_backend()`` decision to its sync transport.
+
+    The one sync decision -> transport map, shared by generate and chat.
+    ``messages`` feed the HTTP and Ollama backends; the one-shot CLI backends get
+    ``cli_prompt`` instead (their system prompt travels separately). Returns the
+    response and, for the Python tool loop, the full message trace (else None).
+    """
     if backend == _BACKEND_TOOLS_FALLBACK:
       _logger.info(
         "%s can't run Python tool callables, using fallback %s", self.model_name, self.fallback
       )
-      return self._fallback_llm().generate(message, **kwargs)
+      fb = self._fallback_llm()
+      return fb._run_backend(fb._select_backend(), messages, cli_prompt, **kwargs)
     if backend == _BACKEND_CLAUDE:
-      return self._claude_call(message, **kwargs)
+      return self._claude_call(cli_prompt, **kwargs), None
     if backend == _BACKEND_CODEX:
-      return self._codex_call(message, **kwargs)
+      return self._codex_call(cli_prompt, **kwargs), None
     if backend == _BACKEND_TOOL_LOOP:
-      text, _ = self._run_tool_loop(messages, **kwargs)
-      return text
+      return self._run_tool_loop(messages, **kwargs)
     if backend == _BACKEND_OPENROUTER:
-      return self._cloud_call(messages, **kwargs)
-    return self._local_call(messages, **kwargs)
+      return self._cloud_call(messages, **kwargs), None
+    return self._local_call(messages, **kwargs), None
 
   def chat(self, message: str, **kwargs) -> str | OutputSchema:
     """Multi-turn chat. Maintains conversation history."""
-    if self.use_gemini:
-      self._select_backend()  # raises with the Gemini guidance message
+    backend = self._select_backend()  # raises before history changes
     self.messages.append(create_message(message, "user"))
+    # CLI providers are one-shot: they get the history as text, without the
+    # system prompt, which they receive separately.
+    history = "\n".join(
+      f"{m['role']}: {m['content']}"
+      for m in self.messages
+      if m.get("content") and m["role"] != "system"
+    )
+    response, trace = self._run_backend(backend, list(self.messages), history, **kwargs)
 
-    if self._tool_schemas:
-      text, self.messages = self._run_tool_loop(list(self.messages), **kwargs)
-      return text
-
-    if self.use_claude:
-      # Claude CLI is one-shot; send full history as context (exclude system, it's in --system-prompt)
-      history = "\n".join(
-        f"{m['role']}: {m['content']}"
-        for m in self.messages
-        if m.get("content") and m["role"] != "system"
-      )
-      response = self._claude_call(history, **kwargs)
-    elif self.use_openrouter:
-      response = self._cloud_call(self.messages, **kwargs)
-    else:
-      response = self._local_call(self.messages, **kwargs)
-
-    # Extract content for history: schema responses have .content, plain responses are strings
-    if isinstance(response, BaseModel):
+    if trace is not None:
+      self.messages = trace  # the tool loop's trace ends with the assistant reply
+    elif isinstance(response, BaseModel):
+      # Schema responses keep .content (or their JSON) in history.
       self.messages.append(create_message(self._response_to_history_content(response), "assistant"))
     else:
       self.messages.append(create_message(response, "assistant"))
