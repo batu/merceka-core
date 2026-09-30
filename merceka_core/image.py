@@ -289,10 +289,12 @@ def _edit_openai(
 
   original_size = image.size
   content_box = (0, 0, *original_size)
-  if _openai_native_edit_size(model, 16, 16) and not _openai_native_edit_size(model, *original_size):
-    padded, content_box = _pad_to_multiple_of_16(image)
+  # Gate on the padded size itself: an input that becomes a native size once its
+  # edges are padded to multiples of 16 keeps its own pixel grid.
+  if not _openai_native_edit_size(model, *original_size):
+    padded, padded_box = _pad_to_multiple_of_16(image)
     if _openai_native_edit_size(model, *padded.size):
-      image = padded
+      image, content_box = padded, padded_box
   # Encode input as PNG bytes for the multipart upload.
   buf = io.BytesIO()
   image.convert("RGBA").save(buf, format="PNG")
@@ -306,6 +308,9 @@ def _edit_openai(
   else:
     ar = "9:16" if h / w > 1.5 else "3:4"
   size = _openai_native_edit_size(model, w, h) or _openai_size(ar, "1K", model)
+  # The fixed sizes cover three aspects. Anything else would be charged and then
+  # refused by the aspect guard below, so refuse before the paid call.
+  _require_servable_aspect(size, image.size, model)
 
   files = {"image": ("input.png", buf.getvalue(), "image/png")}
   form = {
@@ -369,6 +374,28 @@ def _mask_to_openai_alpha(mask: Image.Image) -> bytes:
   return buf.getvalue()
 
 
+def _aspect_matches(size: tuple[int, int], original_size: tuple[int, int]) -> bool:
+  """True when ``size`` is within 2% of the aspect ratio of ``original_size``."""
+  ow, oh = original_size
+  rw, rh = size
+  in_aspect = ow / oh if oh else 1.0
+  out_aspect = rw / rh if rh else 1.0
+  return abs(out_aspect - in_aspect) / in_aspect <= 0.02
+
+
+def _require_servable_aspect(size: str, original_size: tuple[int, int], model: str) -> None:
+  """Raise ValueError before a paid call whose ``WxH`` output the aspect guard would refuse."""
+  dims = size.split("x")
+  if len(dims) != 2 or _aspect_matches((int(dims[0]), int(dims[1])), original_size):
+    return
+  ow, oh = original_size
+  raise ValueError(
+    f"{model} cannot edit a {ow}x{oh} input at its aspect: the closest supported size is "
+    f"{size}, which would have to be stretched. Refusing before the paid call; crop or pad "
+    "the input to a supported aspect first."
+  )
+
+
 def _resize_to_input_guarded(result: Image.Image, original_size: tuple[int, int]) -> Image.Image:
   """Resize a model output back to the input size, refusing aspect mismatches.
 
@@ -381,9 +408,7 @@ def _resize_to_input_guarded(result: Image.Image, original_size: tuple[int, int]
     return result
   ow, oh = original_size
   rw, rh = result.size
-  in_aspect = ow / oh if oh else 1.0
-  out_aspect = rw / rh if rh else 1.0
-  if abs(out_aspect - in_aspect) / in_aspect > 0.02:
+  if not _aspect_matches(result.size, original_size):
     raise RuntimeError(
       f"model returned aspect {rw}x{rh} for input {ow}x{oh} — refusing to stretch "
       "(would spatially warp content). Request an aspect-matched size or handle explicitly."
