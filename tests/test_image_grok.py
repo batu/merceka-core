@@ -8,6 +8,7 @@ FAKE_GROK_MODE picks a failure mode.
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -16,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from merceka_core import costs
+from merceka_core import image as image_module
 from merceka_core.image import generate_image
 
 CLI_SESSION = "01a0a9d0-d40b-77c2-b646-911373e8f29f"
@@ -108,3 +110,36 @@ def test_cli_session_id_does_not_replace_the_ambient_session_id(grok):
   assert row["meta"]["sessionId"] == "level_abc"
   assert row["meta"]["grokSessionId"] == CLI_SESSION
   assert row["meta"]["numTurns"] == 3
+
+
+def test_billed_run_without_an_image_is_still_recorded(grok):
+  grok("no_image")
+
+  with pytest.raises(RuntimeError, match="grok produced no image"):
+    generate_image("a tree", model="grok/imagine")
+
+  [row] = _ledger_rows()
+  assert row["usd"] == 0.02
+  assert row["meta"]["status"] == "no_image"
+
+
+def test_timed_out_run_is_recorded_unpriced(grok, monkeypatch):
+  grok("sleep")
+  monkeypatch.setattr(image_module, "_GROK_TIMEOUT_S", 1)
+
+  with pytest.raises(subprocess.TimeoutExpired):
+    generate_image("a tree", model="grok/imagine")
+
+  [row] = _ledger_rows()
+  assert row["usd"] is None
+  assert row["meta"] == {"status": "timeout"}
+
+
+def test_failed_run_is_recorded(grok):
+  grok("fail")
+
+  with pytest.raises(RuntimeError, match="grok CLI failed"):
+    generate_image("a tree", model="grok/imagine")
+
+  [row] = _ledger_rows()
+  assert row["meta"] == {"status": "error"}

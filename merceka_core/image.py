@@ -629,7 +629,12 @@ def _generate_google(
 _GROK_TIMEOUT_S = 600
 
 
-def _grok_run(prompt: str, job_dir: str) -> tuple[str, dict]:
+def _grok_run(prompt: str, job_dir: str, model: str) -> str:
+  """Run the grok CLI in ``job_dir`` and return the path of the image it wrote.
+
+  The CLI bills agent tokens whether or not an image comes out, so every run
+  writes one ledger row: priced from the CLI's JSON result when it printed one,
+  unpriced otherwise, with ``meta.status`` naming any failure."""
   import subprocess
 
   prompt_path = os.path.join(job_dir, "prompt.txt")
@@ -642,24 +647,32 @@ def _grok_run(prompt: str, job_dir: str) -> tuple[str, dict]:
   ]
   from merceka_core._env import scrubbed_env
 
-  proc = subprocess.run(
-    cmd, capture_output=True, text=True, timeout=_GROK_TIMEOUT_S,
-    env=scrubbed_env(keep=("XAI_API_KEY",)),
-  )
+  try:
+    proc = subprocess.run(
+      cmd, capture_output=True, text=True, timeout=_GROK_TIMEOUT_S,
+      env=scrubbed_env(keep=("XAI_API_KEY",)),
+    )
+  except subprocess.TimeoutExpired:
+    _grok_record(model, {}, status="timeout")
+    raise
   if proc.returncode != 0:
+    _grok_record(model, {}, status="error")
     raise RuntimeError(f"grok CLI failed ({proc.returncode}): {proc.stderr[-500:]}")
   try:
     data = json.loads(proc.stdout)
   except json.JSONDecodeError as e:
+    _grok_record(model, {}, status="error")
     raise RuntimeError(f"grok CLI returned non-JSON: {proc.stdout[-500:]}") from e
   out_dir = os.path.join(job_dir, "output")
   files = sorted(os.listdir(out_dir)) if os.path.isdir(out_dir) else []
   if not files:
+    _grok_record(model, data, status="no_image")
     raise RuntimeError(f"grok produced no image (stop={data.get('stopReason')}): {str(data.get('text'))[-300:]}")
-  return os.path.join(out_dir, files[-1]), data
+  _grok_record(model, data)
+  return os.path.join(out_dir, files[-1])
 
 
-def _grok_record(model: str, data: dict) -> None:
+def _grok_record(model: str, data: dict, status: str | None = None) -> None:
   # grokSessionId, not sessionId: call-site meta wins over ambient attribution,
   # and the ambient sessionId is the caller's (a level id, for the level editor).
   meta = {
@@ -667,6 +680,8 @@ def _grok_record(model: str, data: dict) -> None:
     for key, value in (("grokSessionId", data.get("sessionId")), ("numTurns", data.get("num_turns")))
     if value is not None
   }
+  if status:
+    meta["status"] = status
   _costs.record(
     source="grok-cli", model=model, usage=data.get("usage") or {},
     usd=data.get("total_cost_usd"), meta=meta or None,
@@ -693,8 +708,7 @@ def _generate_grok(prompt: str, model: str, aspect_ratio: str) -> Image.Image:
     "Copy the generated file to output/result.png (or output/result.jpg if JPEG). "
     "Final response: only that relative path."
   )
-  path, data = _grok_run(full, job_dir)
-  _grok_record(model, data)
+  path = _grok_run(full, job_dir, model)
   with Image.open(path) as img:
     img.load()
     return img.convert("RGB")
@@ -712,8 +726,7 @@ def _edit_grok(image: Image.Image, prompt: str, model: str) -> Image.Image:
     "Copy the result to output/result.png (or output/result.jpg if JPEG). "
     "Final response: only that relative path."
   )
-  path, data = _grok_run(full, job_dir)
-  _grok_record(model, data)
+  path = _grok_run(full, job_dir, model)
   with Image.open(path) as img:
     img.load()
     return img.convert("RGB")
