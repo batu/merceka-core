@@ -262,6 +262,13 @@ def test_parse_accepts_a_numeric_string_score():
   assert parse_judge_response('{"score": "85", "defects": []}')["score"] == 85
 
 
+def test_parse_prefers_a_complete_verdict_over_a_later_partial_object():
+  parsed = parse_judge_response(f'{_verdict(41, [_BLOCKER])}\nExample: {{"score": 99, "defects": []}}')
+
+  assert parsed["score"] == 41
+  assert [d["severity"] for d in parsed["defects"]] == ["blocker"]
+
+
 def test_prose_judge_answer_is_skipped_as_parse_failure(monkeypatch):
   monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
   client = _client_for(["Score (0-100): 42\n- Blocker background: opaque box", _content(92)])

@@ -724,12 +724,12 @@ def parse_judge_response(
 
   The verdict is the last JSON object in ``text`` that fits the response schema:
   a finite numeric ``score`` (a number, or a string holding one), a ``defects``
-  list and ``recurring_checks``, which must be a list when present. The whole
-  text is tried first; otherwise fenced ```json blocks and balanced top-level
-  objects are candidates, ordered by position, so narration with braces, a
-  draft before the final answer or a trailing note cannot displace the verdict.
-  A verdict that omits ``recurring_checks`` still counts; its checks are
-  recorded as skipped.
+  list and a ``recurring_checks`` list. The whole text is tried first;
+  otherwise fenced ```json blocks and balanced top-level objects are
+  candidates, ordered by position, so narration with braces, a draft before the
+  final answer or a trailing note cannot displace the verdict. When no object
+  carries ``recurring_checks``, the last one with a score and defects list is
+  used and its checks are recorded as skipped.
 
   Raises:
     ValueError: When no object fits the schema. There is no prose fallback;
@@ -766,7 +766,9 @@ def _extract_verdict(text: str) -> dict[str, Any] | None:
   # outranks an earlier draft however each one is formatted.
   candidates = {**_balanced_objects(text), **_fenced_objects(text)}
   verdicts = [obj for _start, obj in sorted(candidates.items()) if _is_verdict(obj)]
-  return verdicts[-1] if verdicts else None
+  # An object with every schema field outranks one that omits recurring_checks.
+  complete = [obj for obj in verdicts if "recurring_checks" in obj]
+  return (complete or verdicts or [None])[-1]
 
 
 def _fenced_objects(text: str) -> dict[int, Any]:
