@@ -13,6 +13,7 @@ from merceka_core.agent import (
 )
 from merceka_core.errors import (
   GpuLockTimeout,
+  LLMResponseError,
   VideoBackendError,
   VideoNotFoundError,
   VideoUploadError,
@@ -76,6 +77,7 @@ __all__ = [
   "RawProviderEvent",
   "GPU_LOCK_PATH",
   "GpuLockTimeout",
+  "LLMResponseError",
   "VideoBackendError",
   "VideoNotFoundError",
   "VideoUploadError",
