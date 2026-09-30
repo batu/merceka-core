@@ -79,7 +79,7 @@ from ollama import chat as ollama_chat
 from pathlib import Path
 
 
-from typing import Callable
+from typing import Callable, cast
 
 
 from pydantic import BaseModel
@@ -1072,32 +1072,57 @@ class LLM:
     messages: list[str],
     concurrency: int = 10,
     show_progress: bool = True,
+    *,
+    return_exceptions: bool = False,
     **kwargs,
   ) -> list[str | OutputSchema]:
     """Batch async generation with concurrency control.
+
+    Items start in input order. When one fails, queued items never start and
+    the calls already in flight finish (their spend is metered), then the first
+    failure is raised. With ``return_exceptions=True`` every item runs and a
+    failed item's slot holds its exception instead.
 
     Args:
         messages: List of input messages to process
         concurrency: Max parallel requests (default 10)
         show_progress: Show tqdm progress bar
+        return_exceptions: Return failures in place instead of raising
         **kwargs: Additional args passed to the API (e.g., temperature)
 
     Returns:
         List of responses in same order as inputs
     """
     import asyncio
-    from tqdm.asyncio import tqdm_asyncio
 
     semaphore = asyncio.Semaphore(concurrency)
+    failures: list[Exception] = []
+    progress = tqdm(total=len(messages), desc="Processing") if show_progress else None
 
-    async def process_one(message: str) -> str | OutputSchema:
+    async def process_one(message: str):
       async with semaphore:
-        return await self.agenerate(message, **kwargs)
+        if failures:
+          return None  # a call already failed: start no new paid call
+        try:
+          return await self.agenerate(message, **kwargs)
+        except Exception as exc:
+          if not return_exceptions:
+            failures.append(exc)
+          return exc
+        finally:
+          if progress is not None:
+            progress.update(1)
 
-    tasks = [process_one(msg) for msg in messages]
-    if show_progress:
-      return await tqdm_asyncio.gather(*tasks, desc="Processing")
-    return await asyncio.gather(*tasks)
+    try:
+      results = await asyncio.gather(*(process_one(msg) for msg in messages))
+    finally:
+      if progress is not None:
+        progress.close()
+    if failures:
+      raise failures[0]
+    # No slot is None (items are skipped only after a failure, which raises).
+    # Exceptions appear only with return_exceptions=True, as documented.
+    return cast(list[str | OutputSchema], results)
 
   def _resolve_timeout(self, kwargs: dict) -> int:
     """Resolve the subprocess timeout: per-call kwarg > instance default > module default."""
