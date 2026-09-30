@@ -234,6 +234,7 @@ def critique(
   floor: float = 85.0,
   timeout: float = 60.0,
   client: httpx.Client | None = None,
+  quorum: int | None = None,
 ) -> dict[str, Any]:
   """Run a multi-model visual critique and aggregate participating judges.
 
@@ -254,13 +255,24 @@ def critique(
       client.
     client: Optional injected ``httpx.Client`` for tests or caller-managed
       connection reuse.
+    quorum: Minimum number of judges that must return a parseable score.
+      Defaults to a majority of the enabled roster, ``ceil(n / 2)`` and at least
+      1, so a panel that lost most of its judges (expired CLI login, HTTP
+      errors, parse failures) raises instead of letting the survivors decide
+      alone. Pass ``quorum=1`` to accept any non-empty panel.
 
   Returns:
     A dict with score, verdict, defects, per_model, consensus, participated,
-    and skipped.
+    and skipped, plus ``participants`` (judges that returned a score),
+    ``roster_size`` (enabled judges) and ``degraded`` (True when any enabled
+    judge was skipped). Judges disabled in the roster are listed in skipped
+    but do not count toward the roster or degrade the panel.
 
   Raises:
-    RuntimeError: When no judge produced a parseable score.
+    RuntimeError: When fewer than ``quorum`` judges produced a parseable score.
+      The message names every skipped judge and its reason.
+    ValueError: When ``images`` is empty or ``quorum`` is below 1 or above the
+      number of enabled judges.
   """
   if not images:
     raise ValueError("critique requires at least one image")
@@ -272,6 +284,14 @@ def critique(
     )
 
   roster = _normalize_judges(judges)
+  roster_size = sum(1 for judge in roster if judge.get("enabled", True))
+  if quorum is not None and not 1 <= quorum <= roster_size:
+    raise ValueError(
+      f"quorum {quorum} exceeds the {roster_size} enabled judges"
+      if quorum > roster_size
+      else f"quorum must be at least 1, got {quorum}"
+    )
+  required = quorum if quorum is not None else max(1, math.ceil(roster_size / 2))
   check_units = _normalize_recurring_check_units(images, recurring_check_units)
   messages = _build_messages(
     images,
@@ -338,9 +358,13 @@ def critique(
     if owns_client:
       http_client.close()
 
-  if not participant_results:
+  participants = len(participant_results)
+  if participants < required:
     reasons = ", ".join(f"{s['judge']}: {s['reason']}" for s in skipped) or "none"
-    raise RuntimeError(f"vision critique had 0 participating judges; skipped={reasons}")
+    raise RuntimeError(
+      f"vision critique had {participants} participating judges, below the quorum of "
+      f"{required} (roster of {roster_size}); skipped={reasons}"
+    )
 
   score = float(median([r["score"] for r in participant_results]))
   consensus = _consensus_keys(participant_results)
@@ -360,6 +384,9 @@ def critique(
     "consensus": consensus,
     "participated": participated,
     "skipped": skipped,
+    "participants": participants,
+    "roster_size": roster_size,
+    "degraded": participants < roster_size,
   }
 
 

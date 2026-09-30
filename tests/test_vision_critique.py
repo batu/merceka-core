@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import importlib
 import json
+import subprocess
+from pathlib import Path
 
 import httpx
 import pytest
@@ -14,8 +17,25 @@ from merceka_core.vision.critique import (
 )
 from merceka_core.vision import critique as run_critique
 
+# The package re-exports the critique *function* under the submodule's name.
+critique_module = importlib.import_module("merceka_core.vision.critique")
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+
+
+def _fake_cli_run(outcomes: dict[str, tuple[int, str]]):
+  """subprocess.run stand-in keyed on the CLI binary name: (returncode, answer text)."""
+  calls = []
+
+  def run(cmd, **kwargs):
+    calls.append((list(cmd), kwargs))
+    returncode, text = outcomes.get(Path(cmd[0]).name, (1, ""))
+    if "--output-last-message" in cmd:
+      Path(cmd[cmd.index("--output-last-message") + 1]).write_text(text)
+    return subprocess.CompletedProcess(cmd, returncode, text, "")
+
+  run.calls = calls  # type: ignore[attr-defined]
+  return run
 
 
 def _judge(judge_id: str) -> dict:
@@ -402,11 +422,13 @@ def test_budget_halts_remaining_judges_mid_panel(monkeypatch):
     [PNG_BYTES],
     judges=[_judge("first"), _judge("second"), _judge("third")],
     budget_check=budget_check,
+    quorum=1,
     client=client,
   )
 
   assert seen == ["first", "second"]
   assert result["participated"] == ["first"]
+  assert result["degraded"] is True
   assert result["skipped"] == [
     {"judge": "second", "reason": "budget"},
     {"judge": "third", "reason": "budget"},
@@ -435,6 +457,97 @@ def test_zero_participants_raise_clear_error(monkeypatch):
 
   with pytest.raises(RuntimeError, match="0 participating judges"):
     run_critique([PNG_BYTES], judges=[_judge("auth"), _judge("junk")], client=client)
+
+
+def test_default_roster_raises_when_most_judges_fail(monkeypatch):
+  # Review repro r2 A / r8: expired CLI logins used to leave gemini deciding alone.
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  monkeypatch.setattr(
+    critique_module.subprocess, "run", _fake_cli_run({"codex": (1, ""), "claude": (1, "")})
+  )
+  client = _client_for([_content(86)])
+
+  with pytest.raises(RuntimeError, match="1 participating judges, below the quorum of 2") as exc:
+    run_critique([PNG_BYTES], client=client)
+
+  message = str(exc.value)
+  assert "codex/gpt-5.6-terra: cli-error" in message
+  assert "anthropic/claude-fable-5: cli-error" in message
+  assert "anthropic/claude-opus-5: cli-error" in message
+
+
+def test_quorum_failure_names_skipped_judges_and_reasons(monkeypatch):
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  client = _client_for([_content(90), httpx.Response(429, text="slow down"), "not parseable"])
+
+  with pytest.raises(RuntimeError, match="below the quorum of 2") as exc:
+    run_critique([PNG_BYTES], judges=[_judge("ok"), _judge("rate"), _judge("junk")], client=client)
+
+  assert "rate: HTTP 429" in str(exc.value)
+  assert "junk: parse-failure" in str(exc.value)
+
+
+def test_degraded_panel_reports_participants_and_roster_size(monkeypatch):
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  client = _client_for([_content(90), httpx.Response(500, text="boom"), _content(92)])
+
+  result = run_critique(
+    [PNG_BYTES], judges=[_judge("j1"), _judge("j2"), _judge("j3")], client=client
+  )
+
+  assert result["degraded"] is True
+  assert result["participants"] == 2
+  assert result["roster_size"] == 3
+  assert result["skipped"] == [{"judge": "j2", "reason": "HTTP 500"}]
+
+
+def test_full_panel_is_not_degraded(monkeypatch):
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  client = _client_for([_content(90), _content(92)])
+
+  result = run_critique([PNG_BYTES], judges=[_judge("j1"), _judge("j2")], client=client)
+
+  assert result["degraded"] is False
+  assert result["participants"] == 2
+  assert result["roster_size"] == 2
+
+
+def test_quorum_one_accepts_a_single_surviving_judge(monkeypatch):
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  client = _client_for([_content(90), httpx.Response(500, text="boom"), "not parseable"])
+
+  result = run_critique(
+    [PNG_BYTES], judges=[_judge("j1"), _judge("j2"), _judge("j3")], quorum=1, client=client
+  )
+
+  assert result["participated"] == ["j1"]
+  assert result["degraded"] is True
+  assert result["participants"] == 1
+  assert result["roster_size"] == 3
+
+
+def test_disabled_judges_do_not_count_toward_the_roster(monkeypatch):
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  client = _client_for([_content(90)])
+
+  result = run_critique(
+    [PNG_BYTES], judges=[_judge("j1"), dict(_judge("off"), enabled=False)], client=client
+  )
+
+  assert result["skipped"] == [{"judge": "off", "reason": "disabled"}]
+  assert result["degraded"] is False
+  assert result["roster_size"] == 1
+  assert result["participants"] == 1
+
+
+def test_unreachable_quorum_raises_before_any_judge_call(monkeypatch):
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  client = _client_for([])
+
+  with pytest.raises(ValueError, match="quorum 3 exceeds the 2 enabled judges"):
+    run_critique([PNG_BYTES], judges=[_judge("j1"), _judge("j2")], quorum=3, client=client)
+
+  assert client.calls == []  # type: ignore[attr-defined]
 
 
 def test_budget_floor_uses_openrouter_credits(monkeypatch):
