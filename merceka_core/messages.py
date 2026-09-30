@@ -37,7 +37,8 @@ def create_message_with_resource(
     role: Message role (user or assistant)
     
   Returns:
-    Message dict in litellm vision format with base64-encoded content
+    Message dict in OpenAI/OpenRouter multimodal format: images as a base64
+    ``image_url`` part, PDFs as a base64 ``file`` part.
   """
   resource_path = Path(resource_path)
   
@@ -69,16 +70,23 @@ def create_message_with_resource(
       ".3gp": "video/3gpp",
     }
     mime_type = mime_map.get(ext, "application/octet-stream")
-  
+
+  data_url = f"data:{mime_type};base64,{base64_data}"
+  if mime_type == "application/pdf":
+    # OpenRouter takes PDFs as a file part; an image_url part is for images.
+    attachment = {
+      "type": "file",
+      "file": {"filename": resource_path.name, "file_data": data_url},
+    }
+  else:
+    attachment = {"type": "image_url", "image_url": {"url": data_url}}
+
   # Create message with multimodal content
   return {
     "role": role,
     "content": [
       {"type": "text", "text": text},
-      {
-        "type": "image_url",
-        "image_url": {"url": f"data:{mime_type};base64,{base64_data}"},
-      },
+      attachment,
     ],
   }
 

@@ -51,14 +51,22 @@ class TestCreateMessageWithResource:
     assert url.startswith("data:image/png;base64,")
 
   def test_detects_pdf_mime_type(self, tmp_path: Path):
-    """Should detect PDF MIME type from extension."""
+    """PDFs go as an OpenRouter file part, not as an image_url.
+
+    Regression: a PDF was sent as image_url. OpenRouter documents PDF input
+    as {"type": "file", "file": {"filename", "file_data": <data URL>}}.
+    """
     test_file = tmp_path / "test.pdf"
     test_file.write_bytes(b"fake pdf")
-    
+
     result = create_message_with_resource("test", test_file)
-    
-    url = result["content"][1]["image_url"]["url"]
-    assert url.startswith("data:application/pdf;base64,")
+
+    part = result["content"][1]
+    assert part["type"] == "file"
+    assert part["file"]["filename"] == "test.pdf"
+    assert part["file"]["file_data"] == "data:application/pdf;base64," + base64.b64encode(
+      b"fake pdf").decode()
+    assert "image_url" not in part
 
   def test_detects_jpeg_mime_type(self, tmp_path: Path):
     """Should detect JPEG MIME type from extension."""
