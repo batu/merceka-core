@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import subprocess
@@ -17,7 +18,6 @@ from merceka_core.agent import (
 from merceka_core.agents import _process
 from merceka_core.agents.pi import PiAgentProvider
 
-
 RUN = "merceka_core.agents._process.run"
 
 
@@ -29,7 +29,7 @@ def _no_real_processes(monkeypatch: pytest.MonkeyPatch) -> None:
     raise AssertionError(f"unit test tried to launch a real CLI: {args[:1]}")
 
   monkeypatch.setattr(subprocess, "Popen", refuse)
-  monkeypatch.setattr(os, "killpg", lambda pgid, sig: None)
+  monkeypatch.setattr(os, "killpg", lambda *_: None)
 
 
 def _request(root: Path, profile: AgentProfile = AgentProfile.READ_ONLY) -> AgentRequest:
@@ -41,20 +41,104 @@ def _request(root: Path, profile: AgentProfile = AgentProfile.READ_ONLY) -> Agen
   )
 
 
-@pytest.mark.asyncio
-async def test_run_invokes_pi_read_only_json_no_session(tmp_path: Path):
-  stdout = (
-    json.dumps({"type": "response.output_text.delta", "delta": "the "}) + "\n"
-    + json.dumps({"type": "response.output_text.delta", "delta": "answer"}) + "\n"
-    + json.dumps({"type": "turn.complete", "final_text": "the answer"}) + "\n"
-  )
+# `pi --mode json` wire format, from pi 0.85.1 docs/json.md and pi-ai's types:
+# message_update records carry only the delta, message_end the whole message.
+SESSION = {"type": "session", "version": 3, "id": "uuid", "timestamp": "t", "cwd": "/root"}
+USAGE = {"input": 10, "output": 4, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 14}
 
+
+def _assistant(text: str, stop_reason: str = "stop", error: str | None = None) -> dict:
+  message = {
+    "role": "assistant",
+    "content": [{"type": "text", "text": text}] if text else [],
+    "stopReason": stop_reason,
+    "usage": USAGE,
+  }
+  if error is not None:
+    message["errorMessage"] = error
+  return message
+
+
+def _text_delta(delta: str) -> dict:
+  return {
+    "type": "message_update",
+    "usage": USAGE,
+    "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": delta},
+  }
+
+
+def _events(*assistant_turns: tuple[list[str], dict]) -> list[dict]:
+  """A session answering in ``assistant_turns``: (text deltas, final message) each."""
+  events: list[dict] = [SESSION, {"type": "agent_start"}]
+  for deltas, final in assistant_turns:
+    events += [
+      {"type": "turn_start"},
+      {"type": "message_start", "message": {"role": "assistant", "content": []}},
+      *[_text_delta(delta) for delta in deltas],
+      {"type": "message_end", "message": final},
+      {"type": "turn_end", "message": final, "toolResults": []},
+    ]
+  events.append({"type": "agent_end", "messages": [final for _, final in assistant_turns]})
+  return events
+
+
+def _retried_then_answered(answer: str) -> list[dict]:
+  """pi's auto-retry: a failed run, auto_retry_start, then a second run that answers."""
+  failed = _events(([], _assistant("", stop_reason="error", error="503 overloaded")))
+  retry = {
+    "type": "auto_retry_start", "attempt": 1, "maxAttempts": 3, "delayMs": 2000,
+    "errorMessage": "503 overloaded",
+  }
+  answered = _events(([answer], _assistant(answer)))[1:]  # one session header per process
+  return [*failed, retry, *answered, {"type": "auto_retry_end", "success": True, "attempt": 1}]
+
+
+def _stdout(events: list[dict]) -> str:
+  return "".join(json.dumps(event) + "\n" for event in events)
+
+
+class FakePiProcess:
+  """A `pi -p --mode json` child replaying ``events`` and then exiting ``returncode``."""
+
+  pid = 424242
+
+  def __init__(self, events: list[dict], returncode: int = 0, stderr: str = ""):
+    self.stdin = io.StringIO()
+    self.stdout = io.StringIO(_stdout(events))
+    self.stderr = io.StringIO(stderr)
+    self.returncode: int | None = None
+    self._exit_code = returncode
+
+  def poll(self):
+    return self.returncode
+
+  def wait(self, timeout=None):
+    del timeout  # accepted like Popen.wait; the fake exits at once
+    self.returncode = self._exit_code
+    return self.returncode
+
+
+async def _stream(tmp_path: Path, monkeypatch, events, returncode=0, stderr="") -> list:
+  process = FakePiProcess(events, returncode, stderr)
+  monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: process)
   provider = PiAgentProvider(model="gemini-flash-latest")
-  with patch(
+  return [event async for event in provider.stream(_request(tmp_path))]
+
+
+def _completed(stdout: str, returncode: int = 0, stderr: str = ""):
+  return patch(
     RUN,
     new_callable=AsyncMock,
-    return_value=subprocess.CompletedProcess(["pi"], 0, stdout=stdout, stderr=""),
-  ) as mock_run:
+    return_value=subprocess.CompletedProcess(["pi"], returncode, stdout=stdout, stderr=stderr),
+  )
+
+
+@pytest.mark.asyncio
+async def test_run_invokes_pi_read_only_json_no_session(tmp_path: Path):
+  stdout = _stdout(_events((["the ", "answer"], _assistant("the answer"))))
+
+  provider = PiAgentProvider(model="gemini-flash-latest")
+  with _completed(stdout) as mock_run:
     result = await provider.run(_request(tmp_path))
 
   cmd = mock_run.call_args.args[0]
@@ -75,11 +159,7 @@ async def test_run_invokes_pi_read_only_json_no_session(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_run_maps_write_profile_to_write_tools(tmp_path: Path):
   provider = PiAgentProvider(model="gemini-flash-latest")
-  with patch(
-    RUN,
-    new_callable=AsyncMock,
-    return_value=subprocess.CompletedProcess(["pi"], 0, stdout="", stderr=""),
-  ) as mock_run:
+  with _completed("") as mock_run:
     await provider.run(_request(tmp_path, profile=AgentProfile.WRITE))
 
   cmd = mock_run.call_args.args[0]
@@ -90,11 +170,7 @@ async def test_run_maps_write_profile_to_write_tools(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_run_passes_provider_when_set(tmp_path: Path):
   provider = PiAgentProvider(model="anthropic/claude", provider="anthropic")
-  with patch(
-    RUN,
-    new_callable=AsyncMock,
-    return_value=subprocess.CompletedProcess(["pi"], 0, stdout="", stderr=""),
-  ) as mock_run:
+  with _completed("") as mock_run:
     await provider.run(_request(tmp_path))
 
   cmd = mock_run.call_args.args[0]
@@ -102,137 +178,111 @@ async def test_run_passes_provider_when_set(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_run_falls_back_to_joined_deltas_without_final_text(tmp_path: Path):
-  stdout = (
-    json.dumps({"type": "response.output_text.delta", "delta": "Hello "}) + "\n"
-    + json.dumps({"type": "response.output_text.delta", "delta": "world"}) + "\n"
-  )
-  provider = PiAgentProvider(model="gemini-flash-latest")
-  with patch(
-    RUN,
-    new_callable=AsyncMock,
-    return_value=subprocess.CompletedProcess(["pi"], 0, stdout=stdout, stderr=""),
-  ):
-    result = await provider.run(_request(tmp_path))
+async def test_run_answer_is_the_final_assistant_message(tmp_path: Path):
+  # After a tool round the answer is the last assistant message, not every
+  # delta of the session joined together.
+  stdout = _stdout(_events(
+    (["I'll read ", "the index."], _assistant("I'll read the index.", stop_reason="toolUse")),
+    (["Page ", "3."], _assistant("Page 3.")),
+  ))
 
-  assert result.text == "Hello world"
+  with _completed(stdout):
+    result = await PiAgentProvider(model="gemini-flash-latest").run(_request(tmp_path))
+
+  assert result.text == "Page 3."
+
+
+@pytest.mark.asyncio
+async def test_run_error_stop_reason_is_a_provider_failure(tmp_path: Path):
+  stdout = _stdout(_events(([], _assistant("", stop_reason="error", error="429 quota exceeded"))))
+
+  with _completed(stdout):
+    with pytest.raises(ProviderFailure, match="429 quota exceeded"):
+      await PiAgentProvider(model="gemini-flash-latest").run(_request(tmp_path))
+
+
+@pytest.mark.asyncio
+async def test_run_error_recovered_by_a_retry_is_not_a_failure(tmp_path: Path):
+  with _completed(_stdout(_retried_then_answered("Page 3."))):
+    result = await PiAgentProvider(model="gemini-flash-latest").run(_request(tmp_path))
+
+  assert result.text == "Page 3."
 
 
 @pytest.mark.asyncio
 async def test_run_raises_provider_failure_on_nonzero_exit(tmp_path: Path):
   provider = PiAgentProvider(model="gemini-flash-latest")
-  with patch(
-    RUN,
-    new_callable=AsyncMock,
-    return_value=subprocess.CompletedProcess(["pi"], 1, stdout="", stderr="nope"),
-  ):
+  with _completed("", returncode=1, stderr="nope"):
     with pytest.raises(ProviderFailure, match="Pi failed"):
       await provider.run(_request(tmp_path))
 
 
 @pytest.mark.asyncio
-async def test_stream_normalizes_json_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-  class FakeStdout:
-    def __init__(self):
-      self.lines = iter([
-        json.dumps({"type": "response.output_text.delta", "delta": "Hello "}) + "\n",
-        json.dumps({"type": "tool_call", "tool": "read"}) + "\n",
-        json.dumps({"type": "response.output_text.delta", "delta": "world"}) + "\n",
-        json.dumps({"type": "turn.complete", "final_text": "Hello world"}) + "\n",
-        "",
-      ])
+async def test_stream_yields_text_deltas_and_completes_with_the_answer(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+  tool_call = {
+    "type": "message_update",
+    "usage": USAGE,
+    "assistantMessageEvent": {
+      "type": "toolcall_start", "contentIndex": 1, "id": "call_1", "toolName": "read",
+    },
+  }
+  events = _events((["Hello "], _assistant("Hello world")))
+  events.insert(5, tool_call)
+  events.insert(6, _text_delta("world"))
+  events.insert(8, {
+    "type": "tool_execution_end", "toolCallId": "call_1", "toolName": "read",
+    "result": {}, "isError": False,
+  })
 
-    def readline(self):
-      return next(self.lines)
+  result = await _stream(tmp_path, monkeypatch, events)
 
-    def close(self):
-      return None
+  assert any(isinstance(event, AgentRawProviderEvent) for event in result)
+  assert [event.content for event in result if isinstance(event, AgentTextDelta)] == ["Hello ", "world"]
+  assert isinstance(result[-1], AgentComplete)
+  assert result[-1].result.text == "Hello world"
 
-  class FakeStdin:
-    def write(self, text):
-      self.text = text
 
-    def close(self):
-      return None
+@pytest.mark.asyncio
+async def test_stream_does_not_yield_thinking_as_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+  events = _events((["Answer."], _assistant("Answer.")))
+  events.insert(4, {
+    "type": "message_update",
+    "usage": USAGE,
+    "assistantMessageEvent": {"type": "thinking_delta", "contentIndex": 0, "delta": "hmm"},
+  })
 
-  class FakeStderr:
-    def read(self):
-      return ""
+  result = await _stream(tmp_path, monkeypatch, events)
 
-    def close(self):
-      return None
+  assert [event.content for event in result if isinstance(event, AgentTextDelta)] == ["Answer."]
 
-  class FakeProcess:
-    pid = 424242
 
-    def __init__(self, *args, **kwargs):
-      self.stdin = FakeStdin()
-      self.stdout = FakeStdout()
-      self.stderr = FakeStderr()
-      self.returncode = None
+@pytest.mark.asyncio
+async def test_stream_error_stop_reason_is_a_provider_failure(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+  # pi exits 0 in json mode even when the model call failed.
+  events = _events(([], _assistant("", stop_reason="error", error="Request aborted")))
 
-    def poll(self):
-      return self.returncode
+  with pytest.raises(ProviderFailure, match="Request aborted"):
+    await _stream(tmp_path, monkeypatch, events)
 
-    def wait(self, timeout=None):
-      self.returncode = 0
-      return 0
 
-  monkeypatch.setattr(subprocess, "Popen", FakeProcess)
+@pytest.mark.asyncio
+async def test_stream_error_recovered_by_a_retry_completes_with_the_answer(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+  result = await _stream(tmp_path, monkeypatch, _retried_then_answered("Page 3."))
 
-  provider = PiAgentProvider(model="gemini-flash-latest")
-  events = [event async for event in provider.stream(_request(tmp_path))]
-
-  assert any(isinstance(event, AgentRawProviderEvent) for event in events)
-  assert [event.content for event in events if isinstance(event, AgentTextDelta)] == ["Hello ", "world"]
-  assert isinstance(events[-1], AgentComplete)
-  assert events[-1].result.text == "Hello world"
+  assert isinstance(result[-1], AgentComplete)
+  assert result[-1].result.text == "Page 3."
 
 
 @pytest.mark.asyncio
 async def test_stream_raises_on_nonzero_exit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-  class FakeStdout:
-    def readline(self):
-      return ""
-
-    def close(self):
-      return None
-
-  class FakeStdin:
-    def write(self, text):
-      return None
-
-    def close(self):
-      return None
-
-  class FakeStderr:
-    def read(self):
-      return "stream failed"
-
-    def close(self):
-      return None
-
-  class FakeProcess:
-    pid = 424242
-
-    def __init__(self, *args, **kwargs):
-      self.stdin = FakeStdin()
-      self.stdout = FakeStdout()
-      self.stderr = FakeStderr()
-      self.returncode = None
-
-    def poll(self):
-      return self.returncode
-
-    def wait(self, timeout=None):
-      self.returncode = 1
-      return 1
-
-  monkeypatch.setattr(subprocess, "Popen", FakeProcess)
-
-  provider = PiAgentProvider(model="gemini-flash-latest")
   with pytest.raises(ProviderFailure, match="stream failed"):
-    [event async for event in provider.stream(_request(tmp_path))]
+    await _stream(tmp_path, monkeypatch, [], returncode=1, stderr="stream failed")
 
 
 def test_malformed_json_line_becomes_raw_event():
