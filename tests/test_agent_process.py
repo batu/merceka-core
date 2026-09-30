@@ -123,15 +123,15 @@ async def test_run_timeout_raises_provider_failure_and_stops_the_process_group(
   provider_name, fake_cli, tmp_path
 ):
   pid_file = tmp_path / "grandchild.pid"
-  provider = PROVIDERS[provider_name](fake_cli(_wrapper_with_grandchild(pid_file)), 1)
+  provider = PROVIDERS[provider_name](fake_cli(_wrapper_with_grandchild(pid_file)), 2)
   started = time.monotonic()
-
-  with pytest.raises(ProviderFailure, match="timed out after 1s"):
-    await provider.run(_request(tmp_path))
-
-  grandchild = _read_pid(pid_file)
+  task = asyncio.create_task(provider.run(_request(tmp_path)))
+  grandchild = await asyncio.to_thread(_read_pid, pid_file)
   try:
-    assert time.monotonic() - started < 5
+    with pytest.raises(ProviderFailure, match="timed out after 2s"):
+      await task
+
+    assert time.monotonic() - started < 8
     assert _dies_within(grandchild, 3)
   finally:
     _kill_if_alive(grandchild)
@@ -178,18 +178,21 @@ async def test_run_starts_the_cli_in_its_own_process_group(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider_name", sorted(PROVIDERS))
 async def test_closing_a_stream_does_not_block_the_event_loop(
-  provider_name, fake_cli, spawned, tmp_path
+  provider_name, fake_cli, spawned, tmp_path, monkeypatch
 ):
   # A child that ignores SIGTERM: stopping it takes the full grace period plus
-  # a SIGKILL, and none of that may run on the event loop.
+  # a SIGKILL. Done on the event loop, that would stall it for the whole grace.
+  monkeypatch.setattr(_process, "TERMINATE_GRACE_SECONDS", 1.0)
   binary = fake_cli("""
     import json, signal, sys, time
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     sys.stdin.read()
     print(json.dumps({"type": "started"}), flush=True)
-    time.sleep(5)
+    time.sleep(30)
   """)
-  provider = PROVIDERS[provider_name](binary, 30)
+  provider = PROVIDERS[provider_name](binary, 60)
+  stream = provider.stream(_request(tmp_path))
+  await anext(stream)
   gaps: list[float] = []
 
   async def heartbeat():
@@ -201,16 +204,15 @@ async def test_closing_a_stream_does_not_block_the_event_loop(
       last = now
 
   beat = asyncio.create_task(heartbeat())
-  stream = provider.stream(_request(tmp_path))
-  await anext(stream)
+  await asyncio.sleep(0.05)
   started = time.monotonic()
   await stream.aclose()
   closed_after = time.monotonic() - started
   await asyncio.sleep(0.1)  # let the heartbeat record any stall during the close
   beat.cancel()
 
-  assert max(gaps) < 0.3
-  assert closed_after < 3
+  assert max(gaps) < 0.5  # a blocking close stalls for at least the 1 s grace
+  assert closed_after < 10  # an unbounded wait lasts the child's 30 s sleep
   assert spawned[0].returncode is not None  # the stubborn child is gone, and reaped
 
 
