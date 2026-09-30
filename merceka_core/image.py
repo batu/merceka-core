@@ -14,6 +14,7 @@ import logging
 import math
 import os
 import re
+import shutil
 
 import httpx
 from PIL import Image
@@ -708,28 +709,34 @@ def _generate_grok(prompt: str, model: str, aspect_ratio: str) -> Image.Image:
     "Copy the generated file to output/result.png (or output/result.jpg if JPEG). "
     "Final response: only that relative path."
   )
-  path = _grok_run(full, job_dir, model)
-  with Image.open(path) as img:
-    img.load()
-    return img.convert("RGB")
+  try:
+    path = _grok_run(full, job_dir, model)
+    with Image.open(path) as img:
+      img.load()
+      return img.convert("RGB")
+  finally:
+    shutil.rmtree(job_dir, ignore_errors=True)
 
 
 def _edit_grok(image: Image.Image, prompt: str, model: str) -> Image.Image:
   job_dir = _grok_job_dir()
-  src = os.path.join(job_dir, "source.png")
-  image.convert("RGB").save(src, format="PNG")
-  full = (
-    f"Call image_edit exactly once with the source image at the absolute path {src} "
-    "(it exists; do not search for it, do not list directories, do not read other files). "
-    "Do not describe the image. Use this exact text as the edit prompt:\n\n"
-    f"{prompt}\n\n"
-    "Copy the result to output/result.png (or output/result.jpg if JPEG). "
-    "Final response: only that relative path."
-  )
-  path = _grok_run(full, job_dir, model)
-  with Image.open(path) as img:
-    img.load()
-    return img.convert("RGB")
+  try:
+    src = os.path.join(job_dir, "source.png")
+    image.convert("RGB").save(src, format="PNG")
+    full = (
+      f"Call image_edit exactly once with the source image at the absolute path {src} "
+      "(it exists; do not search for it, do not list directories, do not read other files). "
+      "Do not describe the image. Use this exact text as the edit prompt:\n\n"
+      f"{prompt}\n\n"
+      "Copy the result to output/result.png (or output/result.jpg if JPEG). "
+      "Final response: only that relative path."
+    )
+    path = _grok_run(full, job_dir, model)
+    with Image.open(path) as img:
+      img.load()
+      return img.convert("RGB")
+  finally:
+    shutil.rmtree(job_dir, ignore_errors=True)
 
 
 def generate_image(

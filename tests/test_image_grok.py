@@ -15,10 +15,11 @@ import textwrap
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from merceka_core import costs
 from merceka_core import image as image_module
-from merceka_core.image import generate_image
+from merceka_core.image import edit_image, generate_image
 
 CLI_SESSION = "01a0a9d0-d40b-77c2-b646-911373e8f29f"
 FAKE_GROK = textwrap.dedent(
@@ -112,8 +113,28 @@ def test_cli_session_id_does_not_replace_the_ambient_session_id(grok):
   assert row["meta"]["numTurns"] == 3
 
 
+def test_job_dir_is_removed_after_the_image_is_read(grok):
+  base = grok("ok")
+
+  generate_image("a tree", model="grok/imagine")
+
+  assert _job_dirs(base) == []
+
+
+def test_edit_sends_the_source_path_and_removes_the_job_dir(grok, tmp_path):
+  base = grok("ok")
+
+  result = edit_image(Image.new("RGB", (32, 32), (9, 9, 9)), "make it red", model="grok/imagine")
+
+  assert result.size == (32, 32)
+  prompt = (tmp_path / "prompts.log").read_text()
+  assert "source.png" in prompt and "make it red" in prompt
+  assert len(_ledger_rows()) == 1
+  assert _job_dirs(base) == []
+
+
 def test_billed_run_without_an_image_is_still_recorded(grok):
-  grok("no_image")
+  base = grok("no_image")
 
   with pytest.raises(RuntimeError, match="grok produced no image"):
     generate_image("a tree", model="grok/imagine")
@@ -121,10 +142,11 @@ def test_billed_run_without_an_image_is_still_recorded(grok):
   [row] = _ledger_rows()
   assert row["usd"] == 0.02
   assert row["meta"]["status"] == "no_image"
+  assert _job_dirs(base) == []
 
 
 def test_timed_out_run_is_recorded_unpriced(grok, monkeypatch):
-  grok("sleep")
+  base = grok("sleep")
   monkeypatch.setattr(image_module, "_GROK_TIMEOUT_S", 1)
 
   with pytest.raises(subprocess.TimeoutExpired):
@@ -133,6 +155,7 @@ def test_timed_out_run_is_recorded_unpriced(grok, monkeypatch):
   [row] = _ledger_rows()
   assert row["usd"] is None
   assert row["meta"] == {"status": "timeout"}
+  assert _job_dirs(base) == []
 
 
 def test_failed_run_is_recorded(grok):
