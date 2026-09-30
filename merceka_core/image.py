@@ -660,10 +660,16 @@ def _grok_run(prompt: str, job_dir: str) -> tuple[str, dict]:
 
 
 def _grok_record(model: str, data: dict) -> None:
-  usage = data.get("usage") or {}
+  # grokSessionId, not sessionId: call-site meta wins over ambient attribution,
+  # and the ambient sessionId is the caller's (a level id, for the level editor).
+  meta = {
+    key: value
+    for key, value in (("grokSessionId", data.get("sessionId")), ("numTurns", data.get("num_turns")))
+    if value is not None
+  }
   _costs.record(
-    source="grok-cli", model=model, usage=usage, usd=data.get("total_cost_usd"),
-    meta={"sessionId": data.get("sessionId"), "numTurns": data.get("num_turns")},
+    source="grok-cli", model=model, usage=data.get("usage") or {},
+    usd=data.get("total_cost_usd"), meta=meta or None,
   )
 
 
