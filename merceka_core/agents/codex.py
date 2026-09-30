@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-import json
-import subprocess
 import tempfile
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -21,6 +18,7 @@ from merceka_core.agent import (
   ProviderFailure,
   RawProviderEvent,
 )
+from merceka_core.agents import _process
 
 CODEX_PROVIDER = "codex"
 CODEX_TIMEOUT_SECONDS = 300
@@ -34,27 +32,20 @@ class CodexAgentProvider:
   timeout_seconds: int = CODEX_TIMEOUT_SECONDS
 
   async def run(self, request: AgentRequest) -> AgentResult:
-    return await asyncio.to_thread(self._run_sync, request)
-
-  def stream(self, request: AgentRequest) -> AsyncIterator[AgentStreamEvent]:
-    return self._stream(request)
-
-  def _run_sync(self, request: AgentRequest) -> AgentResult:
     with tempfile.NamedTemporaryFile("r", encoding="utf-8", delete=False) as output_file:
       output_path = Path(output_file.name)
     try:
       cmd = self._command(request, json_output=True)
       cmd.extend(["--output-last-message", str(output_path)])
-      result = subprocess.run(
+      result = await _process.run(
         cmd,
         input=self._prompt(request),
-        capture_output=True,
-        text=True,
         timeout=self.timeout_seconds,
         cwd=str(request.roots[0]),
         env=_cli.codex_env(),
+        label="Codex",
       )
-      raw_events = tuple(self._raw_events_from_stdout(result.stdout))
+      raw_events = tuple(_process.raw_events_from_stdout(result.stdout, CODEX_PROVIDER))
       if result.returncode != 0:
         message = result.stderr.strip() or result.stdout.strip() or "unknown provider error"
         raise ProviderFailure(f"Codex failed with exit {result.returncode}: {message}")
@@ -71,63 +62,61 @@ class CodexAgentProvider:
     finally:
       output_path.unlink(missing_ok=True)
 
+  def stream(self, request: AgentRequest) -> AsyncIterator[AgentStreamEvent]:
+    return self._stream(request)
+
   async def _stream(self, request: AgentRequest) -> AsyncIterator[AgentStreamEvent]:
-    cmd = self._command(request, json_output=True)
-    process = subprocess.Popen(
-      cmd,
-      stdin=subprocess.PIPE,
-      stdout=subprocess.PIPE,
-      stderr=subprocess.PIPE,
-      text=True,
-      bufsize=1,
+    stream = _process.Stream(
+      self._command(request, json_output=True),
       cwd=str(request.roots[0]),
       env=_cli.codex_env(),
+      timeout=self.timeout_seconds,
+      label="Codex stream",
     )
-    if process.stdin is None or process.stdout is None or process.stderr is None:
-      raise ProviderFailure("Codex stream did not expose stdio pipes")
-
-    process.stdin.write(self._prompt(request))
-    process.stdin.close()
-
     raw_events: list[RawProviderEvent] = []
-    text_chunks: list[str] = []
+    answer = ""
+    stream_error: str | None = None
     try:
+      await stream.send(self._prompt(request))
       while True:
-        line = await asyncio.to_thread(process.stdout.readline)
+        line = await stream.readline()
         if line == "":
           break
         line = line.strip()
         if not line:
           continue
 
-        raw_event = self._raw_event_from_line(line)
+        raw_event = _process.raw_event_from_line(line, CODEX_PROVIDER)
         raw_events.append(raw_event)
         yield AgentRawProviderEvent(raw_event=raw_event)
 
         payload = raw_event.payload
-        if isinstance(payload, dict):
-          text = self._text_delta_from_payload(payload)
-          if text is not None:
-            text_chunks.append(text)
-            yield AgentTextDelta(content=text)
+        if not isinstance(payload, dict):
+          continue
+        failure = _turn_failure(payload)
+        if failure is not None:
+          raise ProviderFailure(f"Codex stream failed: {failure}")
+        if payload.get("type") == "error":
+          # Fatal unless a turn completes after it: Codex also reports the
+          # reconnects it recovers from ("Reconnecting... 1/5") this way.
+          stream_error = str(payload.get("message") or "unknown error")
+          continue
+        if payload.get("type") == "turn.completed":
+          stream_error = None
+        text = self._text_delta_from_payload(payload)
+        if text is not None:
+          answer = text
+          yield AgentTextDelta(content=text)
 
-      returncode = await asyncio.to_thread(process.wait)
-      stderr = await asyncio.to_thread(process.stderr.read)
+      returncode, stderr = await stream.finish()
+      if stream_error is not None:
+        raise ProviderFailure(f"Codex stream failed: {stream_error}")
       if returncode != 0:
         message = stderr.strip() or f"exit {returncode}"
         raise ProviderFailure(f"Codex stream failed with exit {returncode}: {message}")
-      yield AgentComplete(result=AgentResult(text="".join(text_chunks), raw_events=tuple(raw_events)))
-    except GeneratorExit:
-      self._terminate_process(process)
-      raise
-    except asyncio.CancelledError:
-      self._terminate_process(process)
-      raise
+      yield AgentComplete(result=AgentResult(text=answer, raw_events=tuple(raw_events)))
     finally:
-      if process.returncode is None:
-        self._terminate_process(process)
-      self._close_pipe(process.stdout)
-      self._close_pipe(process.stderr)
+      await stream.close()
 
   def _command(self, request: AgentRequest, *, json_output: bool) -> list[str]:
     model = "" if self.model in DEFAULT_CODEX_MODEL_ALIASES else self.model
@@ -158,37 +147,27 @@ class CodexAgentProvider:
       f"<user>\n{request.message}\n</user>\n"
     )
 
-  def _raw_events_from_stdout(self, stdout: str) -> list[RawProviderEvent]:
-    return [self._raw_event_from_line(line) for line in stdout.splitlines() if line.strip()]
-
-  def _raw_event_from_line(self, line: str) -> RawProviderEvent:
-    try:
-      payload: Any = json.loads(line)
-    except json.JSONDecodeError as exc:
-      return RawProviderEvent(
-        provider=CODEX_PROVIDER,
-        event_type="malformed_json",
-        payload={"line": line, "error": str(exc)},
-      )
-    event_type = str(payload.get("type", "raw")) if isinstance(payload, dict) else "raw"
-    return RawProviderEvent(provider=CODEX_PROVIDER, event_type=event_type, payload=payload)
-
   def _text_delta_from_payload(self, payload: dict[str, Any]) -> str | None:
-    for key in ("delta", "text", "message", "content"):
-      value = payload.get(key)
-      if isinstance(value, str) and value:
-        return value
-    message = payload.get("message")
-    if isinstance(message, dict):
-      content = message.get("content")
-      if isinstance(content, str) and content:
-        return content
+    """Text of a completed agent message.
+
+    ``codex exec --json`` emits each assistant message whole, as
+    ``item.completed`` with ``item.type == "agent_message"``; the last one is
+    the answer (what ``--output-last-message`` writes). Reasoning, commands and
+    error items carry text too, but are not the answer.
+    """
+    if payload.get("type") != "item.completed":
+      return None
+    item = payload.get("item")
+    if not isinstance(item, dict) or item.get("type") != "agent_message":
+      return None
+    text = item.get("text")
+    return text if isinstance(text, str) and text else None
+
+
+def _turn_failure(payload: dict[str, Any]) -> str | None:
+  """The message of a ``turn.failed`` event, which ends the turn with an error."""
+  if payload.get("type") != "turn.failed":
     return None
-
-  def _terminate_process(self, process: subprocess.Popen[str]) -> None:
-    process.terminate()
-    process.wait()
-
-  def _close_pipe(self, pipe: Any) -> None:
-    if pipe is not None:
-      pipe.close()
+  error = payload.get("error")
+  message = error.get("message") if isinstance(error, dict) else None
+  return str(message or "turn failed")

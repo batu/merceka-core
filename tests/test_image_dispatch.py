@@ -31,8 +31,8 @@ def _openai_body(size=(1, 1)):
   return {"data": [{"b64_json": _png_b64(size)}]}
 
 
-def _openrouter_body():
-  uri = f"data:image/png;base64,{_png_b64()}"
+def _openrouter_body(size=(1, 1)):
+  uri = f"data:image/png;base64,{_png_b64(size)}"
   return {"choices": [{"message": {"images": [{"image_url": {"url": uri}}]}}]}
 
 
@@ -196,7 +196,8 @@ class TestGenerateImageDispatch:
 class TestEditImageDispatch:
   @pytest.fixture
   def source(self):
-    return Image.new("RGB", (10, 20), (200, 10, 10))
+    # 2:3, an aspect the fixed OpenAI 1024x1536 size serves without stretching.
+    return Image.new("RGB", (20, 30), (200, 10, 10))
 
   def test_openai_prefix_hits_edits_endpoint_multipart(self, fake_post, source):
     fake = fake_post(FakeResponse(body=_openai_body(source.size)))
@@ -207,10 +208,10 @@ class TestEditImageDispatch:
     assert url == OPENAI_EDITS
     assert "image" in kwargs["files"]  # multipart upload, not JSON
     assert kwargs["data"]["model"] == "gpt-image-2"
-    assert result.size == (10, 20)  # resized back to the input dimensions
+    assert result.size == (20, 30)  # resized back to the input dimensions
 
   def test_non_openai_model_hits_openrouter_with_image_part(self, fake_post, source):
-    fake = fake_post(FakeResponse(body=_openrouter_body()))
+    fake = fake_post(FakeResponse(body=_openrouter_body((40, 60))))
 
     result = edit_image(source, "make it blue", model="google/gemini-3.1-flash-image-preview")
 
@@ -220,7 +221,7 @@ class TestEditImageDispatch:
     part_types = [part["type"] for part in content]
     assert part_types == ["text", "image_url"]
     assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
-    assert result.size == (10, 20)
+    assert result.size == (20, 30)
 
   def test_openai_edit_error_status_propagates(self, fake_post, source):
     fake_post(FakeResponse(status_code=503, text="down"))

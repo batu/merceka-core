@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-import json
-import subprocess
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -19,6 +16,7 @@ from merceka_core.agent import (
   ProviderFailure,
   RawProviderEvent,
 )
+from merceka_core.agents import _process
 
 PI_PROVIDER = "pi"
 PI_TIMEOUT_SECONDS = 300
@@ -34,26 +32,21 @@ class PiAgentProvider:
   timeout_seconds: int = PI_TIMEOUT_SECONDS
 
   async def run(self, request: AgentRequest) -> AgentResult:
-    return await asyncio.to_thread(self._run_sync, request)
-
-  def stream(self, request: AgentRequest) -> AsyncIterator[AgentStreamEvent]:
-    return self._stream(request)
-
-  def _run_sync(self, request: AgentRequest) -> AgentResult:
-    cmd = self._command(request)
-    result = subprocess.run(
-      cmd,
+    result = await _process.run(
+      self._command(request),
       input=self._prompt(request),
-      capture_output=True,
-      text=True,
       timeout=self.timeout_seconds,
       cwd=str(request.roots[0]),
       env=scrubbed_env(),
+      label="Pi",
     )
-    raw_events = tuple(self._raw_events_from_stdout(result.stdout))
+    raw_events = tuple(_process.raw_events_from_stdout(result.stdout, PI_PROVIDER))
     if result.returncode != 0:
       message = result.stderr.strip() or result.stdout.strip() or "unknown provider error"
       raise ProviderFailure(f"Pi failed with exit {result.returncode}: {message}")
+    failure = _run_failure(raw_events)
+    if failure is not None:
+      raise ProviderFailure(f"Pi failed: {failure}")
     text = self._final_text(raw_events)
     if not raw_events:
       raw_events = (
@@ -65,36 +58,29 @@ class PiAgentProvider:
       )
     return AgentResult(text=text, raw_events=raw_events)
 
+  def stream(self, request: AgentRequest) -> AsyncIterator[AgentStreamEvent]:
+    return self._stream(request)
+
   async def _stream(self, request: AgentRequest) -> AsyncIterator[AgentStreamEvent]:
-    cmd = self._command(request)
-    process = subprocess.Popen(
-      cmd,
-      stdin=subprocess.PIPE,
-      stdout=subprocess.PIPE,
-      stderr=subprocess.PIPE,
-      text=True,
-      bufsize=1,
+    stream = _process.Stream(
+      self._command(request),
       cwd=str(request.roots[0]),
       env=scrubbed_env(),
+      timeout=self.timeout_seconds,
+      label="Pi stream",
     )
-    if process.stdin is None or process.stdout is None or process.stderr is None:
-      raise ProviderFailure("Pi stream did not expose stdio pipes")
-
-    process.stdin.write(self._prompt(request))
-    process.stdin.close()
-
     raw_events: list[RawProviderEvent] = []
-    text_chunks: list[str] = []
     try:
+      await stream.send(self._prompt(request))
       while True:
-        line = await asyncio.to_thread(process.stdout.readline)
+        line = await stream.readline()
         if line == "":
           break
         line = line.strip()
         if not line:
           continue
 
-        raw_event = self._raw_event_from_line(line)
+        raw_event = _process.raw_event_from_line(line, PI_PROVIDER)
         raw_events.append(raw_event)
         yield AgentRawProviderEvent(raw_event=raw_event)
 
@@ -102,27 +88,19 @@ class PiAgentProvider:
         if isinstance(payload, dict):
           text = self._text_delta_from_payload(payload)
           if text is not None:
-            text_chunks.append(text)
             yield AgentTextDelta(content=text)
 
-      returncode = await asyncio.to_thread(process.wait)
-      stderr = await asyncio.to_thread(process.stderr.read)
+      returncode, stderr = await stream.finish()
       if returncode != 0:
         message = stderr.strip() or f"exit {returncode}"
         raise ProviderFailure(f"Pi stream failed with exit {returncode}: {message}")
-      text = self._final_text(tuple(raw_events)) or "".join(text_chunks)
+      failure = _run_failure(tuple(raw_events))
+      if failure is not None:
+        raise ProviderFailure(f"Pi stream failed: {failure}")
+      text = self._final_text(tuple(raw_events))
       yield AgentComplete(result=AgentResult(text=text, raw_events=tuple(raw_events)))
-    except GeneratorExit:
-      self._terminate_process(process)
-      raise
-    except asyncio.CancelledError:
-      self._terminate_process(process)
-      raise
     finally:
-      if process.returncode is None:
-        self._terminate_process(process)
-      self._close_pipe(process.stdout)
-      self._close_pipe(process.stderr)
+      await stream.close()
 
   def _command(self, request: AgentRequest) -> list[str]:
     cmd = [self.pi_binary, "-p", "--mode", "json", "--no-session", "--model", self.model]
@@ -149,48 +127,72 @@ class PiAgentProvider:
       f"<user>\n{request.message}\n</user>\n"
     )
 
-  def _raw_events_from_stdout(self, stdout: str) -> list[RawProviderEvent]:
-    return [self._raw_event_from_line(line) for line in stdout.splitlines() if line.strip()]
-
-  def _raw_event_from_line(self, line: str) -> RawProviderEvent:
-    try:
-      payload: Any = json.loads(line)
-    except json.JSONDecodeError as exc:
-      return RawProviderEvent(
-        provider=PI_PROVIDER,
-        event_type="malformed_json",
-        payload={"line": line, "error": str(exc)},
-      )
-    event_type = str(payload.get("type", "raw")) if isinstance(payload, dict) else "raw"
-    return RawProviderEvent(provider=PI_PROVIDER, event_type=event_type, payload=payload)
-
   def _text_delta_from_payload(self, payload: dict[str, Any]) -> str | None:
-    event_type = payload.get("type")
-    if isinstance(event_type, str) and event_type.endswith((".output_text.delta", "message_delta")):
-      delta = payload.get("delta")
-      if isinstance(delta, str) and delta:
-        return delta
-    return None
+    """Answer text streamed in a ``message_update`` event.
+
+    ``pi --mode json`` sends each streaming step of an assistant message as
+    ``message_update`` with ``assistantMessageEvent``; only its ``text_delta``
+    steps are answer text (thinking and tool-call deltas are not).
+    """
+    if payload.get("type") != "message_update":
+      return None
+    event = payload.get("assistantMessageEvent")
+    if not isinstance(event, dict) or event.get("type") != "text_delta":
+      return None
+    delta = event.get("delta")
+    return delta if isinstance(delta, str) and delta else None
 
   def _final_text(self, raw_events: tuple[RawProviderEvent, ...]) -> str:
-    final = ""
-    chunks: list[str] = []
-    for event in raw_events:
-      payload = event.payload
-      if not isinstance(payload, dict):
-        continue
-      text = self._text_delta_from_payload(payload)
-      if text is not None:
-        chunks.append(text)
-      candidate = payload.get("final_text")
-      if isinstance(candidate, str) and candidate:
-        final = candidate
-    return final or "".join(chunks)
+    """The text of the last assistant ``message_end``, the authoritative message.
 
-  def _terminate_process(self, process: subprocess.Popen[str]) -> None:
-    process.terminate()
-    process.wait()
+    Falls back to the joined text deltas if no assistant message ended.
+    """
+    last = _last_assistant_message(raw_events)
+    if last is not None:
+      return _message_text(last)
+    return "".join(
+      text
+      for event in raw_events
+      if isinstance(event.payload, dict)
+      and (text := self._text_delta_from_payload(event.payload)) is not None
+    )
 
-  def _close_pipe(self, pipe: Any) -> None:
-    if pipe is not None:
-      pipe.close()
+
+def _last_assistant_message(raw_events: tuple[RawProviderEvent, ...]) -> dict[str, Any] | None:
+  """The message of the last assistant ``message_end`` event, if any."""
+  last = None
+  for event in raw_events:
+    payload = event.payload
+    if not isinstance(payload, dict) or payload.get("type") != "message_end":
+      continue
+    message = payload.get("message")
+    if isinstance(message, dict) and message.get("role") == "assistant":
+      last = message
+  return last
+
+
+def _message_text(message: dict[str, Any]) -> str:
+  content = message.get("content")
+  if isinstance(content, str):
+    return content
+  if not isinstance(content, list):
+    return ""
+  return "".join(
+    part["text"]
+    for part in content
+    if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
+  )
+
+
+def _run_failure(raw_events: tuple[RawProviderEvent, ...]) -> str | None:
+  """Why the run failed, judged the way pi's own print mode judges it.
+
+  pi exits 0 in json mode even when the model call failed: the failure is
+  only the last assistant message's ``stopReason``. Only the last message
+  counts, because pi retries some errors itself and a later message can
+  still answer.
+  """
+  last = _last_assistant_message(raw_events)
+  if last is None or last.get("stopReason") not in ("error", "aborted"):
+    return None
+  return str(last.get("errorMessage") or f"request {last['stopReason']}")
