@@ -1,8 +1,10 @@
 import base64
+import functools
 import io
 import json
 from unittest.mock import patch
 
+import httpx
 import pytest
 from PIL import Image
 
@@ -35,7 +37,13 @@ class _FakeResponse:
     self._payload = payload
 
   def json(self):
+    if isinstance(self._payload, _NotJSON):
+      raise json.JSONDecodeError("Expecting value", "<html>gateway</html>", 0)
     return self._payload
+
+
+class _NotJSON:
+  """A 200 whose body is not JSON, e.g. a gateway error page."""
 
 
 class _FakeClient:
@@ -160,3 +168,123 @@ def test_critique_parses_zoom_judge_verdict(monkeypatch):
 
   assert result["score"] == 88
   assert result["participated"] == ["anthropic/claude-fable-5-zoom"]
+
+
+@pytest.mark.parametrize(
+  ("stop_reason", "reason"), [("max_tokens", "max-tokens"), ("refusal", "refusal")]
+)
+def test_zoom_judge_treats_truncated_or_refused_turns_as_failures(stop_reason, reason):
+  # Review repro r4 A: truncated JSON after "Score: 97." used to count as a verdict.
+  client = _FakeClient(
+    [
+      {
+        "stop_reason": stop_reason,
+        "content": [{"type": "text", "text": 'Score: 97. {"score": 97, "defects": [{"key"'}],
+      }
+    ]
+  )
+
+  result = zoom_judge.call_zoom_judge(
+    ZOOM_JUDGE, [_png_bytes()], None, "judge this", api_key="sk-ant-test", client=client
+  )
+
+  assert result == {"ok": False, "reason": reason}
+
+
+@pytest.mark.parametrize(
+  "body",
+  [
+    _NotJSON(),
+    [],
+    {"type": "error"},
+    {"content": None, "stop_reason": "end_turn"},
+    {"content": ["x"], "stop_reason": "end_turn"},
+    {"content": [{"type": "tool_use", "id": "t1", "input": "zoom"}], "stop_reason": "tool_use"},
+    {"content": [{"type": "text", "text": "zooming"}], "stop_reason": "tool_use"},
+  ],
+)
+def test_zoom_judge_reports_malformed_responses_instead_of_raising(body):
+  client = _FakeClient([body])
+
+  result = zoom_judge.call_zoom_judge(
+    ZOOM_JUDGE, [_png_bytes()], None, "judge this", api_key="sk-ant-test", client=client
+  )
+
+  assert result == {"ok": False, "reason": "malformed-response"}
+
+
+@pytest.mark.parametrize(
+  "tool_input",
+  [
+    {"x1": 0, "y1": 0, "x2": 8, "y2": 8, "image_index": "abc"},
+    {"x1": 0, "y1": 0, "x2": 8, "y2": 8, "image_index": [0]},
+    {"x1": "left", "y1": 0, "x2": 8, "y2": 8},
+  ],
+)
+def test_zoom_judge_returns_bad_tool_arguments_as_tool_errors(tool_input):
+  # Review repro r4 C: these raised out of the loop and aborted the whole panel.
+  tool_use = {
+    "stop_reason": "tool_use",
+    "content": [{"type": "tool_use", "id": "toolu_1", "name": "zoom", "input": tool_input}],
+  }
+  client = _FakeClient([tool_use, _final_response()])
+
+  result = zoom_judge.call_zoom_judge(
+    ZOOM_JUDGE, [_png_bytes()], None, "judge this", api_key="sk-ant-test", client=client
+  )
+
+  assert result["ok"] is True
+  tool_result = client.requests[1]["json"]["messages"][2]["content"][0]
+  assert tool_result["is_error"] is True
+  assert tool_result["content"][0]["text"].startswith("Error:")
+
+
+def test_zoom_judge_accepts_cmyk_input():
+  # Review repro r4 F: CMYK could not be written as PNG and raised.
+  buf = io.BytesIO()
+  Image.new("CMYK", (40, 40), (0, 255, 255, 0)).save(buf, format="JPEG")
+  client = _FakeClient([_final_response()])
+
+  result = zoom_judge.call_zoom_judge(
+    ZOOM_JUDGE, [buf.getvalue()], None, "judge this", api_key="sk-ant-test", client=client
+  )
+
+  assert result["ok"] is True
+
+
+def test_zoom_judge_reports_unreadable_images_instead_of_raising():
+  client = _FakeClient([])
+
+  result = zoom_judge.call_zoom_judge(
+    ZOOM_JUDGE, [b"not an image"], None, "judge this", api_key="sk-ant-test", client=client
+  )
+
+  assert result == {"ok": False, "reason": "image-error"}
+  assert client.requests == []
+
+
+def test_critique_keeps_finished_judges_when_the_zoom_judge_fails(monkeypatch):
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+  zoom_client = _FakeClient([_NotJSON()])
+  monkeypatch.setattr(
+    zoom_judge,
+    "call_zoom_judge",
+    functools.partial(zoom_judge.call_zoom_judge, client=zoom_client),
+  )
+  openrouter = httpx.Client(
+    transport=httpx.MockTransport(
+      lambda _request: httpx.Response(
+        200, json={"choices": [{"message": {"content": json.dumps(_VERDICT)}}]}
+      )
+    )
+  )
+
+  result = run_critique(
+    [_png_bytes()],
+    judges=[{"id": "panel/or", "model": "vendor/or"}, dict(ZOOM_JUDGE, enabled=True)],
+    client=openrouter,
+  )
+
+  assert result["participated"] == ["panel/or"]
+  assert result["skipped"] == [{"judge": ZOOM_JUDGE["id"], "reason": "malformed-response"}]
