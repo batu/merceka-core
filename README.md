@@ -43,6 +43,85 @@ summary = llm.generate_with_video(
 )
 ```
 
+### Credentials
+
+Provider keys come from the environment. Importing `merceka_core.llm` (or
+`llm_gemini`) also fills the library's own keys (`OPENROUTER_API_KEY`,
+`OPENAI_API_KEY`, `GOOGLE_API_KEY`, `GEMINI_API_KEY`, `FAL_KEY`, and the
+OpenRouter header settings) from the nearest `.env` above the package. It fills
+only keys that are absent, and never any other entry in that file.
+
+- To disable a provider, set its key to an empty string (`OPENROUTER_API_KEY=`).
+  `env -u` does not work, because an absent key is filled from `.env`.
+- `PYTHON_DOTENV_DISABLED=1` skips `.env` entirely.
+- CLI subprocesses (Claude Code, Codex, pi, grok) never inherit credentials. They
+  authenticate with their own logins.
+
+### Images
+
+```python
+from merceka_core.image import generate_image, edit_image, inpaint, upscale_image
+
+img = generate_image("a red kite on a white background", model="openai/gpt-image-2",
+                     transparent=True)
+edited = edit_image(img, "make the kite blue", model="google/gemini-3.1-flash-image-preview")
+filled = inpaint(img, mask, "clear sky")          # default fal-ai/flux-pro/v1/fill
+big = upscale_image(img, scale=2.0)               # default fal-ai/esrgan
+```
+
+Model ids pick the provider: `openai/...` and `google/...` go direct when their
+key is set, otherwise through OpenRouter; `fal-ai/...` goes to fal. Edits that
+cannot keep the input's aspect ratio raise an error instead of stretching the
+image.
+
+### Cost ledger
+
+Every metered provider call appends one JSONL row to `~/.merceka/costs.jsonl`
+(override with `MERCEKA_COST_LEDGER`). `usd` is the provider's own figure
+(`usd_source: "provider"`) or rate-table arithmetic from `rates.json`
+(`usd_source: "rates"`, an estimate). It is `null` when neither exists.
+
+```python
+from merceka_core import costs
+
+with costs.attribution({"sessionId": "level_42", "operation": "extract"}):
+    ...  # every row recorded in here carries this meta
+```
+
+```bash
+uv run python -m merceka_core.costs --since 2026-09-30T00:00:00+03:00
+```
+
+The summary reports `usd_metered` and `usd_rates` separately; `usd_known` is their sum.
+
+### Vision critique
+
+```python
+from merceka_core.vision import critique
+
+result = critique(["ours.png"], reference="target.png")
+result["verdict"], result["score"], result["defects"], result["recurring_checks"]
+```
+
+A panel of judges (OpenRouter models, the local `claude` and `codex` CLIs, and an
+Anthropic zoom judge) scores the images. The verdict aggregates the judges that
+answered; `skipped` lists the ones that didn't.
+
+### Agents
+
+```python
+from merceka_core import Agent, AgentRequest, ClaudeCodeAgentProvider
+
+agent = Agent(ClaudeCodeAgentProvider(model="sonnet"))
+result = await agent.run(AgentRequest(message="Summarise chapter 3", system_prompt="",
+                                      roots=(book_dir,)))
+```
+
+`AgentProfile.READ_ONLY` (the default) restricts the agent to read and search
+tools inside `roots`. `AgentProfile.WRITE` allows edits and shell commands. The
+Claude, Codex and pi providers enforce this with each CLI's own tool and sandbox
+flags.
+
 ### Cross-process GPU serialization
 
 Multiple processes (slab vision triage, mindweaver enrichment, ad-hoc
