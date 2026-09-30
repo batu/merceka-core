@@ -29,6 +29,13 @@ _env.load_provider_keys()
 _logger = logging.getLogger(__name__)
 
 CLAUDE_CLI_TIMEOUT = 120  # seconds
+# Streaming Claude CLI teardown. A child whose output ended gets the grace period
+# to exit on its own; SIGTERM and then SIGKILL follow, each wait bounded, so an
+# abandoned or stuck stream can never block its consumer's teardown.
+_STREAM_EXIT_GRACE_S = 5.0
+_STREAM_SIGNAL_WAIT_S = 5.0
+_STREAM_STDERR_TAIL = 2000  # characters of CLI stderr carried on a stream failure
+_STREAM_STDERR_WAIT_S = 1.0
 
 
 from typing import Optional
@@ -117,6 +124,73 @@ from merceka_core.retry import (  # noqa: F401 — re-exported for back-compat
   _retry_delay,
   _retry_after_seconds,
 )
+
+
+def _stop_stream_process(process: subprocess.Popen, *, finished: bool) -> bool:
+  """Reap a streaming CLI child without ever blocking indefinitely.
+
+  A child whose output ended (``finished``) gets a grace period to exit on its
+  own; an abandoned or failed stream is terminated at once. SIGTERM is followed
+  by SIGKILL if it is ignored. Returns True when the child had to be signalled.
+  """
+  if finished:
+    try:
+      process.wait(timeout=_STREAM_EXIT_GRACE_S)
+      return False
+    except subprocess.TimeoutExpired:
+      pass
+  if process.poll() is not None:
+    return False
+  process.terminate()
+  try:
+    process.wait(timeout=_STREAM_SIGNAL_WAIT_S)
+  except subprocess.TimeoutExpired:
+    process.kill()
+    try:
+      process.wait(timeout=_STREAM_SIGNAL_WAIT_S)
+    except subprocess.TimeoutExpired:
+      _logger.error("Claude CLI pid %s did not exit after SIGKILL", process.pid)
+  return True
+
+
+def _read_pipe_tail(pipe, limit: int) -> str:
+  """The last ``limit`` characters left in an exited child's output ``pipe``.
+
+  Bounded by ``_STREAM_STDERR_WAIT_S``: a grandchild that inherited the pipe can
+  hold it open after the child exits, and an unbounded read would then block.
+  """
+  import select
+
+  chunks: list[bytes] = []
+  try:
+    fd = pipe.fileno()
+    deadline = time.monotonic() + _STREAM_STDERR_WAIT_S
+    while (remaining := deadline - time.monotonic()) > 0:
+      ready, _, _ = select.select([fd], [], [], remaining)
+      if not ready:
+        break
+      data = os.read(fd, 65536)
+      if not data:
+        break
+      chunks.append(data)
+  except (OSError, ValueError):
+    pass  # the detail is best-effort; the failure is raised regardless
+  return b"".join(chunks).decode("utf-8", errors="replace")[-limit:]
+
+
+def _claude_result_error(event: dict) -> str | None:
+  """The failure message of a stream-json ``result`` event, or None on success.
+
+  Failed runs set ``is_error`` (usage limit, auth, API errors carry the message in
+  ``result``) or use an ``error_*`` subtype (max turns, execution errors, which
+  list messages in ``errors``).
+  """
+  subtype = str(event.get("subtype") or "")
+  if not event.get("is_error") and not subtype.startswith("error"):
+    return None
+  errors = event.get("errors")
+  detail = event.get("result") or ("; ".join(map(str, errors)) if errors else "")
+  return f"Claude CLI reported an error ({subtype or 'unknown'}): {detail or 'no detail'}"
 
 
 class LLM:
@@ -921,11 +995,18 @@ class LLM:
         env=env,
         cwd=cwd,
       )
-      # Send message and close stdin so Claude starts processing
-      process.stdin.write(message)
-      process.stdin.close()
-
+      finished = False  # stdout was read to a result event or to EOF
+      result_seen = False
+      result_error: str | None = None
+      stderr_tail = ""
       try:
+        try:
+          # Send message and close stdin so Claude starts processing.
+          process.stdin.write(message)
+          process.stdin.close()
+        except BrokenPipeError:
+          pass  # the CLI exited at once; its exit status and stderr say why
+
         for line in process.stdout:
           line = line.strip()
           if not line:
@@ -939,11 +1020,34 @@ class LLM:
           if text is not None:
             yield text
           elif _cli.is_claude_result_event(obj):
+            result_seen = True
+            result_error = _claude_result_error(obj)
             break
+        finished = True
       finally:
-        process.stdout.close()
-        process.stderr.close()
-        process.wait()
+        # Runs on normal completion, on errors, and when the consumer abandons
+        # the stream (GeneratorExit): the child is always reaped, never waited
+        # on without a bound.
+        signalled = _stop_stream_process(process, finished=finished)
+        # Success is a clean exit, or a clean result event from a child that
+        # then had to be signalled because it lingered.
+        succeeded = result_error is None and (
+          result_seen if signalled else process.returncode == 0
+        )
+        if finished and not succeeded and process.poll() is not None:
+          stderr_tail = _read_pipe_tail(process.stderr, _STREAM_STDERR_TAIL)
+        for pipe in (process.stdin, process.stdout, process.stderr):
+          with contextlib.suppress(OSError):
+            pipe.close()
+
+    if succeeded:
+      return
+    # The CLI reports failures (usage limit, auth, bad flags) through an error
+    # result event and/or a non-zero exit. Raise, so stream_generate's fallback
+    # runs instead of an empty answer passing as success.
+    detail = "\n".join(part for part in (result_error, stderr_tail.strip()) if part)
+    code = process.returncode if process.returncode and not signalled else 1
+    raise subprocess.CalledProcessError(code, cmd, stderr=detail or None)
 
   def stream_generate(self, message: str, **kwargs):
     """Stream tokens from the primary model. Sync generator.
@@ -952,14 +1056,19 @@ class LLM:
     non-Claude models.
     """
     if self.use_claude:
+      streamed = False
       try:
-        yield from self._claude_stream(message, **kwargs)
+        with contextlib.closing(self._claude_stream(message, **kwargs)) as stream:
+          for chunk in stream:
+            streamed = True
+            yield chunk
         return
-      except (FileNotFoundError, OSError) as e:
-        if self.fallback:
-          _logger.warning("Claude stream failed (%s), falling back", type(e).__name__)
-        else:
+      except (FileNotFoundError, OSError, subprocess.CalledProcessError) as e:
+        # Once chunks reached the consumer, a fallback answer would be appended
+        # to a partial one, so the failure is raised instead.
+        if not self.fallback or streamed:
           raise
+        _logger.warning("Claude stream failed (%s), falling back", type(e).__name__)
 
     # Fallback: generate full response and yield as one chunk
     fb = self._fallback_llm(self.fallback or self.model_name)
