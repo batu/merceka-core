@@ -218,6 +218,39 @@ def _read_pipe_tail(pipe, limit: int) -> str:
   return b"".join(chunks).decode("utf-8", errors="replace")[-limit:]
 
 
+def _decode_tool_arguments(msg: dict) -> None:
+  """Decode JSON-string tool-call arguments in place, where they are valid JSON.
+
+  Invalid arguments stay a string; the tool loop reports them to the model.
+  """
+  for tc in msg.get("tool_calls") or []:
+    args = tc["function"].get("arguments")
+    if isinstance(args, str):
+      with contextlib.suppress(json.JSONDecodeError):
+        tc["function"]["arguments"] = json.loads(args)
+
+
+def _tool_arguments(tool_call: dict) -> tuple[dict, str | None]:
+  """A tool call's arguments as a dict, or an error message for the model.
+
+  Models sometimes emit arguments that are not a JSON object (truncated,
+  single-quoted). The message becomes the tool result, so the model can retry,
+  instead of the whole call failing.
+  """
+  fn = tool_call["function"]
+  args = fn.get("arguments")
+  if args is None or args == "":
+    return {}, None
+  if isinstance(args, str):
+    try:
+      args = json.loads(args)
+    except json.JSONDecodeError as exc:
+      return {}, f"Error: arguments for {fn['name']} are not valid JSON ({exc}): {args[:200]}"
+  if not isinstance(args, dict):
+    return {}, f"Error: arguments for {fn['name']} must be a JSON object, got {args!r:.200}"
+  return args, None
+
+
 def _claude_result_error(event: dict) -> str | None:
   """The failure message of a stream-json ``result`` event, or None on success.
 
@@ -610,12 +643,7 @@ class LLM:
       body = json.load(response)
     self._record_openrouter_usage(payload["model"], body)
     msg = self._openrouter_choice(body)["message"]
-    # Normalize: ensure arguments is a dict
-    if msg.get("tool_calls"):
-      for tc in msg["tool_calls"]:
-        args = tc["function"].get("arguments")
-        if isinstance(args, str):
-          tc["function"]["arguments"] = json.loads(args)
+    _decode_tool_arguments(msg)
     return msg
 
   async def _acloud_call_raw(self, messages: list[dict], **kwargs) -> dict:
@@ -634,11 +662,7 @@ class LLM:
       body = response.json()
     self._record_openrouter_usage(payload["model"], body)
     msg = self._openrouter_choice(body)["message"]
-    if msg.get("tool_calls"):
-      for tc in msg["tool_calls"]:
-        args = tc["function"].get("arguments")
-        if isinstance(args, str):
-          tc["function"]["arguments"] = json.loads(args)
+    _decode_tool_arguments(msg)
     return msg
 
   # --- Tool execution and agentic loop ---
@@ -646,9 +670,9 @@ class LLM:
   def _execute_tool_call(self, tool_call: dict) -> str:
     """Dispatch a tool call to its handler, return result as string."""
     fn_name = tool_call["function"]["name"]
-    fn_args = tool_call["function"]["arguments"]
-    if isinstance(fn_args, str):
-      fn_args = json.loads(fn_args)
+    fn_args, error = _tool_arguments(tool_call)
+    if error:
+      return error
     handler = self._tool_handlers.get(fn_name)
     if handler is None:
       return f"Error: unknown tool '{fn_name}'"
@@ -700,11 +724,11 @@ class LLM:
 
       for tc in assistant_msg["tool_calls"]:
         fn_name = tc["function"]["name"]
-        fn_args = tc["function"]["arguments"]
-        if isinstance(fn_args, str):
-          fn_args = json.loads(fn_args)
+        fn_args, error = _tool_arguments(tc)
         handler = self._tool_handlers.get(fn_name)
-        if handler is None:
+        if error:
+          result = error
+        elif handler is None:
           result = f"Error: unknown tool '{fn_name}'"
         else:
           try:
