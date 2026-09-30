@@ -11,7 +11,8 @@ import inspect
 import mimetypes
 import re as _re
 from pathlib import Path
-from typing import Callable, Literal, Optional, get_type_hints
+from types import UnionType
+from typing import Callable, Literal, Optional, Union, get_args, get_origin, get_type_hints
 
 from pydantic import BaseModel
 
@@ -36,7 +37,8 @@ def create_message_with_resource(
     role: Message role (user or assistant)
     
   Returns:
-    Message dict in litellm vision format with base64-encoded content
+    Message dict in OpenAI/OpenRouter multimodal format: images as a base64
+    ``image_url`` part, PDFs as a base64 ``file`` part.
   """
   resource_path = Path(resource_path)
   
@@ -68,16 +70,23 @@ def create_message_with_resource(
       ".3gp": "video/3gpp",
     }
     mime_type = mime_map.get(ext, "application/octet-stream")
-  
+
+  data_url = f"data:{mime_type};base64,{base64_data}"
+  if mime_type == "application/pdf":
+    # OpenRouter takes PDFs as a file part; an image_url part is for images.
+    attachment = {
+      "type": "file",
+      "file": {"filename": resource_path.name, "file_data": data_url},
+    }
+  else:
+    attachment = {"type": "image_url", "image_url": {"url": data_url}}
+
   # Create message with multimodal content
   return {
     "role": role,
     "content": [
       {"type": "text", "text": text},
-      {
-        "type": "image_url",
-        "image_url": {"url": f"data:{mime_type};base64,{base64_data}"},
-      },
+      attachment,
     ],
   }
 
@@ -110,7 +119,12 @@ def create_ollama_vision_message(
 
 
 def _python_type_to_json(hint) -> str:
-  """Map a Python type annotation to a JSON Schema type string."""
+  """Map a Python type annotation to a JSON Schema type string.
+
+  ``X | None`` / ``Optional[X]`` map to ``X``'s type: the parameter's schema
+  type describes the value a model should send. Other unions fall back to
+  ``"string"``.
+  """
   _TYPE_MAP = {
     str: "string",
     int: "integer",
@@ -118,6 +132,11 @@ def _python_type_to_json(hint) -> str:
     bool: "boolean",
     list: "array",
   }
+  args = get_args(hint)
+  if get_origin(hint) in (Union, UnionType) and type(None) in args:
+    non_none = [arg for arg in args if arg is not type(None)]
+    if len(non_none) == 1:
+      hint = non_none[0]
   origin = getattr(hint, "__origin__", None)
   if origin is list:
     return "array"

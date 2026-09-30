@@ -1,3 +1,4 @@
+import pytest
 
 
 class TestCodexProvider:
@@ -41,3 +42,43 @@ class TestCodexProvider:
 
     monkeypatch.setattr("merceka_core.llm.subprocess.run", fake_run)
     assert LLM("codex/default").generate("x") == "ok"
+
+
+class TestVerify:
+  """LLM(<ollama model>) pulls the model only when it is not installed."""
+
+  @pytest.fixture
+  def ollama(self, monkeypatch):
+    import merceka_core.llm as llm_module
+
+    state = {"installed": [], "pulled": []}
+    monkeypatch.setattr(llm_module, "list_local_models", lambda: list(state["installed"]))
+    monkeypatch.setattr(llm_module, "_download_model", state["pulled"].append)
+    return state
+
+  @pytest.mark.parametrize("name,installed", [
+    ("gemma3", ["gemma3:latest"]),  # Ollama lists the implicit :latest tag
+    ("gemma3:latest", ["gemma3:latest"]),
+    ("gemma4:26b", ["gemma4:26b", "gemma3:latest"]),
+    ("hf.co/org/model", ["hf.co/org/model:latest"]),
+    ("localhost:5000/model", ["localhost:5000/model:latest"]),  # port, not a tag
+  ])
+  def test_installed_model_is_not_pulled(self, ollama, name, installed):
+    """Regression: LLM("gemma3") pulled on every construction."""
+    from merceka_core.llm import LLM
+
+    ollama["installed"] = installed
+    LLM(name)
+    assert ollama["pulled"] == []
+
+  @pytest.mark.parametrize("name,installed", [
+    ("gemma3", ["gemma3:1b"]),
+    ("gemma3:1b", ["gemma3:latest"]),
+    ("gemma3", []),
+  ])
+  def test_missing_model_is_pulled(self, ollama, name, installed):
+    from merceka_core.llm import LLM
+
+    ollama["installed"] = installed
+    LLM(name)
+    assert ollama["pulled"] == [name]
