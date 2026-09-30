@@ -31,8 +31,8 @@ def _openai_body(size=(1, 1)):
   return {"data": [{"b64_json": _png_b64(size)}]}
 
 
-def _openrouter_body():
-  uri = f"data:image/png;base64,{_png_b64()}"
+def _openrouter_body(size=(1, 1)):
+  uri = f"data:image/png;base64,{_png_b64(size)}"
   return {"choices": [{"message": {"images": [{"image_url": {"url": uri}}]}}]}
 
 
@@ -211,7 +211,7 @@ class TestEditImageDispatch:
     assert result.size == (20, 30)  # resized back to the input dimensions
 
   def test_non_openai_model_hits_openrouter_with_image_part(self, fake_post, source):
-    fake = fake_post(FakeResponse(body=_openrouter_body()))
+    fake = fake_post(FakeResponse(body=_openrouter_body((40, 60))))
 
     result = edit_image(source, "make it blue", model="google/gemini-3.1-flash-image-preview")
 

@@ -10,6 +10,7 @@ __all__ = [
 import base64
 import io
 import json
+import math
 import os
 import re
 
@@ -381,6 +382,22 @@ def _aspect_matches(size: tuple[int, int], original_size: tuple[int, int]) -> bo
   in_aspect = ow / oh if oh else 1.0
   out_aspect = rw / rh if rh else 1.0
   return abs(out_aspect - in_aspect) / in_aspect <= 0.02
+
+
+# Aspect ratios every Gemini image model accepts as imageConfig.aspectRatio;
+# OpenRouter's image_config.aspect_ratio takes the same values.
+_SUPPORTED_ASPECT_RATIOS = ("1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9")
+
+
+def _nearest_aspect_ratio(w: int, h: int) -> str:
+  """The supported aspect ratio closest to ``w``x``h``, compared in log space."""
+  target = math.log(w / h)
+
+  def distance(ratio: str) -> float:
+    num, den = ratio.split(":")
+    return abs(math.log(int(num) / int(den)) - target)
+
+  return min(_SUPPORTED_ASPECT_RATIOS, key=distance)
 
 
 def _require_servable_aspect(size: str, original_size: tuple[int, int], model: str) -> None:
@@ -763,10 +780,11 @@ def edit_image(
     and not os.environ.get("MERCEKA_FORCE_OPENROUTER")
   ):
     result = _generate_google(
-      prompt, model.removeprefix("google/"), "1:1", False, input_images=[image]
+      prompt, model.removeprefix("google/"), _nearest_aspect_ratio(*image.size), False,
+      input_images=[image],
     )
-    if resize_to_input and result.size != image.size:
-      result = result.resize(image.size, Image.Resampling.LANCZOS)
+    if resize_to_input:
+      result = _resize_to_input_guarded(result, image.size)
     return result
 
   api_key = os.environ.get("OPENROUTER_API_KEY")
@@ -777,12 +795,7 @@ def edit_image(
   original_size = image.size
 
   w, h = image.size
-  if w == h:
-    ar = "1:1"
-  elif w > h:
-    ar = "16:9" if w / h > 1.5 else "4:3"
-  else:
-    ar = "9:16" if h / w > 1.5 else "3:4"
+  ar = _nearest_aspect_ratio(w, h)
   img_size = "1K" if max(w, h) <= 1024 else "2K"
 
   payload = {
@@ -821,8 +834,8 @@ def edit_image(
   usage = data.get("usage") or {}
   _costs.record(source="openrouter", model=model, usage=usage, usd=usage.get("cost"))
   result = _openrouter_image_or_raise(data)
-  if resize_to_input and result.size != original_size:
-    result = result.resize(original_size, Image.Resampling.LANCZOS)
+  if resize_to_input:
+    result = _resize_to_input_guarded(result, original_size)
   return result
 
 
@@ -996,10 +1009,7 @@ def _inpaint_fal(
     img_response.raise_for_status()
 
   result = Image.open(io.BytesIO(img_response.content)).convert("RGB")
-  # Resize to match input dimensions (fal.ai may return different size)
-  if result.size != image.size:
-    result = result.resize(image.size, Image.Resampling.LANCZOS)
-  return result
+  return _resize_to_input_guarded(result, image.size)
 
 
 def _inpaint_openrouter(
