@@ -126,21 +126,131 @@ def test_parse_fenced_json_and_legacy_fidelity_findings():
   ]
 
 
-def test_parse_prose_fallback():
-  parsed = parse_judge_response("Fidelity: 88%\n- Major color: primary button is dull")
-
-  assert parsed["score"] == 88
-  assert parsed["defects"][0]["key"] == "color"
-  assert parsed["defects"][0]["severity"] == "major"
+def test_parse_rejects_prose_without_a_json_verdict():
+  # There is no prose fallback: a regex used to grab the first number after "score".
+  with pytest.raises(ValueError):
+    parse_judge_response("Fidelity: 88%\n- Major color: primary button is dull")
 
 
-def test_malformed_json_block_falls_back_to_prose():
-  parsed = parse_judge_response(
-    '```json\n{"score": nope}\n```\nFidelity: 77%\n- Minor spacing: button too low'
+@pytest.mark.parametrize(
+  "text",
+  [
+    # Review repro r3 D: the rubric's "0" used to become the score.
+    "Score (0-100): 42\n- Blocker background: opaque box behind ribbon",
+    # Review repro r4 A: truncated JSON after a prose score used to parse as 97.
+    'Score: 97. {"score": 97, "defects": [{"key": "layout"',
+  ],
+)
+def test_parse_prose_scores_are_parse_failures(text):
+  with pytest.raises(ValueError):
+    parse_judge_response(text)
+
+
+def test_malformed_json_block_is_a_parse_failure():
+  with pytest.raises(ValueError):
+    parse_judge_response(
+      '```json\n{"score": nope}\n```\nFidelity: 77%\n- Minor spacing: button too low'
+    )
+
+
+def _verdict(score: float, defects: list[dict] | None = None, passes: bool = True) -> str:
+  return json.dumps(
+    {
+      "score": score,
+      "defects": defects or [],
+      "recurring_checks": [
+        {"id": check_id, "pass": passes, "evidence": "OURS 1 x=1 y=1"}
+        for check_id in RECURRING_CHECK_IDS
+      ],
+    }
   )
 
-  assert parsed["score"] == 77
-  assert parsed["defects"][0]["key"] == "spacing"
+
+_BLOCKER = {
+  "key": "background",
+  "region": "banner",
+  "severity": "blocker",
+  "defect": "opaque box",
+  "direction": "make it transparent",
+}
+
+
+def test_parse_ignores_braced_narration_before_the_verdict():
+  # Review repro r3 A: this used to parse as 95.
+  text = (
+    "Leaning in on the banner. Initial impression: score 95 looks plausible, "
+    "but let me check {the ribbon}.\n" + _verdict(41, [_BLOCKER])
+  )
+
+  parsed = parse_judge_response(text)
+
+  assert parsed["score"] == 41
+  assert [d["severity"] for d in parsed["defects"]] == ["blocker"]
+  assert {c["pass"] for c in parsed["recurring_checks"]} == {True}
+
+
+def test_parse_takes_the_final_verdict_after_a_draft():
+  # Review repro r3 B: this used to parse as 96, the draft.
+  text = f"Draft:\n{_verdict(96)}\nRevised after zooming:\n{_verdict(38, [_BLOCKER])}"
+
+  parsed = parse_judge_response(text)
+
+  assert parsed["score"] == 38
+  assert parsed["defects"][0]["defect"] == "opaque box"
+
+
+def test_parse_takes_the_last_fenced_verdict():
+  text = f"```json\n{_verdict(96)}\n```\nOn reflection:\n```json\n{_verdict(38)}\n```"
+
+  assert parse_judge_response(text)["score"] == 38
+
+
+def test_parse_keeps_recurring_checks_despite_a_trailing_brace_note():
+  # Review repro r6 C: every recurring check used to become None.
+  checks = [
+    {"id": check_id, "pass": check_id != "banner-transparency", "evidence": "OURS 1"}
+    for check_id in RECURRING_CHECK_IDS
+  ]
+  text = (
+    json.dumps({"score": 91, "defects": [], "recurring_checks": checks})
+    + "\n(evidence coordinates are in {OURS 1} pixel space)"
+  )
+
+  parsed = parse_judge_response(text)
+
+  assert parsed["score"] == 91
+  assert parsed["recurring_checks"] == checks
+
+
+@pytest.mark.parametrize(
+  "trailer",
+  [
+    '{"note": "zoomed twice"}',
+    '{"score": 99}',
+    '{"score": true, "defects": []}',
+    '{"score": 99, "defects": [], "recurring_checks": "all pass"}',
+  ],
+)
+def test_parse_skips_objects_that_are_not_verdicts(trailer):
+  parsed = parse_judge_response(f"{_verdict(41)}\n{trailer}")
+
+  assert parsed["score"] == 41
+
+
+def test_parse_accepts_a_numeric_string_score():
+  assert parse_judge_response('{"score": "85", "defects": []}')["score"] == 85
+
+
+def test_prose_judge_answer_is_skipped_as_parse_failure(monkeypatch):
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  client = _client_for(["Score (0-100): 42\n- Blocker background: opaque box", _content(92)])
+
+  result = run_critique(
+    [PNG_BYTES], judges=[_judge("prose"), _judge("good")], quorum=1, client=client
+  )
+
+  assert result["skipped"] == [{"judge": "prose", "reason": "parse-failure"}]
+  assert result["score"] == 92
 
 
 def test_parse_clamps_scores():
@@ -194,7 +304,7 @@ def test_critique_median_payload_and_reference(monkeypatch, tmp_path):
   assert body["temperature"] == 0
   assert body["response_format"]["type"] == "json_schema"
   # provider.require_parameters dropped: anthropic-via-OpenRouter hard-400s strict
-  # params (schema numeric bounds); tolerant fenced/prose parse is the fallback.
+  # params (schema numeric bounds); fenced/embedded JSON extraction is the fallback.
   assert "provider" not in body
   parts = body["messages"][0]["content"]
   assert [part["type"] for part in parts].count("image_url") == 2

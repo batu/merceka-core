@@ -605,8 +605,9 @@ def _call_judge(
     "messages": messages,
     "temperature": 0,
     # response_format is best-effort: providers that ignore it (e.g. anthropic)
-    # fall back to the tolerant fenced/prose parser. require_parameters would
-    # hard-400 those providers (found live: anthropic 400 vs gemini 200).
+    # fall back to the fenced/embedded JSON extraction in parse_judge_response.
+    # require_parameters would hard-400 those providers (found live: anthropic
+    # 400 vs gemini 200).
     "response_format": _OPENROUTER_RESPONSE_FORMAT,
   }
   try:
@@ -640,75 +641,99 @@ def parse_judge_response(
   *,
   recurring_check_units: list[str] | None = None,
 ) -> dict[str, Any]:
-  """Parse one judge response into a clamped score and normalized defects."""
+  """Parse one judge response into a clamped score and normalized defects.
+
+  The verdict is the last JSON object in ``text`` that fits the response schema:
+  a finite numeric ``score`` (a number, or a string holding one), a ``defects``
+  list and ``recurring_checks``, which must be a list when present. The whole
+  text is tried first, then fenced ```json blocks, then every balanced top-level
+  object, so narration with braces, a draft before the final answer or a
+  trailing note cannot displace the verdict. A verdict that omits
+  ``recurring_checks`` still counts; its checks are recorded as skipped.
+
+  Raises:
+    ValueError: When no object fits the schema. There is no prose fallback;
+      the panel records the judge as ``parse-failure``.
+  """
   if not isinstance(text, str):
     raise ValueError("judge response is not text")
   check_units = _normalize_recurring_check_units([b""], recurring_check_units)
-  obj = _extract_json_object(text)
+  obj = _extract_verdict(text)
   if obj is None:
-    return _parse_prose_response(text, check_units)
+    raise ValueError("judge response has no JSON verdict with a numeric score and defects list")
 
-  raw_score = obj.get("score", obj.get("fidelity"))
-  score = _clamp_score(raw_score)
+  score = _clamp_score(_verdict_score(obj))
   if score is None:
     raise ValueError("judge response missing numeric score")
 
-  raw_defects = obj.get("defects", obj.get("findings", []))
-  defects = [_normalize_defect(d) for d in raw_defects] if isinstance(raw_defects, list) else []
+  defects = [_normalize_defect(d) for d in _verdict_defects(obj)]
   defects.sort(key=lambda d: SEVERITY_RANK[d["severity"]], reverse=True)
   recurring_checks = _normalize_recurring_checks(obj.get("recurring_checks"), check_units)
   return {"score": score, "defects": defects, "recurring_checks": recurring_checks}
 
 
-def _extract_json_object(text: str) -> dict[str, Any] | None:
-  start = text.find("{")
-  end = text.rfind("}")
-  if start == -1 or end <= start:
-    return None
+_FENCED_BLOCK = re.compile(r"```(?:json)?\s*(.*?)```", re.S | re.I)
+
+
+def _extract_verdict(text: str) -> dict[str, Any] | None:
   try:
-    return json.loads(text[start : end + 1])
+    whole = json.loads(text.strip())
   except json.JSONDecodeError:
-    return None
+    whole = None
+  if _is_verdict(whole):
+    return whole
+  for candidates in (_fenced_objects(text), _balanced_objects(text)):
+    verdicts = [obj for obj in candidates if _is_verdict(obj)]
+    if verdicts:
+      return verdicts[-1]
+  return None
 
 
-def _parse_prose_response(text: str, recurring_check_units: list[str]) -> dict[str, Any]:
-  match = re.search(r"\b(?:score|fidelity)\b[^0-9-]*(-?\d+(?:\.\d+)?)\s*%?", text, re.I)
-  if match is None:
-    match = re.search(r"(-?\d+(?:\.\d+)?)\s*%\s*(?:fidelity|match|score)", text, re.I)
-  score = _clamp_score(match.group(1) if match else None)
-  if score is None:
-    raise ValueError("judge prose response missing numeric score")
-
-  defects = []
-  for line in text.splitlines():
-    sev = re.search(r"\b(blocker|major|minor)\b", line, re.I)
-    if not sev:
+def _fenced_objects(text: str) -> list[Any]:
+  objects = []
+  for block in _FENCED_BLOCK.findall(text):
+    try:
+      objects.append(json.loads(block))
+    except json.JSONDecodeError:
       continue
-    severity = sev.group(1).lower()
-    key_match = re.search(
-      r"\b(" + "|".join(re.escape(k) for k in FINDING_KEYS) + r")\b", line, re.I
-    )
-    key = _normalize_key(key_match.group(1).lower() if key_match else line)
-    defect_text = re.sub(r"^\s*[-*0-9.)\s]+", "", line).strip()
-    defects.append(
-      {
-        "key": key,
-        "region": "unspecified",
-        "severity": severity,
-        "defect": _clip(defect_text),
-        "direction": _clip(defect_text),
-      }
-    )
+  return objects
 
-  defects.sort(key=lambda d: SEVERITY_RANK[d["severity"]], reverse=True)
-  return {
-    "score": score,
-    "defects": defects,
-    "recurring_checks": _skipped_recurring_checks(
-      recurring_check_units,
-      "model returned prose only",
-    ),
-  }
+
+def _balanced_objects(text: str) -> list[Any]:
+  """Every top-level JSON object in ``text``, skipping spans that do not decode."""
+  decoder = json.JSONDecoder()
+  objects = []
+  index = text.find("{")
+  while index != -1:
+    try:
+      obj, end = decoder.raw_decode(text, index)
+    except json.JSONDecodeError:
+      index = text.find("{", index + 1)
+      continue
+    objects.append(obj)
+    index = text.find("{", end)
+  return objects
+
+
+def _is_verdict(obj: Any) -> bool:
+  if not isinstance(obj, dict):
+    return False
+  score = _verdict_score(obj)
+  return (
+    not isinstance(score, bool)
+    and _clamp_score(score) is not None
+    and isinstance(_verdict_defects(obj), list)
+    and isinstance(obj.get("recurring_checks", []), list)
+  )
+
+
+def _verdict_score(obj: dict[str, Any]) -> Any:
+  # "fidelity"/"findings" are the legacy field names.
+  return obj.get("score", obj.get("fidelity"))
+
+
+def _verdict_defects(obj: dict[str, Any]) -> Any:
+  return obj.get("defects", obj.get("findings"))
 
 
 def _normalize_defect(raw: Any) -> dict[str, str]:
