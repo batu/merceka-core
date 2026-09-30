@@ -118,11 +118,13 @@ _BACKEND_LOCAL = "local"
 
 from merceka_core.retry import (  # noqa: F401 — re-exported for back-compat
   _RETRY_BASE_DELAY,
+  _RETRY_HTTPX_ERRORS,
   _RETRY_MAX_ATTEMPTS,
   _RETRY_MAX_DELAY,
   _RETRY_STATUS_CODES,
   _retry_delay,
   _retry_after_seconds,
+  _urlerror_never_sent,
 )
 
 
@@ -729,12 +731,13 @@ class LLM:
           _RETRY_MAX_ATTEMPTS,
         )
         time.sleep(delay)
-      except (ConnectionRefusedError, ConnectionResetError, urllib.error.URLError) as exc:
-        if attempt == _RETRY_MAX_ATTEMPTS - 1:
+      except urllib.error.URLError as exc:
+        # Retry only failures before any connection existed; see retry.py.
+        if not _urlerror_never_sent(exc) or attempt == _RETRY_MAX_ATTEMPTS - 1:
           raise
         delay = _retry_delay(attempt)
         _logger.warning(
-          "OpenRouter connection error %s, retrying in %.2fs", type(exc).__name__, delay
+          "OpenRouter connection error %s, retrying in %.2fs", type(exc.reason).__name__, delay
         )
         time.sleep(delay)
     # Unreachable (the loop either returns or raises on the last attempt).
@@ -772,14 +775,9 @@ class LLM:
           _RETRY_MAX_ATTEMPTS,
         )
         await asyncio.sleep(delay)
-      except (
-        httpx.ConnectError,
-        httpx.ReadTimeout,
-        httpx.WriteTimeout,
-        httpx.PoolTimeout,
-        ConnectionRefusedError,
-        ConnectionResetError,
-      ) as exc:
+      except _RETRY_HTTPX_ERRORS as exc:
+        # Connect/pool failures only: a read or write timeout can follow a
+        # request the provider already billed; see retry.py.
         if attempt == _RETRY_MAX_ATTEMPTS - 1:
           raise
         delay = _retry_delay(attempt)
