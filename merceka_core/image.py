@@ -979,7 +979,11 @@ def _inpaint_fal(
     if response.status_code != 200:
       raise RuntimeError(f"fal.ai API error {response.status_code}: {response.text[:500]}")
     result_data = response.json()
+    # fal states no per-call cost in the body. The gateway's request id rides in
+    # a response header; it tells a duplicated write apart from a repeat call.
+    request_id = (getattr(response, "headers", None) or {}).get("x-fal-request-id")
 
+  _costs.record(source="fal", model=model, usage={"calls": 1}, request_id=request_id)
   try:
     result_image_url = result_data["images"][0]["url"]
   except (KeyError, IndexError) as e:
