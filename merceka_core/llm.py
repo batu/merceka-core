@@ -1299,9 +1299,23 @@ class LLM:
     )
 
   def _verify(self):
-    """Verify the model is available, download if missing."""
-    if self.model_name not in list_local_models():
+    """Verify the model is available, download if missing.
+
+    Ollama lists installed models with their tag, and an untagged name means
+    ``:latest``, so ``gemma3`` is installed when ``gemma3:latest`` is listed.
+    """
+    if _with_default_tag(self.model_name) not in {
+      _with_default_tag(name) for name in list_local_models()
+    }:
       _download_model(self.model_name)
+
+
+def _with_default_tag(model_name: str) -> str:
+  """``model_name`` with Ollama's implicit ``:latest`` tag made explicit.
+
+  Only a colon in the last path segment is a tag (``host:port/model`` is not).
+  """
+  return model_name if ":" in model_name.rsplit("/", 1)[-1] else f"{model_name}:latest"
 
 
 # Gemini surface moved to merceka_core.llm_gemini; re-exported for back-compat.
