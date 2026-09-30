@@ -1529,7 +1529,12 @@ def _reject_schema_mismatch(schema: type[BaseModel], content) -> None:
   if not isinstance(data, dict) or not data:
     return
   names = set(schema.model_fields)
-  names |= {f.alias for f in schema.model_fields.values() if isinstance(f.alias, str)}
+  for field in schema.model_fields.values():
+    for alias in (field.alias, field.validation_alias):
+      if isinstance(alias, str):
+        names.add(alias)
+      elif alias is not None:
+        return  # AliasChoices/AliasPath: accepted keys are not a flat set
   if names.isdisjoint(data):
     keys = ", ".join(sorted(map(str, data))[:10])
     raise ValidationError.from_exception_data(schema.__name__, [{

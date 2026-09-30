@@ -68,3 +68,22 @@ def test_root_model_keys_are_data_not_fields():
 
   out = LLM("openrouter/x", output_schema=Scores)._parse_response('{"a": 1, "b": 2}')
   assert out.root == {"a": 1, "b": 2}
+
+
+def test_validation_alias_choices_are_not_rejected():
+  from pydantic import AliasChoices, Field
+
+  class Choices(OutputSchema):
+    ok: bool = Field(default=False, validation_alias=AliasChoices("isOk", "is_ok"))
+
+  out = LLM("openrouter/x", output_schema=Choices)._parse_response('{"isOk": true}')
+  assert out.ok is True
+
+
+def test_string_validation_alias_counts_as_a_schema_field():
+  from pydantic import Field
+
+  class Renamed(OutputSchema):
+    ok: bool = Field(default=False, validation_alias="isOk")
+
+  assert LLM("openrouter/x", output_schema=Renamed)._parse_response('{"isOk": true}').ok
