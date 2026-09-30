@@ -12,10 +12,12 @@ __all__ = [
   "generate_with_search_grounding",
 ]
 
+import contextlib
 import json
 import logging
 import os
 import subprocess
+import tempfile
 import httpx
 import time
 import urllib.error
@@ -799,6 +801,20 @@ class LLM:
       return self.timeout
     return CLAUDE_CLI_TIMEOUT
 
+  @contextlib.contextmanager
+  def _claude_workdir(self):
+    """Working directory for Claude CLI runs.
+
+    Read/Grep/Glob run without approval inside the working directory, so it must
+    be a declared directory, never the caller's cwd (which may hold a .env). The
+    first ``add_dirs`` entry is used when present, otherwise a scratch directory.
+    """
+    if self.add_dirs and Path(self.add_dirs[0]).is_dir():
+      yield str(self.add_dirs[0])
+      return
+    with tempfile.TemporaryDirectory(prefix="merceka-claude-") as scratch:
+      yield scratch
+
   def _claude_call(self, message: str, **kwargs) -> str | OutputSchema:
     """Call Claude CLI via subprocess.
 
@@ -815,14 +831,16 @@ class LLM:
     timeout = self._resolve_timeout(kwargs)
     env = _cli.claude_env()
 
-    result = subprocess.run(
-      cmd,
-      input=message,
-      capture_output=True,
-      text=True,
-      timeout=timeout,
-      env=env,
-    )
+    with self._claude_workdir() as cwd:
+      result = subprocess.run(
+        cmd,
+        input=message,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+        cwd=cwd,
+      )
     if result.returncode != 0:
       raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
 
@@ -877,39 +895,41 @@ class LLM:
       allowed_tools=self.allowed_tools,
       stream=True,
     )
-    env = _cli.claude_env()
-    process = subprocess.Popen(
-      cmd,
-      stdin=subprocess.PIPE,
-      stdout=subprocess.PIPE,
-      stderr=subprocess.PIPE,
-      text=True,
-      bufsize=1,
-      env=env,
-    )
-    # Send message and close stdin so Claude starts processing
-    process.stdin.write(message)
-    process.stdin.close()
+    with self._claude_workdir() as cwd:
+      env = _cli.claude_env()
+      process = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=env,
+        cwd=cwd,
+      )
+      # Send message and close stdin so Claude starts processing
+      process.stdin.write(message)
+      process.stdin.close()
 
-    try:
-      for line in process.stdout:
-        line = line.strip()
-        if not line:
-          continue
-        try:
-          obj = json.loads(line)
-        except json.JSONDecodeError:
-          continue
+      try:
+        for line in process.stdout:
+          line = line.strip()
+          if not line:
+            continue
+          try:
+            obj = json.loads(line)
+          except json.JSONDecodeError:
+            continue
 
-        text = _cli.claude_stream_text_delta(obj)
-        if text is not None:
-          yield text
-        elif _cli.is_claude_result_event(obj):
-          break
-    finally:
-      process.stdout.close()
-      process.stderr.close()
-      process.wait()
+          text = _cli.claude_stream_text_delta(obj)
+          if text is not None:
+            yield text
+          elif _cli.is_claude_result_event(obj):
+            break
+      finally:
+        process.stdout.close()
+        process.stderr.close()
+        process.wait()
 
   def stream_generate(self, message: str, **kwargs):
     """Stream tokens from the primary model. Sync generator.

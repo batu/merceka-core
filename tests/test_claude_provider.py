@@ -70,6 +70,26 @@ class TestClaudeCall:
         assert args[1]["env"]["ANTHROPIC_API_KEY"] == ""
         assert result == "Hello!"
 
+    def test_claude_call_runs_in_scratch_dir_without_add_dirs(self):
+        """Read/Grep/Glob are free inside the cwd, so it must never be the
+        caller's directory (which may hold a .env)."""
+        with patch.object(LLM, '_verify'):
+            llm = LLM("claude/sonnet")
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+            llm.generate("Hi")
+        cwd = mock_run.call_args.kwargs["cwd"]
+        assert Path(cwd).name.startswith("merceka-claude-")
+        assert cwd != str(Path.cwd())
+
+    def test_claude_call_runs_in_first_add_dir(self, tmp_path):
+        with patch.object(LLM, '_verify'):
+            llm = LLM("claude/sonnet", add_dirs=[str(tmp_path)], allowed_tools=["Read"])
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+            llm.generate("Hi")
+        assert mock_run.call_args.kwargs["cwd"] == str(tmp_path)
+
     def test_claude_call_respects_timeout(self):
         with patch.object(LLM, '_verify'):
             llm = LLM("claude/opus", system_prompt="test")
