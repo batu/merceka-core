@@ -146,8 +146,10 @@ _FALLBACK_ERRORS = (
 )
 
 # Per-call kwargs a fallback on another transport must not receive.
-# Read only by the CLI transports (_claude_call/_codex_call).
-_CLI_KWARGS = frozenset({"timeout", "images"})
+# Read only by the CLI transports (_claude_call/_codex_call). ``timeout`` is not
+# listed: the CLI and OpenRouter transports both read it (subprocess or HTTP
+# timeout), and the Ollama and Gemini fallbacks keep only allowlisted kwargs.
+_CLI_KWARGS = frozenset({"images"})
 # Accepted by ollama.chat() besides the model/messages/tools/think/format that
 # _local_call sets itself.
 _OLLAMA_KWARGS = frozenset({"options", "keep_alive", "stream", "logprobs", "top_logprobs"})
@@ -404,7 +406,8 @@ class LLM:
     unknown kwargs with a TypeError and OpenRouter would send them in the request
     body, so the fallback gets only what its transport accepts: CLI models keep
     everything (they read ``timeout``/``images`` and ignore the rest), OpenRouter
-    loses the CLI- and Ollama-only kwargs, and Ollama gets its own kwargs with
+    keeps ``timeout`` (its HTTP timeout) and loses the CLI-, Ollama- and
+    Gemini-only kwargs, and Ollama gets its own kwargs with
     sampling parameters moved into ``options``. Returns None when the fallback
     cannot honour the call: ``images`` reach only a codex fallback, and any other
     one would answer without seeing them.

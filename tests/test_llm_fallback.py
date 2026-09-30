@@ -182,8 +182,21 @@ class TestFallbackKwargs:
     monkeypatch.setattr(LLM, "_cloud_call", cloud)
     llm = LLM("openrouter/primary", fallback="openrouter/fb")
     kwargs = {"temperature": 0.1, "logprobs": True, "top_logprobs": 2, "provider": {"order": ["a"]}}
-    assert llm.generate("q", timeout=30, keep_alive="5m", **kwargs) == "ok"
+    assert llm.generate("q", keep_alive="5m", **kwargs) == "ok"
     assert seen["openrouter/fb"] == kwargs
+
+  def test_cli_timeout_carries_over_to_an_openrouter_fallback(self, monkeypatch):
+    """OpenRouter uses timeout= as its HTTP timeout, so the fallback keeps it."""
+    seen = {}
+
+    def cloud(self, *_args, **kwargs):
+      seen.update(kwargs)
+      return "ok"
+
+    monkeypatch.setattr(LLM, "_claude_call", _failing(FileNotFoundError("claude")))
+    monkeypatch.setattr(LLM, "_cloud_call", cloud)
+    assert LLM("claude/sonnet", fallback="openrouter/fb").generate("q", timeout=600) == "ok"
+    assert seen == {"timeout": 600}
 
   def test_codex_images_keep_a_codex_fallback(self, monkeypatch, tmp_path):
     png = tmp_path / "x.png"
