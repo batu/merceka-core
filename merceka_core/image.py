@@ -545,12 +545,34 @@ def _google_image_or_raise(data: dict) -> Image.Image:
   raise RuntimeError(f"Gemini API returned no image: {str(data)[:400]}")
 
 
+# imageConfig.imageSize tiers per Gemini image model, from Google's image
+# generation docs: 3.1 Flash Image adds 512, 3.1 Flash Lite Image serves 1K
+# only, and 2.5 Flash Image documents no imageSize. Unlisted models get none.
+_GOOGLE_IMAGE_SIZES = (
+  ("gemini-3.1-flash-lite-image", ("1K",)),
+  ("gemini-3.1-flash-image", ("512", "1K", "2K", "4K")),
+  ("gemini-3-pro-image", ("1K", "2K", "4K")),
+)
+
+
+def _google_image_size(model: str, image_size: str | None) -> str | None:
+  """``image_size`` as a Gemini imageSize tier, or None when the model can't take it."""
+  if not image_size:
+    return None
+  tier = image_size.strip().upper()
+  for prefix, tiers in _GOOGLE_IMAGE_SIZES:
+    if model.startswith(prefix):
+      return tier if tier in tiers else None
+  return None
+
+
 def _generate_google(
   prompt: str,
   model: str,
   aspect_ratio: str,
   transparent: bool,
   input_images: list[Image.Image] | None = None,
+  image_size: str | None = None,
 ) -> Image.Image:
   """Direct Google Gemini API image generation/editing (key-gated fallback
   when OpenRouter is unavailable). Same prompt contract as the OpenRouter
@@ -570,11 +592,15 @@ def _generate_google(
       }
     )
   parts.append({"text": prompt + suffix})
+  image_config = {"aspectRatio": aspect_ratio}
+  tier = _google_image_size(model, image_size)
+  if tier:
+    image_config["imageSize"] = tier
   payload = {
     "contents": [{"parts": parts}],
     "generationConfig": {
       "responseModalities": ["IMAGE"],
-      "imageConfig": {"aspectRatio": aspect_ratio},
+      "imageConfig": image_config,
     },
   }
   with httpx.Client(timeout=300) as client:
@@ -729,7 +755,9 @@ def generate_image(
   ):
     # Key-gated direct Gemini dispatch; OpenRouter remains the default when
     # only OPENROUTER_API_KEY is present.
-    return _generate_google(prompt, model.removeprefix("google/"), aspect_ratio, transparent)
+    return _generate_google(
+      prompt, model.removeprefix("google/"), aspect_ratio, transparent, image_size=image_size
+    )
 
   api_key = os.environ.get("OPENROUTER_API_KEY")
   if not api_key:
