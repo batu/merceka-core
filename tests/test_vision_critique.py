@@ -8,6 +8,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from merceka_core import costs
 from merceka_core.vision import critique, openrouter_budget_floor
 from merceka_core.vision import critique as exported_critique
 from merceka_core.vision.critique import (
@@ -833,6 +834,82 @@ def test_unknown_string_judge_goes_to_openrouter_by_id():
   (judge,) = critique_module._normalize_judges(["vendor/new-model"])
 
   assert judge == {"id": "vendor/new-model", "model": "vendor/new-model", "enabled": True}
+
+
+def _ledger_rows() -> list[dict]:
+  path = costs.ledger_path()
+  if not path.exists():
+    return []
+  return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def _metered_response(content: str, generation_id: str, cost: float) -> httpx.Response:
+  return httpx.Response(
+    200,
+    json={
+      "id": generation_id,
+      "choices": [{"message": {"content": content}}],
+      "usage": {"prompt_tokens": 1200, "completion_tokens": 300, "cost": cost},
+    },
+  )
+
+
+def test_openrouter_judge_calls_are_metered_and_cli_judges_are_not(monkeypatch):
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  monkeypatch.setattr(critique_module.subprocess, "run", _fake_cli_run({"codex": (0, _content(90))}))
+  client = _client_for(
+    [
+      _metered_response(_content(92), "gen-1", 0.0123),
+      # Billed even though the verdict does not parse.
+      _metered_response("not parseable", "gen-2", 0.004),
+      httpx.Response(429, text="rate limited"),
+    ]
+  )
+
+  result = run_critique(
+    [PNG_BYTES],
+    judges=["codex/gpt-5.6-terra", _judge("j1"), _judge("junk"), _judge("limited")],
+    quorum=1,
+    client=client,
+  )
+
+  assert result["participated"] == ["codex/gpt-5.6-terra", "j1"]
+  body = json.loads(client.calls[0].content)  # type: ignore[attr-defined]
+  assert body["usage"] == {"include": True}
+  rows = [{k: v for k, v in row.items() if k != "ts"} for row in _ledger_rows()]
+  usage = {"prompt_tokens": 1200, "completion_tokens": 300}
+  assert rows == [
+    {
+      "source": "openrouter",
+      "model": "model/j1",
+      "usage": {**usage, "cost": 0.0123},
+      "usd": 0.0123,
+      "usd_source": "provider",
+      "request_id": "gen-1",
+    },
+    {
+      "source": "openrouter",
+      "model": "model/junk",
+      "usage": {**usage, "cost": 0.004},
+      "usd": 0.004,
+      "usd_source": "provider",
+      "request_id": "gen-2",
+    },
+  ]
+
+
+def test_openrouter_response_without_usage_is_recorded_unpriced(monkeypatch):
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  client = _client_for([_content(92)])
+
+  run_critique([PNG_BYTES], judges=[_judge("j1")], client=client)
+
+  (row,) = _ledger_rows()
+  assert row["source"] == "openrouter"
+  assert row["model"] == "model/j1"
+  assert row["usage"] == {}
+  assert row["usd"] is None
+  assert "request_id" not in row
 
 
 def test_budget_floor_uses_openrouter_credits(monkeypatch):

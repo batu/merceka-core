@@ -22,6 +22,7 @@ import httpx
 import shutil
 
 from merceka_core import _cli, _env
+from merceka_core import costs as _costs
 from merceka_core.vision import zoom_judge as _zoom_judge
 import subprocess
 import tempfile as _tempfile
@@ -630,6 +631,8 @@ def _call_judge(
     # require_parameters would hard-400 those providers (found live: anthropic
     # 400 vs gemini 200).
     "response_format": _OPENROUTER_RESPONSE_FORMAT,
+    # Ask OpenRouter to report the call's cost so the ledger row is metered.
+    "usage": {"include": True},
   }
   try:
     response = client.post(
@@ -649,12 +652,33 @@ def _call_judge(
     return {"ok": False, "reason": _skip_reason_for_status(response.status_code)}
 
   try:
-    content = _extract_openrouter_text(response.json())
+    body = response.json()
+  except ValueError:
+    return {"ok": False, "reason": "parse-failure"}
+  _record_openrouter_cost(judge["model"], body)
+  try:
+    content = _extract_openrouter_text(body)
     parsed = parse_judge_response(content, recurring_check_units=recurring_check_units)
   except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
     return {"ok": False, "reason": "parse-failure"}
 
   return {"ok": True, **parsed}
+
+
+def _record_openrouter_cost(model: str, body: Any) -> None:
+  """Meter one billed OpenRouter call; the verdict may still fail to parse."""
+  if not isinstance(body, dict):
+    return
+  usage = body.get("usage")
+  usage = usage if isinstance(usage, dict) else {}
+  cost = usage.get("cost")
+  _costs.record(
+    source="openrouter",
+    model=model,
+    usage=usage,
+    usd=cost if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
+    request_id=body.get("id"),
+  )
 
 
 def parse_judge_response(

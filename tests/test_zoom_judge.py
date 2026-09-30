@@ -10,6 +10,8 @@ from PIL import Image
 
 import importlib
 
+from merceka_core import costs
+
 # The vision package re-exports the critique *function* under the same name as
 # the submodule, so attribute-style imports resolve to the function.
 critique_module = importlib.import_module("merceka_core.vision.critique")
@@ -336,3 +338,70 @@ def test_critique_keeps_finished_judges_when_the_zoom_judge_fails(monkeypatch):
 
   assert result["participated"] == ["panel/or"]
   assert result["skipped"] == [{"judge": ZOOM_JUDGE["id"], "reason": "malformed-response"}]
+
+
+def _metered(payload: dict, message_id: str, input_tokens: int = 1500) -> dict:
+  usage = {"input_tokens": input_tokens, "output_tokens": 120}
+  return {**payload, "id": message_id, "usage": usage}
+
+
+def _zoom_ledger_rows() -> list[dict]:
+  path = costs.ledger_path()
+  if not path.exists():
+    return []
+  rows = [json.loads(line) for line in path.read_text().splitlines()]
+  return [{k: v for k, v in row.items() if k != "ts"} for row in rows]
+
+
+def test_every_billed_zoom_round_is_metered():
+  client = _FakeClient(
+    [
+      _metered(_tool_use_response((0, 0, 32, 32)), "msg_1"),
+      _metered(_final_response(), "msg_2", input_tokens=4200),
+    ]
+  )
+
+  result = zoom_judge.call_zoom_judge(
+    ZOOM_JUDGE, [_png_bytes()], None, "judge this", api_key="sk-ant-test", client=client
+  )
+
+  assert result["ok"] is True
+  assert _zoom_ledger_rows() == [
+    {
+      "source": "anthropic",
+      "model": "claude-fable-5",
+      "usage": {"input_tokens": 1500, "output_tokens": 120},
+      "usd": None,
+      "request_id": "msg_1",
+    },
+    {
+      "source": "anthropic",
+      "model": "claude-fable-5",
+      "usage": {"input_tokens": 4200, "output_tokens": 120},
+      "usd": None,
+      "request_id": "msg_2",
+    },
+  ]
+
+
+def test_truncated_zoom_turn_is_still_metered():
+  client = _FakeClient(
+    [_metered({"stop_reason": "max_tokens", "content": [{"type": "text", "text": "{"}]}, "msg_9")]
+  )
+
+  result = zoom_judge.call_zoom_judge(
+    ZOOM_JUDGE, [_png_bytes()], None, "judge this", api_key="sk-ant-test", client=client
+  )
+
+  assert result == {"ok": False, "reason": "max-tokens"}
+  assert [row["request_id"] for row in _zoom_ledger_rows()] == ["msg_9"]
+
+
+def test_unparseable_zoom_response_writes_no_ledger_row():
+  client = _FakeClient([_NotJSON()])
+
+  zoom_judge.call_zoom_judge(
+    ZOOM_JUDGE, [_png_bytes()], None, "judge this", api_key="sk-ant-test", client=client
+  )
+
+  assert _zoom_ledger_rows() == []

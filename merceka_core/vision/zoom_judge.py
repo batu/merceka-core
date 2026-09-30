@@ -9,7 +9,9 @@ and returns them magnified to fill the budget.
 
 Talks to the Anthropic Messages API directly with httpx (no SDK dependency),
 matching how the rest of the panel talks to OpenRouter. Key-gated on
-ANTHROPIC_API_KEY by the caller in critique.py.
+ANTHROPIC_API_KEY by the caller in critique.py. Every billed round is written
+to the cost ledger with the API's token usage; usd stays null because the
+rate table has no entry for these models.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from typing import Any
 import httpx
 from PIL import Image
 
+from merceka_core import costs as _costs
 from merceka_core.vision.zoom import (
   MAX_EDGE_HIGHRES,
   MAX_TOKENS_HIGHRES,
@@ -125,6 +128,7 @@ def call_zoom_judge(
         body = response.json()
       except ValueError:
         return {"ok": False, "reason": "malformed-response"}
+      _record_anthropic_cost(judge["model"], body)
       blocks = _content_blocks(body)
       if blocks is None:
         return {"ok": False, "reason": "malformed-response"}
@@ -180,6 +184,19 @@ def _first_turn(
     content.append({"type": "text", "text": f"{label} ({view.width}x{view.height} px)"})
     content.append(_image_block(view, "image/png"))
   return originals, views, content
+
+
+def _record_anthropic_cost(model: str, body: Any) -> None:
+  """Meter one billed Messages API round. There is no rate entry, so usd stays null."""
+  if not isinstance(body, dict):
+    return
+  usage = body.get("usage")
+  _costs.record(
+    source="anthropic",
+    model=model,
+    usage=usage if isinstance(usage, dict) else {},
+    request_id=body.get("id"),
+  )
 
 
 def _content_blocks(body: Any) -> list[dict[str, Any]] | None:
