@@ -127,6 +127,26 @@ from merceka_core.retry import (  # noqa: F401 — re-exported for back-compat
   _urlerror_never_sent,
 )
 
+# Per-call kwargs a fallback on another transport must not receive.
+# Read only by the CLI transports (_claude_call/_codex_call).
+_CLI_KWARGS = frozenset({"timeout", "images"})
+# Accepted by ollama.chat() besides the model/messages/tools/think/format that
+# _local_call sets itself.
+_OLLAMA_KWARGS = frozenset({"options", "keep_alive", "stream", "logprobs", "top_logprobs"})
+# The Ollama kwargs OpenRouter has no counterpart for.
+_OLLAMA_ONLY_KWARGS = frozenset({"options", "keep_alive"})
+# OpenRouter sampling kwargs and their names in Ollama's ``options``.
+_OLLAMA_OPTIONS = {
+  "temperature": "temperature",
+  "top_p": "top_p",
+  "top_k": "top_k",
+  "seed": "seed",
+  "max_tokens": "num_predict",
+  "frequency_penalty": "frequency_penalty",
+  "presence_penalty": "presence_penalty",
+  "repetition_penalty": "repeat_penalty",
+}
+
 
 def _stop_stream_process(process: subprocess.Popen, *, finished: bool) -> bool:
   """Reap a streaming CLI child without ever blocking indefinitely.
@@ -317,12 +337,66 @@ class LLM:
       urllib.error.URLError,
       VideoBackendError,
     ) as e:
-      if self.fallback:
-        _logger.warning(
-          "Primary LLM failed (%s), falling back to %s", type(e).__name__, self.fallback
-        )
-        return self._fallback_llm().generate(message, **kwargs)
-      raise
+      target = self._cascade_target(kwargs)
+      if target is None:
+        raise
+      _logger.warning(
+        "Primary LLM failed (%s), falling back to %s", type(e).__name__, self.fallback
+      )
+      fb, fb_kwargs = target
+      return fb.generate(message, **fb_kwargs)
+
+  def _fallback_call(self, kwargs: dict) -> tuple["LLM", dict] | None:
+    """The fallback LLM and ``kwargs`` adapted to its transport.
+
+    Per-call kwargs are written for the primary's transport. Ollama rejects
+    unknown kwargs with a TypeError and OpenRouter would send them in the request
+    body, so the fallback gets only what its transport accepts: CLI models keep
+    everything (they read ``timeout``/``images`` and ignore the rest), OpenRouter
+    loses the CLI- and Ollama-only kwargs, and Ollama gets its own kwargs with
+    sampling parameters moved into ``options``. Returns None when the fallback
+    cannot honour the call: ``images`` reach only a codex fallback, and any other
+    one would answer without seeing them.
+    """
+    fb = self._fallback_llm()
+    if kwargs.get("images") and not fb.use_codex:
+      return None
+    if fb.use_claude or fb.use_codex:
+      return fb, dict(kwargs)
+    if fb.use_openrouter:
+      return fb, {k: v for k, v in kwargs.items() if k not in _CLI_KWARGS | _OLLAMA_ONLY_KWARGS}
+    fb_kwargs = {k: v for k, v in kwargs.items() if k in _OLLAMA_KWARGS}
+    options = {_OLLAMA_OPTIONS[k]: v for k, v in kwargs.items() if k in _OLLAMA_OPTIONS}
+    if options:
+      fb_kwargs["options"] = {**options, **(fb_kwargs.get("options") or {})}
+    dropped = sorted(set(kwargs) - set(fb_kwargs) - set(_OLLAMA_OPTIONS))
+    if dropped:
+      _logger.debug("Not passing %s to Ollama fallback %s", dropped, fb.model_name)
+    return fb, fb_kwargs
+
+  def _cascade_target(self, kwargs: dict) -> tuple["LLM", dict] | None:
+    """Where generate/agenerate send a call whose primary failed; None re-raises.
+
+    None when no fallback is set, when the fallback already served the call (a
+    CLI model with Python tools hands them to the fallback, and a second run
+    would repeat its tool calls), or when it cannot honour the call's kwargs.
+    """
+    if not self.fallback or self._select_backend() == _BACKEND_TOOLS_FALLBACK:
+      return None
+    return self._fallback_call(kwargs)
+
+  def _tools_fallback_call(self, kwargs: dict) -> tuple["LLM", dict]:
+    """The fallback that serves a CLI model's Python tools, with adapted kwargs."""
+    _logger.info(
+      "%s can't run Python tool callables, using fallback %s", self.model_name, self.fallback
+    )
+    target = self._fallback_call(kwargs)
+    if target is None:
+      raise ValueError(
+        f"{self.model_name!r} hands its Python tools to fallback {self.fallback!r}, which "
+        "cannot receive images=. Use a codex/ fallback, or drop tools= or images=."
+      )
+    return target
 
   def _generate_primary(self, message: str, **kwargs) -> str | OutputSchema:
     """Primary generation dispatch."""
@@ -341,11 +415,8 @@ class LLM:
     response and, for the Python tool loop, the full message trace (else None).
     """
     if backend == _BACKEND_TOOLS_FALLBACK:
-      _logger.info(
-        "%s can't run Python tool callables, using fallback %s", self.model_name, self.fallback
-      )
-      fb = self._fallback_llm()
-      return fb._run_backend(fb._select_backend(), messages, cli_prompt, **kwargs)
+      fb, fb_kwargs = self._tools_fallback_call(kwargs)
+      return fb._run_backend(fb._select_backend(), messages, cli_prompt, **fb_kwargs)
     if backend == _BACKEND_CLAUDE:
       return self._claude_call(cli_prompt, **kwargs), None
     if backend == _BACKEND_CODEX:
@@ -829,12 +900,14 @@ class LLM:
       urllib.error.URLError,
       VideoBackendError,
     ) as e:
-      if self.fallback:
-        _logger.warning(
-          "Primary LLM failed (%s), falling back to %s", type(e).__name__, self.fallback
-        )
-        return await self._fallback_llm().agenerate(message, **kwargs)
-      raise
+      target = self._cascade_target(kwargs)
+      if target is None:
+        raise
+      _logger.warning(
+        "Primary LLM failed (%s), falling back to %s", type(e).__name__, self.fallback
+      )
+      fb, fb_kwargs = target
+      return await fb.agenerate(message, **fb_kwargs)
 
   async def _agenerate_primary(self, message: str, **kwargs) -> str | OutputSchema:
     """Async primary generation dispatch. Mirrors _generate_primary exactly."""
@@ -843,10 +916,8 @@ class LLM:
     messages = [create_message(self.system_prompt, "system"), create_message(message, "user")]
     backend = self._select_backend()
     if backend == _BACKEND_TOOLS_FALLBACK:
-      _logger.info(
-        "%s can't run Python tool callables, using fallback %s", self.model_name, self.fallback
-      )
-      return await self._fallback_llm().agenerate(message, **kwargs)
+      fb, fb_kwargs = self._tools_fallback_call(kwargs)
+      return await fb._agenerate_primary(message, **fb_kwargs)
     if backend == _BACKEND_CLAUDE:
       return await asyncio.to_thread(self._claude_call, message, **kwargs)
     if backend == _BACKEND_CODEX:
@@ -1095,13 +1166,16 @@ class LLM:
       return
     except (FileNotFoundError, OSError, subprocess.CalledProcessError) as e:
       # Once chunks reached the consumer, a fallback answer would be appended
-      # to a partial one, so the failure is raised instead.
-      if not self.fallback or streamed:
+      # to a partial one, so the failure is raised instead. The stream ignores
+      # Python tools, so this is a primary failure even with tools set.
+      target = self._fallback_call(kwargs) if self.fallback and not streamed else None
+      if target is None:
         raise
       _logger.warning("Claude stream failed (%s), falling back", type(e).__name__)
 
     # The fallback answers as one chunk.
-    yield self._fallback_llm().generate(message, **kwargs)
+    fb, fb_kwargs = target
+    yield fb.generate(message, **fb_kwargs)
 
   async def astream_generate(self, message: str, **kwargs):
     """Async streaming generator. Runs the sync stream in a worker thread."""
