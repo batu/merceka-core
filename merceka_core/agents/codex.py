@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import subprocess
 import tempfile
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -34,25 +33,18 @@ class CodexAgentProvider:
   timeout_seconds: int = CODEX_TIMEOUT_SECONDS
 
   async def run(self, request: AgentRequest) -> AgentResult:
-    return await asyncio.to_thread(self._run_sync, request)
-
-  def stream(self, request: AgentRequest) -> AsyncIterator[AgentStreamEvent]:
-    return self._stream(request)
-
-  def _run_sync(self, request: AgentRequest) -> AgentResult:
     with tempfile.NamedTemporaryFile("r", encoding="utf-8", delete=False) as output_file:
       output_path = Path(output_file.name)
     try:
       cmd = self._command(request, json_output=True)
       cmd.extend(["--output-last-message", str(output_path)])
-      result = subprocess.run(
+      result = await _process.run(
         cmd,
         input=self._prompt(request),
-        capture_output=True,
-        text=True,
         timeout=self.timeout_seconds,
         cwd=str(request.roots[0]),
         env=_cli.codex_env(),
+        label="Codex",
       )
       raw_events = tuple(_process.raw_events_from_stdout(result.stdout, CODEX_PROVIDER))
       if result.returncode != 0:
@@ -71,18 +63,12 @@ class CodexAgentProvider:
     finally:
       output_path.unlink(missing_ok=True)
 
+  def stream(self, request: AgentRequest) -> AsyncIterator[AgentStreamEvent]:
+    return self._stream(request)
+
   async def _stream(self, request: AgentRequest) -> AsyncIterator[AgentStreamEvent]:
     cmd = self._command(request, json_output=True)
-    process = subprocess.Popen(
-      cmd,
-      stdin=subprocess.PIPE,
-      stdout=subprocess.PIPE,
-      stderr=subprocess.PIPE,
-      text=True,
-      bufsize=1,
-      cwd=str(request.roots[0]),
-      env=_cli.codex_env(),
-    )
+    process = _process.start(cmd, cwd=str(request.roots[0]), env=_cli.codex_env())
     if process.stdin is None or process.stdout is None or process.stderr is None:
       raise ProviderFailure("Codex stream did not expose stdio pipes")
 

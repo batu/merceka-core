@@ -1,7 +1,8 @@
 import json
+import os
 import subprocess
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -15,6 +16,20 @@ from merceka_core.agent import (
 )
 from merceka_core.agents import _process
 from merceka_core.agents.pi import PiAgentProvider
+
+
+RUN = "merceka_core.agents._process.run"
+
+
+@pytest.fixture(autouse=True)
+def _no_real_processes(monkeypatch: pytest.MonkeyPatch) -> None:
+  """No test here may start the real CLI or signal a real process group."""
+
+  def refuse(*args, **_kwargs):
+    raise AssertionError(f"unit test tried to launch a real CLI: {args[:1]}")
+
+  monkeypatch.setattr(subprocess, "Popen", refuse)
+  monkeypatch.setattr(os, "killpg", lambda pgid, sig: None)
 
 
 def _request(root: Path, profile: AgentProfile = AgentProfile.READ_ONLY) -> AgentRequest:
@@ -36,7 +51,8 @@ async def test_run_invokes_pi_read_only_json_no_session(tmp_path: Path):
 
   provider = PiAgentProvider(model="gemini-flash-latest")
   with patch(
-    "subprocess.run",
+    RUN,
+    new_callable=AsyncMock,
     return_value=subprocess.CompletedProcess(["pi"], 0, stdout=stdout, stderr=""),
   ) as mock_run:
     result = await provider.run(_request(tmp_path))
@@ -60,7 +76,8 @@ async def test_run_invokes_pi_read_only_json_no_session(tmp_path: Path):
 async def test_run_maps_write_profile_to_write_tools(tmp_path: Path):
   provider = PiAgentProvider(model="gemini-flash-latest")
   with patch(
-    "subprocess.run",
+    RUN,
+    new_callable=AsyncMock,
     return_value=subprocess.CompletedProcess(["pi"], 0, stdout="", stderr=""),
   ) as mock_run:
     await provider.run(_request(tmp_path, profile=AgentProfile.WRITE))
@@ -74,7 +91,8 @@ async def test_run_maps_write_profile_to_write_tools(tmp_path: Path):
 async def test_run_passes_provider_when_set(tmp_path: Path):
   provider = PiAgentProvider(model="anthropic/claude", provider="anthropic")
   with patch(
-    "subprocess.run",
+    RUN,
+    new_callable=AsyncMock,
     return_value=subprocess.CompletedProcess(["pi"], 0, stdout="", stderr=""),
   ) as mock_run:
     await provider.run(_request(tmp_path))
@@ -91,7 +109,8 @@ async def test_run_falls_back_to_joined_deltas_without_final_text(tmp_path: Path
   )
   provider = PiAgentProvider(model="gemini-flash-latest")
   with patch(
-    "subprocess.run",
+    RUN,
+    new_callable=AsyncMock,
     return_value=subprocess.CompletedProcess(["pi"], 0, stdout=stdout, stderr=""),
   ):
     result = await provider.run(_request(tmp_path))
@@ -103,7 +122,8 @@ async def test_run_falls_back_to_joined_deltas_without_final_text(tmp_path: Path
 async def test_run_raises_provider_failure_on_nonzero_exit(tmp_path: Path):
   provider = PiAgentProvider(model="gemini-flash-latest")
   with patch(
-    "subprocess.run",
+    RUN,
+    new_callable=AsyncMock,
     return_value=subprocess.CompletedProcess(["pi"], 1, stdout="", stderr="nope"),
   ):
     with pytest.raises(ProviderFailure, match="Pi failed"):
@@ -143,18 +163,20 @@ async def test_stream_normalizes_json_events(tmp_path: Path, monkeypatch: pytest
       return None
 
   class FakeProcess:
+    pid = 424242
+
     def __init__(self, *args, **kwargs):
       self.stdin = FakeStdin()
       self.stdout = FakeStdout()
       self.stderr = FakeStderr()
+      self.returncode = None
+
+    def poll(self):
+      return self.returncode
+
+    def wait(self, timeout=None):
       self.returncode = 0
-      self.terminated = False
-
-    def wait(self):
       return 0
-
-    def terminate(self):
-      self.terminated = True
 
   monkeypatch.setattr(subprocess, "Popen", FakeProcess)
 
@@ -191,17 +213,20 @@ async def test_stream_raises_on_nonzero_exit(tmp_path: Path, monkeypatch: pytest
       return None
 
   class FakeProcess:
+    pid = 424242
+
     def __init__(self, *args, **kwargs):
       self.stdin = FakeStdin()
       self.stdout = FakeStdout()
       self.stderr = FakeStderr()
+      self.returncode = None
+
+    def poll(self):
+      return self.returncode
+
+    def wait(self, timeout=None):
       self.returncode = 1
-
-    def wait(self):
       return 1
-
-    def terminate(self):
-      return None
 
   monkeypatch.setattr(subprocess, "Popen", FakeProcess)
 

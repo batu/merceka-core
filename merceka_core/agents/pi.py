@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import subprocess
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -34,21 +33,13 @@ class PiAgentProvider:
   timeout_seconds: int = PI_TIMEOUT_SECONDS
 
   async def run(self, request: AgentRequest) -> AgentResult:
-    return await asyncio.to_thread(self._run_sync, request)
-
-  def stream(self, request: AgentRequest) -> AsyncIterator[AgentStreamEvent]:
-    return self._stream(request)
-
-  def _run_sync(self, request: AgentRequest) -> AgentResult:
-    cmd = self._command(request)
-    result = subprocess.run(
-      cmd,
+    result = await _process.run(
+      self._command(request),
       input=self._prompt(request),
-      capture_output=True,
-      text=True,
       timeout=self.timeout_seconds,
       cwd=str(request.roots[0]),
       env=scrubbed_env(),
+      label="Pi",
     )
     raw_events = tuple(_process.raw_events_from_stdout(result.stdout, PI_PROVIDER))
     if result.returncode != 0:
@@ -65,18 +56,12 @@ class PiAgentProvider:
       )
     return AgentResult(text=text, raw_events=raw_events)
 
+  def stream(self, request: AgentRequest) -> AsyncIterator[AgentStreamEvent]:
+    return self._stream(request)
+
   async def _stream(self, request: AgentRequest) -> AsyncIterator[AgentStreamEvent]:
     cmd = self._command(request)
-    process = subprocess.Popen(
-      cmd,
-      stdin=subprocess.PIPE,
-      stdout=subprocess.PIPE,
-      stderr=subprocess.PIPE,
-      text=True,
-      bufsize=1,
-      cwd=str(request.roots[0]),
-      env=scrubbed_env(),
-    )
+    process = _process.start(cmd, cwd=str(request.roots[0]), env=scrubbed_env())
     if process.stdin is None or process.stdout is None or process.stderr is None:
       raise ProviderFailure("Pi stream did not expose stdio pipes")
 

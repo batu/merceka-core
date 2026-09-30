@@ -1,7 +1,8 @@
 import json
+import os
 import subprocess
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -14,6 +15,20 @@ from merceka_core.agent import (
   ProviderFailure,
 )
 from merceka_core.agents.codex import CodexAgentProvider
+
+
+RUN = "merceka_core.agents._process.run"
+
+
+@pytest.fixture(autouse=True)
+def _no_real_processes(monkeypatch: pytest.MonkeyPatch) -> None:
+  """No test here may start the real CLI or signal a real process group."""
+
+  def refuse(*args, **_kwargs):
+    raise AssertionError(f"unit test tried to launch a real CLI: {args[:1]}")
+
+  monkeypatch.setattr(subprocess, "Popen", refuse)
+  monkeypatch.setattr(os, "killpg", lambda pgid, sig: None)
 
 
 def _request(root: Path) -> AgentRequest:
@@ -33,7 +48,7 @@ async def test_run_maps_write_profile_to_workspace_write_sandbox(tmp_path: Path)
     roots=(tmp_path,),
     profile=AgentProfile.WRITE,
   )
-  with patch("subprocess.run", side_effect=fake_run) as mock_run:
+  with patch(RUN, new_callable=AsyncMock, side_effect=fake_run) as mock_run:
     await provider.run(request)
 
   cmd = mock_run.call_args.args[0]
@@ -50,7 +65,7 @@ async def test_run_invokes_codex_exec_read_only_with_output_file(tmp_path: Path)
     return subprocess.CompletedProcess(cmd, 0, stdout='{"type":"done"}\n', stderr="")
 
   provider = CodexAgentProvider(model="openai/gpt-test")
-  with patch("subprocess.run", side_effect=fake_run) as mock_run:
+  with patch(RUN, new_callable=AsyncMock, side_effect=fake_run) as mock_run:
     result = await provider.run(_request(tmp_path))
 
   cmd = mock_run.call_args.args[0]
@@ -72,7 +87,7 @@ async def test_default_high_alias_uses_account_default_model_with_high_effort(tm
     return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
   provider = CodexAgentProvider(model="gpt-5.5-high")
-  with patch("subprocess.run", side_effect=fake_run) as mock_run:
+  with patch(RUN, new_callable=AsyncMock, side_effect=fake_run) as mock_run:
     await provider.run(_request(tmp_path))
 
   cmd = mock_run.call_args.args[0]
@@ -92,7 +107,7 @@ async def test_run_adds_secondary_roots(tmp_path: Path):
     return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
   provider = CodexAgentProvider(model="gpt-5.5-high")
-  with patch("subprocess.run", side_effect=fake_run) as mock_run:
+  with patch(RUN, new_callable=AsyncMock, side_effect=fake_run) as mock_run:
     await provider.run(AgentRequest(message="Q", system_prompt="P", roots=(first, second)))
 
   cmd = mock_run.call_args.args[0]
@@ -102,7 +117,7 @@ async def test_run_adds_secondary_roots(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_run_raises_provider_failure_on_nonzero_exit(tmp_path: Path):
   provider = CodexAgentProvider(model="gpt-5.5-high")
-  with patch("subprocess.run", return_value=subprocess.CompletedProcess(["codex"], 1, stdout="", stderr="nope")):
+  with patch(RUN, new_callable=AsyncMock, return_value=subprocess.CompletedProcess(["codex"], 1, stdout="", stderr="nope")):
     with pytest.raises(ProviderFailure, match="Codex failed"):
       await provider.run(_request(tmp_path))
 
@@ -138,18 +153,20 @@ async def test_stream_normalizes_json_events(tmp_path: Path, monkeypatch: pytest
       return None
 
   class FakeProcess:
+    pid = 424242
+
     def __init__(self, *args, **kwargs):
       self.stdin = FakeStdin()
       self.stdout = FakeStdout()
       self.stderr = FakeStderr()
+      self.returncode = None
+
+    def poll(self):
+      return self.returncode
+
+    def wait(self, timeout=None):
       self.returncode = 0
-      self.terminated = False
-
-    def wait(self):
       return 0
-
-    def terminate(self):
-      self.terminated = True
 
   monkeypatch.setattr(subprocess, "Popen", FakeProcess)
 

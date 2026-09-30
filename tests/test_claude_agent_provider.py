@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import signal
+import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -18,6 +21,22 @@ from merceka_core.agent import (
 from merceka_core.agents.claude_code import ClaudeCodeAgentProvider
 
 
+RUN = "merceka_core.agents._process.run"
+
+
+@pytest.fixture(autouse=True)
+def signals(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
+  """No test here may start the real CLI or signal a real process group."""
+
+  def refuse(*args, **_kwargs):
+    raise AssertionError(f"unit test tried to launch a real CLI: {args[:1]}")
+
+  sent: list[tuple[int, int]] = []
+  monkeypatch.setattr(subprocess, "Popen", refuse)
+  monkeypatch.setattr(os, "killpg", lambda pgid, sig: sent.append((pgid, sig)))
+  return sent
+
+
 def _request(root: Path) -> AgentRequest:
   return AgentRequest(
     message="What is in the book?",
@@ -30,7 +49,7 @@ def _request(root: Path) -> AgentRequest:
 async def test_claude_agent_run_builds_read_only_command(tmp_path: Path):
   provider = ClaudeCodeAgentProvider(model="sonnet")
 
-  with patch("subprocess.run") as mock_run:
+  with patch(RUN, new_callable=AsyncMock) as mock_run:
     mock_run.return_value = MagicMock(returncode=0, stdout="Answer\n", stderr="")
     result = await provider.run(_request(tmp_path))
 
@@ -73,7 +92,7 @@ async def test_claude_agent_run_builds_write_command(tmp_path: Path):
     profile=AgentProfile.WRITE,
   )
 
-  with patch("subprocess.run") as mock_run:
+  with patch(RUN, new_callable=AsyncMock) as mock_run:
     mock_run.return_value = MagicMock(returncode=0, stdout="Done\n", stderr="")
     await provider.run(request)
 
@@ -104,7 +123,7 @@ async def test_claude_read_only_command_is_locked_down(tmp_path: Path):
   """
   provider = ClaudeCodeAgentProvider(model="sonnet")
 
-  with patch("subprocess.run") as mock_run:
+  with patch(RUN, new_callable=AsyncMock) as mock_run:
     mock_run.return_value = MagicMock(returncode=0, stdout="Answer\n", stderr="")
     await provider.run(_request(tmp_path))
 
@@ -129,7 +148,7 @@ async def test_claude_agent_run_passes_multiple_roots(tmp_path: Path):
   second_root.mkdir()
   provider = ClaudeCodeAgentProvider(model="sonnet")
 
-  with patch("subprocess.run") as mock_run:
+  with patch(RUN, new_callable=AsyncMock) as mock_run:
     mock_run.return_value = MagicMock(returncode=0, stdout="Answer", stderr="")
     await provider.run(AgentRequest(message="Q", system_prompt="P", roots=(first_root, second_root)))
 
@@ -144,27 +163,30 @@ async def test_claude_agent_run_passes_multiple_roots(tmp_path: Path):
 async def test_claude_agent_run_raises_on_nonzero_exit(tmp_path: Path):
   provider = ClaudeCodeAgentProvider(model="sonnet")
 
-  with patch("subprocess.run") as mock_run:
+  with patch(RUN, new_callable=AsyncMock) as mock_run:
     mock_run.return_value = MagicMock(returncode=2, stdout="partial", stderr="boom")
     with pytest.raises(ProviderFailure, match="Claude Code failed"):
       await provider.run(_request(tmp_path))
 
 
 class FakePopen:
+  pid = 424242
+
   def __init__(self, lines: list[str], returncode: int = 0, stderr: str = ""):
     self.stdin = io.StringIO()
     self.stdout = io.StringIO("".join(lines))
     self.stderr = io.StringIO(stderr)
-    self.returncode = returncode
-    self.terminated = False
+    self.returncode: int | None = None
+    self._exit_code = returncode
     self.wait_called = False
 
-  def wait(self) -> int:
-    self.wait_called = True
+  def poll(self) -> int | None:
     return self.returncode
 
-  def terminate(self) -> None:
-    self.terminated = True
+  def wait(self, timeout: float | None = None) -> int:
+    self.wait_called = True
+    self.returncode = self._exit_code
+    return self.returncode
 
 
 def _stream_line(obj: dict) -> str:
@@ -228,7 +250,7 @@ async def test_claude_agent_stream_malformed_json_becomes_raw_event(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_claude_agent_stream_closes_process_when_generator_closes(tmp_path: Path):
+async def test_claude_agent_stream_closes_process_when_generator_closes(tmp_path: Path, signals):
   process = FakePopen([
     _stream_line({
       "type": "stream_event",
@@ -247,4 +269,5 @@ async def test_claude_agent_stream_closes_process_when_generator_closes(tmp_path
     assert isinstance(event, AgentRawProviderEvent)
     await stream.aclose()
 
-  assert process.terminated is True
+  assert (process.pid, signal.SIGTERM) in signals
+  assert process.stdout.closed and process.stderr.closed
