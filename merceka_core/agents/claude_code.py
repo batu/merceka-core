@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import subprocess
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -19,6 +18,7 @@ from merceka_core.agent import (
   ProviderFailure,
   RawProviderEvent,
 )
+from merceka_core.agents import _process
 
 CLAUDE_CODE_PROVIDER = "claude_code"
 CLAUDE_CODE_TIMEOUT_SECONDS = 120
@@ -93,7 +93,7 @@ class ClaudeCodeAgentProvider:
         if not line:
           continue
 
-        raw_event = self._raw_event_from_line(line)
+        raw_event = _process.raw_event_from_line(line, CLAUDE_CODE_PROVIDER)
         raw_events.append(raw_event)
         yield AgentRawProviderEvent(raw_event=raw_event)
 
@@ -125,16 +125,16 @@ class ClaudeCodeAgentProvider:
         yield AgentRawProviderEvent(raw_event=completion_event)
       yield AgentComplete(result=AgentResult(text="".join(text_chunks), raw_events=tuple(raw_events)))
     except GeneratorExit:
-      self._terminate_process(process)
+      _process.terminate_process(process)
       raise
     except asyncio.CancelledError:
-      self._terminate_process(process)
+      _process.terminate_process(process)
       raise
     finally:
       if not completed and process.returncode is None:
-        self._terminate_process(process)
-      self._close_pipe(process.stdout)
-      self._close_pipe(process.stderr)
+        _process.terminate_process(process)
+      _process.close_pipe(process.stdout)
+      _process.close_pipe(process.stderr)
 
   def _command(self, request: AgentRequest, *, stream: bool) -> list[str]:
     tools = WRITE_TOOLS if request.profile == AgentProfile.WRITE else READ_ONLY_TOOLS
@@ -148,28 +148,8 @@ class ClaudeCodeAgentProvider:
       binary=self.claude_binary,
     )
 
-  def _raw_event_from_line(self, line: str) -> RawProviderEvent:
-    try:
-      payload: Any = json.loads(line)
-    except json.JSONDecodeError as exc:
-      return RawProviderEvent(
-        provider=CLAUDE_CODE_PROVIDER,
-        event_type="malformed_json",
-        payload={"line": line, "error": str(exc)},
-      )
-    event_type = str(payload.get("type", "raw")) if isinstance(payload, dict) else "raw"
-    return RawProviderEvent(provider=CLAUDE_CODE_PROVIDER, event_type=event_type, payload=payload)
-
   def _text_delta_from_payload(self, payload: dict[str, Any]) -> str | None:
     return _cli.claude_stream_text_delta(payload)
 
   def _env(self) -> dict[str, str]:
     return _cli.claude_env()
-
-  def _terminate_process(self, process: subprocess.Popen[str]) -> None:
-    process.terminate()
-    process.wait()
-
-  def _close_pipe(self, pipe: Any) -> None:
-    if pipe is not None:
-      pipe.close()

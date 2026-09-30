@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import subprocess
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -19,6 +18,7 @@ from merceka_core.agent import (
   ProviderFailure,
   RawProviderEvent,
 )
+from merceka_core.agents import _process
 
 PI_PROVIDER = "pi"
 PI_TIMEOUT_SECONDS = 300
@@ -50,7 +50,7 @@ class PiAgentProvider:
       cwd=str(request.roots[0]),
       env=scrubbed_env(),
     )
-    raw_events = tuple(self._raw_events_from_stdout(result.stdout))
+    raw_events = tuple(_process.raw_events_from_stdout(result.stdout, PI_PROVIDER))
     if result.returncode != 0:
       message = result.stderr.strip() or result.stdout.strip() or "unknown provider error"
       raise ProviderFailure(f"Pi failed with exit {result.returncode}: {message}")
@@ -94,7 +94,7 @@ class PiAgentProvider:
         if not line:
           continue
 
-        raw_event = self._raw_event_from_line(line)
+        raw_event = _process.raw_event_from_line(line, PI_PROVIDER)
         raw_events.append(raw_event)
         yield AgentRawProviderEvent(raw_event=raw_event)
 
@@ -113,16 +113,16 @@ class PiAgentProvider:
       text = self._final_text(tuple(raw_events)) or "".join(text_chunks)
       yield AgentComplete(result=AgentResult(text=text, raw_events=tuple(raw_events)))
     except GeneratorExit:
-      self._terminate_process(process)
+      _process.terminate_process(process)
       raise
     except asyncio.CancelledError:
-      self._terminate_process(process)
+      _process.terminate_process(process)
       raise
     finally:
       if process.returncode is None:
-        self._terminate_process(process)
-      self._close_pipe(process.stdout)
-      self._close_pipe(process.stderr)
+        _process.terminate_process(process)
+      _process.close_pipe(process.stdout)
+      _process.close_pipe(process.stderr)
 
   def _command(self, request: AgentRequest) -> list[str]:
     cmd = [self.pi_binary, "-p", "--mode", "json", "--no-session", "--model", self.model]
@@ -149,21 +149,6 @@ class PiAgentProvider:
       f"<user>\n{request.message}\n</user>\n"
     )
 
-  def _raw_events_from_stdout(self, stdout: str) -> list[RawProviderEvent]:
-    return [self._raw_event_from_line(line) for line in stdout.splitlines() if line.strip()]
-
-  def _raw_event_from_line(self, line: str) -> RawProviderEvent:
-    try:
-      payload: Any = json.loads(line)
-    except json.JSONDecodeError as exc:
-      return RawProviderEvent(
-        provider=PI_PROVIDER,
-        event_type="malformed_json",
-        payload={"line": line, "error": str(exc)},
-      )
-    event_type = str(payload.get("type", "raw")) if isinstance(payload, dict) else "raw"
-    return RawProviderEvent(provider=PI_PROVIDER, event_type=event_type, payload=payload)
-
   def _text_delta_from_payload(self, payload: dict[str, Any]) -> str | None:
     event_type = payload.get("type")
     if isinstance(event_type, str) and event_type.endswith((".output_text.delta", "message_delta")):
@@ -186,11 +171,3 @@ class PiAgentProvider:
       if isinstance(candidate, str) and candidate:
         final = candidate
     return final or "".join(chunks)
-
-  def _terminate_process(self, process: subprocess.Popen[str]) -> None:
-    process.terminate()
-    process.wait()
-
-  def _close_pipe(self, pipe: Any) -> None:
-    if pipe is not None:
-      pipe.close()

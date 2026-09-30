@@ -13,6 +13,7 @@ from merceka_core.agent import (
   AgentTextDelta,
   ProviderFailure,
 )
+from merceka_core.agents import _process
 from merceka_core.agents.pi import PiAgentProvider
 
 
@@ -209,9 +210,9 @@ async def test_stream_raises_on_nonzero_exit(tmp_path: Path, monkeypatch: pytest
     [event async for event in provider.stream(_request(tmp_path))]
 
 
-def test_malformed_json_line_becomes_raw_event(tmp_path: Path):
-  provider = PiAgentProvider(model="gemini-flash-latest")
-  event = provider._raw_event_from_line("not json")
+def test_malformed_json_line_becomes_raw_event():
+  event = _process.raw_event_from_line("not json", "pi")
 
+  assert event.provider == "pi"
   assert event.event_type == "malformed_json"
   assert event.payload["line"] == "not json"

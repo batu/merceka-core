@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import subprocess
 import tempfile
 from collections.abc import AsyncIterator
@@ -21,6 +20,7 @@ from merceka_core.agent import (
   ProviderFailure,
   RawProviderEvent,
 )
+from merceka_core.agents import _process
 
 CODEX_PROVIDER = "codex"
 CODEX_TIMEOUT_SECONDS = 300
@@ -54,7 +54,7 @@ class CodexAgentProvider:
         cwd=str(request.roots[0]),
         env=_cli.codex_env(),
       )
-      raw_events = tuple(self._raw_events_from_stdout(result.stdout))
+      raw_events = tuple(_process.raw_events_from_stdout(result.stdout, CODEX_PROVIDER))
       if result.returncode != 0:
         message = result.stderr.strip() or result.stdout.strip() or "unknown provider error"
         raise ProviderFailure(f"Codex failed with exit {result.returncode}: {message}")
@@ -100,7 +100,7 @@ class CodexAgentProvider:
         if not line:
           continue
 
-        raw_event = self._raw_event_from_line(line)
+        raw_event = _process.raw_event_from_line(line, CODEX_PROVIDER)
         raw_events.append(raw_event)
         yield AgentRawProviderEvent(raw_event=raw_event)
 
@@ -118,16 +118,16 @@ class CodexAgentProvider:
         raise ProviderFailure(f"Codex stream failed with exit {returncode}: {message}")
       yield AgentComplete(result=AgentResult(text="".join(text_chunks), raw_events=tuple(raw_events)))
     except GeneratorExit:
-      self._terminate_process(process)
+      _process.terminate_process(process)
       raise
     except asyncio.CancelledError:
-      self._terminate_process(process)
+      _process.terminate_process(process)
       raise
     finally:
       if process.returncode is None:
-        self._terminate_process(process)
-      self._close_pipe(process.stdout)
-      self._close_pipe(process.stderr)
+        _process.terminate_process(process)
+      _process.close_pipe(process.stdout)
+      _process.close_pipe(process.stderr)
 
   def _command(self, request: AgentRequest, *, json_output: bool) -> list[str]:
     model = "" if self.model in DEFAULT_CODEX_MODEL_ALIASES else self.model
@@ -158,21 +158,6 @@ class CodexAgentProvider:
       f"<user>\n{request.message}\n</user>\n"
     )
 
-  def _raw_events_from_stdout(self, stdout: str) -> list[RawProviderEvent]:
-    return [self._raw_event_from_line(line) for line in stdout.splitlines() if line.strip()]
-
-  def _raw_event_from_line(self, line: str) -> RawProviderEvent:
-    try:
-      payload: Any = json.loads(line)
-    except json.JSONDecodeError as exc:
-      return RawProviderEvent(
-        provider=CODEX_PROVIDER,
-        event_type="malformed_json",
-        payload={"line": line, "error": str(exc)},
-      )
-    event_type = str(payload.get("type", "raw")) if isinstance(payload, dict) else "raw"
-    return RawProviderEvent(provider=CODEX_PROVIDER, event_type=event_type, payload=payload)
-
   def _text_delta_from_payload(self, payload: dict[str, Any]) -> str | None:
     for key in ("delta", "text", "message", "content"):
       value = payload.get(key)
@@ -184,11 +169,3 @@ class CodexAgentProvider:
       if isinstance(content, str) and content:
         return content
     return None
-
-  def _terminate_process(self, process: subprocess.Popen[str]) -> None:
-    process.terminate()
-    process.wait()
-
-  def _close_pipe(self, pipe: Any) -> None:
-    if pipe is not None:
-      pipe.close()
