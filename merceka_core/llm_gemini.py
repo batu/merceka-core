@@ -108,15 +108,19 @@ _CLIENT_ERROR_STATUS_CODES = frozenset({400, 401, 403, 404})
 def _generate_content(client, label: str, **gc_kwargs):
   """``client.models.generate_content`` with the shared retry policy.
 
-  Retries 429/5xx and connection resets. Client errors (400/401/403/404) raise
-  the terminal :class:`VideoUploadError`, because retrying cannot fix them.
-  Everything else, including exhausted retries, raises the transient
-  :class:`VideoBackendError`.
+  Retries 429/5xx and connection resets. Client errors (400/401/403/404) and a
+  TypeError (arguments ``generate_content`` does not accept) raise the terminal
+  :class:`VideoUploadError`, because retrying cannot fix them. Everything else,
+  including exhausted retries, raises the transient :class:`VideoBackendError`.
   """
   for attempt in range(_RETRY_MAX_ATTEMPTS):
     try:
       return client.models.generate_content(**gc_kwargs)
     except Exception as exc:  # noqa: BLE001 — bridge SDK errors to our taxonomy.
+      if isinstance(exc, TypeError):
+        raise VideoUploadError(
+          f"{label} generate_content rejected its arguments: {exc}"
+        ) from exc
       status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
       if status in _CLIENT_ERROR_STATUS_CODES:
         raise VideoUploadError(

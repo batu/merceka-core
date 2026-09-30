@@ -127,6 +127,15 @@ class TestGeminiImageCall:
       LLM("gemini/gemini-flash-latest").generate_with_resource("hi", png)
     assert len(models.calls) == 1  # no retry on 4xx
 
+  def test_bad_argument_type_error_is_terminal(self, monkeypatch, png):
+    """Review item 10: an unknown generate_content kwarg (TypeError) was the
+    transient VideoBackendError; retrying the same call cannot succeed."""
+    models = install_client(
+      monkeypatch, [TypeError("generate_content() got an unexpected keyword argument 'sed'")])
+    with pytest.raises(VideoUploadError, match="unexpected keyword argument"):
+      LLM("gemini/gemini-flash-latest").generate_with_resource("hi", png, sed=1)
+    assert len(models.calls) == 1
+
   def test_retries_exhausted(self, monkeypatch, png):
     monkeypatch.setattr(llm_gemini.time, "sleep", lambda _delay: None)
     models = install_client(
