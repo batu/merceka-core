@@ -218,3 +218,40 @@ class TestFallbackKwargs:
     llm = LLM("codex/gpt-5", tools=[lookup], fallback="openrouter/fb")
     with pytest.raises(ValueError, match="images"):
       llm.generate("describe", images=[str(tmp_path / "x.png")])
+
+
+class TestCascadeCatchesProviderFailures:
+  def test_ollama_response_error_falls_back(self, monkeypatch):
+    """Regression (review R12): an Ollama server error never reached the fallback."""
+    import ollama
+
+    def ollama_500(**_kwargs):
+      raise ollama.ResponseError("model requires more system memory", 500)
+
+    monkeypatch.setattr(llm_module, "ollama_chat", ollama_500)
+    monkeypatch.setattr(LLM, "_cloud_call", lambda self, *_a, **_k: f"from {self.model_name}")
+    assert LLM("gemma4:26b", fallback="openrouter/x").generate("q") == "from openrouter/x"
+
+  @pytest.mark.asyncio
+  async def test_async_ollama_response_error_falls_back(self, monkeypatch):
+    import ollama
+
+    def ollama_500(**_kwargs):
+      raise ollama.ResponseError("model requires more system memory", 500)
+
+    async def cloud(self, *_args, **_kwargs):
+      return f"from {self.model_name}"
+
+    monkeypatch.setattr(llm_module, "ollama_chat", ollama_500)
+    monkeypatch.setattr(LLM, "_acloud_call", cloud)
+    assert await LLM("gemma4:26b", fallback="openrouter/x").agenerate("q") == "from openrouter/x"
+
+  def test_ollama_response_error_without_fallback_raises(self, monkeypatch):
+    import ollama
+
+    def ollama_500(**_kwargs):
+      raise ollama.ResponseError("boom", 500)
+
+    monkeypatch.setattr(llm_module, "ollama_chat", ollama_500)
+    with pytest.raises(ollama.ResponseError):
+      LLM("gemma4:26b").generate("q")

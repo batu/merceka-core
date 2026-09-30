@@ -85,7 +85,7 @@ from typing import Callable
 from pydantic import BaseModel
 
 
-from ollama import ChatResponse
+from ollama import ChatResponse, ResponseError
 from urllib.request import Request, urlopen
 
 
@@ -126,6 +126,21 @@ from merceka_core.retry import (  # noqa: F401 — re-exported for back-compat
   _retry_delay,
   _retry_after_seconds,
   _urlerror_never_sent,
+)
+
+# Primary failures that send generate/agenerate to the fallback: transport,
+# CLI and provider-side errors. Ollama reports server-side failures (model
+# load, out of memory, unknown model) as ResponseError.
+_FALLBACK_ERRORS = (
+  subprocess.TimeoutExpired,
+  subprocess.CalledProcessError,
+  FileNotFoundError,
+  ConnectionError,
+  OSError,
+  httpx.HTTPError,
+  urllib.error.URLError,
+  VideoBackendError,
+  ResponseError,
 )
 
 # Per-call kwargs a fallback on another transport must not receive.
@@ -328,16 +343,7 @@ class LLM:
     """One-shot generation. Does not maintain conversation history."""
     try:
       return self._generate_primary(message, **kwargs)
-    except (
-      subprocess.TimeoutExpired,
-      subprocess.CalledProcessError,
-      FileNotFoundError,
-      ConnectionError,
-      OSError,
-      httpx.HTTPError,
-      urllib.error.URLError,
-      VideoBackendError,
-    ) as e:
+    except _FALLBACK_ERRORS as e:
       target = self._cascade_target(kwargs)
       if target is None:
         raise
@@ -899,16 +905,7 @@ class LLM:
     """Async one-shot generation. Does not maintain conversation history."""
     try:
       return await self._agenerate_primary(message, **kwargs)
-    except (
-      subprocess.TimeoutExpired,
-      subprocess.CalledProcessError,
-      FileNotFoundError,
-      ConnectionError,
-      OSError,
-      httpx.HTTPError,
-      urllib.error.URLError,
-      VideoBackendError,
-    ) as e:
+    except _FALLBACK_ERRORS as e:
       target = self._cascade_target(kwargs)
       if target is None:
         raise
