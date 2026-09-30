@@ -256,9 +256,12 @@ def critique(
       string or a partial dict, keeps the registry's model and transport
       (``cli``, ``effort``, ``api``); fields set in the dict override them.
       Listing a judge enables it unless its dict sets ``enabled: False``.
-    budget_check: Optional callable run before each billable judge call. A
-      falsy return skips the current and remaining judges with reason
-      ``"budget"``.
+    budget_check: Optional callable run before each paid API judge call
+      (OpenRouter and the Anthropic zoom judge); CLI judges run on
+      subscriptions and are never gated. It may take no arguments or one
+      context dict with ``judge``, ``model`` and ``transport``
+      (``"openrouter"`` or ``"anthropic"``). A falsy return skips that judge
+      and every later paid judge with reason ``"budget"``.
     recurring_check_units: Optional labels for the subjects that need recurring
       defect checks. Defaults to one subject per OURS image.
     floor: Informational pass/fail score floor. Defaults to 85.
@@ -282,7 +285,10 @@ def critique(
     and skipped, plus ``participants`` (judges that returned a score),
     ``roster_size`` (enabled judges) and ``degraded`` (True when any enabled
     judge was skipped). Judges disabled in the roster are listed in skipped
-    but do not count toward the roster or degrade the panel.
+    but do not count toward the roster or degrade the panel. A paid judge
+    whose key (``OPENROUTER_API_KEY`` or ``ANTHROPIC_API_KEY``) is not
+    configured is skipped with reason ``"no-key"`` and counts against the
+    quorum.
     ``recurring_checks`` shows, per subject and check, a failure if any judge
     reported one; ``failed_recurring_checks`` lists the check ids that failed
     by majority.
@@ -295,12 +301,6 @@ def critique(
   """
   if not images:
     raise ValueError("critique requires at least one image")
-
-  api_key = _openrouter_api_key()
-  if not api_key:
-    raise RuntimeError(
-      "OPENROUTER_API_KEY is not configured in the environment or the package .env"
-    )
 
   roster = _normalize_judges(judges)
   roster_size = sum(1 for judge in roster if judge.get("enabled", True))
@@ -326,6 +326,8 @@ def critique(
   owns_client = client is None
   http_client = client or httpx.Client(timeout=timeout)
   budget_halted = False
+  # Resolved once, only if an OpenRouter judge runs; "" means no key.
+  openrouter_key: str | None = None
 
   try:
     for judge in roster:
@@ -333,27 +335,38 @@ def critique(
       if not judge.get("enabled", True):
         _record_skip(per_model, skipped, judge, "disabled")
         continue
-      if budget_halted:
-        _record_skip(per_model, skipped, judge, "budget")
-        continue
       if judge.get("cli") == "codex":
-        # CLI judges bill the codex subscription, not OpenRouter credits, so
-        # the OpenRouter budget gate does not apply to them.
+        # Bills the codex subscription, so neither the budget gate nor any
+        # API key applies.
         result = _call_codex_cli_judge(judge, images, reference, spec, check_units)
       elif judge.get("cli") == "claude":
-        # Bills the Claude subscription through the local CLI, not OpenRouter
-        # credits, so the OpenRouter budget gate does not apply.
+        # Bills the Claude subscription through the local CLI.
         result = _call_claude_cli_judge(judge, images, reference, spec, check_units)
       elif judge.get("api") == "anthropic-zoom":
-        # Bills the Anthropic API directly; the OpenRouter budget gate does
-        # not apply. Skips itself when no key is configured.
-        result = _call_anthropic_zoom_judge(judge, images, reference, spec, check_units)
-      else:
-        if budget_check is not None and not _budget_allows(budget_check, judge):
+        # Bills the Anthropic API directly.
+        anthropic_key = _anthropic_api_key()
+        if not anthropic_key:
+          _record_skip(per_model, skipped, judge, "no-key")
+          continue
+        if budget_halted or not _budget_allows(budget_check, judge, "anthropic"):
           budget_halted = True
           _record_skip(per_model, skipped, judge, "budget")
           continue
-        result = _call_judge(http_client, judge, messages, api_key, check_units)
+        result = _call_anthropic_zoom_judge(
+          judge, images, reference, spec, check_units, api_key=anthropic_key
+        )
+      else:
+        # Spends OpenRouter credits.
+        if openrouter_key is None:
+          openrouter_key = _openrouter_api_key() or ""
+        if not openrouter_key:
+          _record_skip(per_model, skipped, judge, "no-key")
+          continue
+        if budget_halted or not _budget_allows(budget_check, judge, "openrouter"):
+          budget_halted = True
+          _record_skip(per_model, skipped, judge, "budget")
+          continue
+        result = _call_judge(http_client, judge, messages, openrouter_key, check_units)
       if result["ok"]:
         per_model[judge_id] = {
           "model": judge["model"],
@@ -462,10 +475,9 @@ def _call_anthropic_zoom_judge(
   reference: str | Path | None,
   spec: str | None,
   recurring_check_units: list[str],
+  *,
+  api_key: str,
 ) -> dict[str, Any]:
-  api_key = _anthropic_api_key()
-  if not api_key:
-    return {"ok": False, "reason": "no-key"}
   raw = _zoom_judge.call_zoom_judge(
     judge,
     images,
@@ -1061,8 +1073,14 @@ def _normalize_recurring_check_units(
   return units or [f"OURS {index}" for index in range(1, len(images) + 1)]
 
 
-def _budget_allows(fn: Callable[..., Any], judge: dict[str, Any]) -> bool:
-  context = {"judge": judge["id"], "model": judge["model"]}
+def _budget_allows(
+  fn: Callable[..., Any] | None,
+  judge: dict[str, Any],
+  transport: str,
+) -> bool:
+  if fn is None:
+    return True
+  context = {"judge": judge["id"], "model": judge["model"], "transport": transport}
   try:
     signature = inspect.signature(fn)
   except (TypeError, ValueError):

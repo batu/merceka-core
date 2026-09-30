@@ -680,6 +680,100 @@ def test_zero_arg_budget_false_skips_without_chat_call(monkeypatch):
   assert client.calls == []  # type: ignore[attr-defined]
 
 
+def test_budget_denial_skips_paid_judges_but_still_runs_cli_judges(monkeypatch):
+  # Review repro r2 F: a falsy budget_check also skipped the free CLI judges after it.
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  monkeypatch.setattr(critique_module.subprocess, "run", _fake_cli_run({"codex": (0, _content(70))}))
+  seen = []
+
+  def budget_check(context):
+    seen.append(context)
+    return False
+
+  client = _client_for([])
+
+  result = run_critique(
+    [PNG_BYTES],
+    judges=[_judge("paid-1"), "codex/gpt-5.6-terra", _judge("paid-2")],
+    budget_check=budget_check,
+    quorum=1,
+    client=client,
+  )
+
+  assert result["participated"] == ["codex/gpt-5.6-terra"]
+  assert result["skipped"] == [
+    {"judge": "paid-1", "reason": "budget"},
+    {"judge": "paid-2", "reason": "budget"},
+  ]
+  assert seen == [{"judge": "paid-1", "model": "model/paid-1", "transport": "openrouter"}]
+  assert client.calls == []  # type: ignore[attr-defined]
+
+
+def test_budget_check_gates_the_paid_zoom_judge(monkeypatch):
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+  zoom_calls = []
+  monkeypatch.setattr(
+    critique_module._zoom_judge,
+    "call_zoom_judge",
+    lambda *args, **kwargs: zoom_calls.append(args) or {"ok": True, "text": _content(80)},
+  )
+  seen = []
+
+  def budget_check(context):
+    seen.append(context)
+    return context["transport"] != "anthropic"
+
+  result = run_critique(
+    [PNG_BYTES],
+    judges=[_judge("paid"), "anthropic/claude-fable-5-zoom"],
+    budget_check=budget_check,
+    client=_client_for([_content(90)]),
+  )
+
+  assert zoom_calls == []
+  assert result["skipped"] == [{"judge": "anthropic/claude-fable-5-zoom", "reason": "budget"}]
+  assert [context["transport"] for context in seen] == ["openrouter", "anthropic"]
+
+
+def test_cli_only_roster_runs_without_an_openrouter_key(monkeypatch):
+  # Review repro r2 G: this used to raise "OPENROUTER_API_KEY is not configured".
+  monkeypatch.setenv("OPENROUTER_API_KEY", "")
+  monkeypatch.setattr(critique_module.subprocess, "run", _fake_cli_run({"codex": (0, _content(90))}))
+
+  result = run_critique([PNG_BYTES], judges=["codex/gpt-5.6-terra"], client=_client_for([]))
+
+  assert result["participated"] == ["codex/gpt-5.6-terra"]
+  assert result["skipped"] == []
+
+
+def test_openrouter_judges_skip_with_no_key(monkeypatch):
+  monkeypatch.setenv("OPENROUTER_API_KEY", "")
+  monkeypatch.setattr(critique_module.subprocess, "run", _fake_cli_run({"codex": (0, _content(90))}))
+  client = _client_for([])
+  budget_calls = []
+
+  result = run_critique(
+    [PNG_BYTES],
+    judges=["codex/gpt-5.6-terra", _judge("j1")],
+    budget_check=lambda: budget_calls.append(1) or True,
+    client=client,
+  )
+
+  assert result["participated"] == ["codex/gpt-5.6-terra"]
+  assert result["skipped"] == [{"judge": "j1", "reason": "no-key"}]
+  assert result["degraded"] is True
+  assert client.calls == []  # type: ignore[attr-defined]
+  assert budget_calls == []  # a judge that cannot run is not charged against the budget
+
+
+def test_missing_keys_count_against_the_quorum(monkeypatch):
+  monkeypatch.setenv("OPENROUTER_API_KEY", "")
+
+  with pytest.raises(RuntimeError, match="j1: no-key, j2: no-key"):
+    run_critique([PNG_BYTES], judges=[_judge("j1"), _judge("j2")], client=_client_for([]))
+
+
 def test_zero_participants_raise_clear_error(monkeypatch):
   monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
   client = _client_for([httpx.Response(401, text="bad key"), "not parseable"])
