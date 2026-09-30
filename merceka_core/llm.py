@@ -76,6 +76,7 @@ def _download_model(model_name: str):
 
 
 from ollama import chat as ollama_chat
+from ollama import Client as OllamaClient
 
 
 from pathlib import Path
@@ -149,12 +150,15 @@ _FALLBACK_ERRORS = (
 
 # Per-call kwargs a fallback on another transport must not receive.
 # Read only by the CLI transports (_claude_call/_codex_call). ``timeout`` is not
-# listed: the CLI and OpenRouter transports both read it (subprocess or HTTP
-# timeout), and the Ollama and Gemini fallbacks keep only allowlisted kwargs.
+# listed: the CLI, OpenRouter and Ollama transports all read it (subprocess or
+# HTTP timeout), and the Gemini fallback keeps only allowlisted kwargs.
 _CLI_KWARGS = frozenset({"images"})
 # Accepted by ollama.chat() besides the model/messages/tools/think/format that
 # _local_call sets itself.
 _OLLAMA_KWARGS = frozenset({"options", "keep_alive", "stream", "logprobs", "top_logprobs"})
+# What an Ollama fallback keeps: ollama.chat() kwargs plus ``timeout``, which
+# _local_call turns into the HTTP timeout of a dedicated client.
+_OLLAMA_FALLBACK_KWARGS = _OLLAMA_KWARGS | {"timeout"}
 # The Ollama kwargs OpenRouter has no counterpart for.
 _OLLAMA_ONLY_KWARGS = frozenset({"options", "keep_alive"})
 # What a Gemini fallback accepts (llm_gemini._build_video_config), and the part of
@@ -177,6 +181,18 @@ _OLLAMA_OPTIONS = {
   "presence_penalty": "presence_penalty",
   "repetition_penalty": "repeat_penalty",
 }
+
+
+def _ollama_chat(timeout: float | None, **kwargs) -> ChatResponse:
+  """``ollama.chat``, bounded by an HTTP timeout when one is given.
+
+  The module-level ``ollama.chat`` takes no timeout (passing one raises
+  TypeError) and its shared client waits forever, so a bounded call gets its own
+  client. Unbounded calls keep the shared one.
+  """
+  if timeout is None:
+    return ollama_chat(**kwargs)
+  return OllamaClient(timeout=timeout).chat(**kwargs)
 
 
 def _stop_stream_process(process: subprocess.Popen, *, finished: bool) -> bool:
@@ -327,7 +343,7 @@ class LLM:
     fallback: Optional[str] = None,  # Fallback model if primary fails
     add_dirs: list[str] | None = None,  # Directories Claude Code can access (--add-dir)
     allowed_tools: list[str] | None = None,  # Claude Code native tools (--allowedTools)
-    timeout: int | None = None,  # Default subprocess timeout (seconds) for CLI providers; per-call timeout= kwarg still wins
+    timeout: int | None = None,  # Default timeout (seconds): CLI subprocess or Ollama HTTP; per-call timeout= kwarg still wins
   ):
     if tools and output_schema:
       raise ValueError("Cannot use both tools and output_schema at the same time")
@@ -458,7 +474,7 @@ class LLM:
     if fb.use_openrouter:
       dropped = _CLI_KWARGS | _OLLAMA_ONLY_KWARGS | _GEMINI_ONLY_KWARGS
       return fb, {k: v for k, v in kwargs.items() if k not in dropped}
-    fb_kwargs = {k: v for k, v in kwargs.items() if k in _OLLAMA_KWARGS}
+    fb_kwargs = {k: v for k, v in kwargs.items() if k in _OLLAMA_FALLBACK_KWARGS}
     options = {_OLLAMA_OPTIONS[k]: v for k, v in kwargs.items() if k in _OLLAMA_OPTIONS}
     if options:
       fb_kwargs["options"] = {**options, **(fb_kwargs.get("options") or {})}
@@ -700,7 +716,8 @@ class LLM:
 
   def _local_call_raw(self, messages: list[dict], **kwargs) -> dict:
     """Call local Ollama and return normalized message dict."""
-    response: ChatResponse = ollama_chat(
+    response: ChatResponse = _ollama_chat(
+      self._ollama_timeout(kwargs),
       model=self.model_name,
       think=self.think,
       messages=messages,
@@ -852,9 +869,16 @@ class LLM:
 
   # --- Existing call methods (non-tool path) ---
 
+  def _ollama_timeout(self, kwargs: dict) -> float | None:
+    """Pop the HTTP timeout for an Ollama call: per-call ``timeout=``, else
+    ``LLM(timeout=)``, else none (the shared client, which waits forever)."""
+    timeout = kwargs.pop("timeout", None)
+    return timeout if timeout is not None else self.timeout
+
   def _local_call(self, messages: list[dict], **kwargs) -> str | OutputSchema:
     """Call local Ollama model."""
-    response: ChatResponse = ollama_chat(
+    response: ChatResponse = _ollama_chat(
+      self._ollama_timeout(kwargs),
       model=self.model_name,
       think=self.think,
       messages=messages,

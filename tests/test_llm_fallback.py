@@ -35,10 +35,26 @@ def ollama_calls(monkeypatch):
 
   def fake_chat(*args, **kwargs):
     bound = signature.bind(*args, **kwargs)  # TypeError on kwargs ollama.chat rejects
-    calls.append({"model": bound.arguments["model"], "options": bound.arguments.get("options")})
+    calls.append({
+      "model": bound.arguments["model"],
+      "options": bound.arguments.get("options"),
+      "timeout": None,
+    })
     return SimpleNamespace(message=SimpleNamespace(content="local answer", tool_calls=None))
 
+  class BoundedClient:
+    """ollama.Client(timeout=...): records the HTTP timeout of each call."""
+
+    def __init__(self, *_args, timeout=None, **_kwargs):
+      self.timeout = timeout
+
+    def chat(self, *args, **kwargs):
+      response = fake_chat(*args, **kwargs)
+      calls[-1]["timeout"] = self.timeout
+      return response
+
   monkeypatch.setattr(llm_module, "ollama_chat", fake_chat)
+  monkeypatch.setattr(llm_module, "OllamaClient", BoundedClient)
   return calls
 
 
@@ -129,24 +145,35 @@ class TestFallbackKwargs:
     assert out == "local answer"
     assert ollama_calls[0]["options"] == {"temperature": 0.0, "num_predict": 300}
 
-  def test_cli_timeout_is_not_passed_to_an_ollama_fallback(self, monkeypatch, ollama_calls):
+  def test_cli_timeout_bounds_an_ollama_fallback(self, monkeypatch, ollama_calls):
+    """Regression: timeout= reached ollama.chat (TypeError, so the fallback never
+    ran), then was dropped (an unbounded local call). It is the HTTP timeout."""
     monkeypatch.setattr(
       llm_module.subprocess, "run", _failing(subprocess.TimeoutExpired("claude", 30)).__get__(0))
     llm = LLM("claude/sonnet", fallback="gemma4:26b")
     assert llm.generate("q", timeout=30) == "local answer"
+    assert ollama_calls[0]["timeout"] == 30
 
   @pytest.mark.asyncio
-  async def test_async_cli_timeout_is_not_passed_to_an_ollama_fallback(
+  async def test_async_cli_timeout_bounds_an_ollama_fallback(
     self, monkeypatch, ollama_calls,
   ):
     monkeypatch.setattr(LLM, "_claude_call", _failing(FileNotFoundError("claude")))
     llm = LLM("claude/sonnet", fallback="gemma4:26b")
     assert await llm.agenerate("q", timeout=30) == "local answer"
+    assert ollama_calls[0]["timeout"] == 30
 
-  def test_tools_fallback_loop_on_ollama_gets_no_cli_timeout(self, ollama_calls):
+  def test_tools_fallback_loop_on_ollama_is_bounded_by_the_timeout(self, ollama_calls):
     llm = LLM("claude/sonnet", tools=[lookup], fallback="gemma4:26b")
     assert llm.generate("q", timeout=30) == "local answer"
     assert ollama_calls[0]["model"] == "gemma4:26b"
+    assert ollama_calls[0]["timeout"] == 30
+
+  def test_ollama_primary_timeout_per_call_then_instance(self, ollama_calls):
+    assert LLM("gemma4:26b", timeout=45).generate("q") == "local answer"
+    assert LLM("gemma4:26b", timeout=45).generate("q", timeout=5) == "local answer"
+    assert LLM("gemma4:26b").generate("q") == "local answer"
+    assert [c["timeout"] for c in ollama_calls] == [45, 5, None]
 
   def test_stream_fallback_gets_adapted_kwargs(self, monkeypatch, ollama_calls):
     def failing_stream(self, *_args, **_kwargs):
