@@ -1227,15 +1227,7 @@ class LLM:
     env = _cli.claude_env()
 
     with self._claude_workdir() as cwd:
-      result = subprocess.run(
-        cmd,
-        input=message,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env=env,
-        cwd=cwd,
-      )
+      result = _cli.run_cli(cmd, input=message, timeout=timeout, env=env, cwd=cwd)
     if result.returncode != 0:
       raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
 
@@ -1262,14 +1254,7 @@ class LLM:
     prompt = f"{self.system_prompt}\n\n{message}" if self.system_prompt else message
 
     timeout = self._resolve_timeout(kwargs)
-    result = subprocess.run(
-      cmd,
-      input=prompt,
-      capture_output=True,
-      text=True,
-      timeout=timeout,
-      env=_cli.codex_env(),
-    )
+    result = _cli.run_cli(cmd, input=prompt, timeout=timeout, env=_cli.codex_env())
     if result.returncode != 0:
       raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
 

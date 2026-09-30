@@ -227,7 +227,7 @@ class TestChatDispatch:
         stderr = ""
       return Result()
 
-    monkeypatch.setattr(llm_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(llm_module._cli, "run_cli", fake_run)
     llm = LLM("codex/gpt-5", system_prompt="SYS")
     assert llm.chat("first") == "reply 1"
     assert llm.chat("second") == "reply 2"

@@ -51,7 +51,7 @@ class TestClaudeCall:
         with patch.object(LLM, '_verify'):
             llm = LLM("claude/sonnet", system_prompt="Be helpful")
 
-        with patch("subprocess.run") as mock_run:
+        with patch("merceka_core._cli.run_cli") as mock_run:
             mock_run.return_value = MagicMock(
                 returncode=0, stdout="Hello!", stderr=""
             )
@@ -75,7 +75,7 @@ class TestClaudeCall:
         caller's directory (which may hold a .env)."""
         with patch.object(LLM, '_verify'):
             llm = LLM("claude/sonnet")
-        with patch("subprocess.run") as mock_run:
+        with patch("merceka_core._cli.run_cli") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
             llm.generate("Hi")
         cwd = mock_run.call_args.kwargs["cwd"]
@@ -85,7 +85,7 @@ class TestClaudeCall:
     def test_claude_call_runs_in_first_add_dir(self, tmp_path):
         with patch.object(LLM, '_verify'):
             llm = LLM("claude/sonnet", add_dirs=[str(tmp_path)], allowed_tools=["Read"])
-        with patch("subprocess.run") as mock_run:
+        with patch("merceka_core._cli.run_cli") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
             llm.generate("Hi")
         assert mock_run.call_args.kwargs["cwd"] == str(tmp_path)
@@ -94,7 +94,7 @@ class TestClaudeCall:
         with patch.object(LLM, '_verify'):
             llm = LLM("claude/opus", system_prompt="test")
 
-        with patch("subprocess.run") as mock_run:
+        with patch("merceka_core._cli.run_cli") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
             llm.generate("test", timeout=30)
 
@@ -104,7 +104,7 @@ class TestClaudeCall:
         with patch.object(LLM, '_verify'):
             llm = LLM("claude/opus", system_prompt="test")
 
-        with patch("subprocess.run") as mock_run:
+        with patch("merceka_core._cli.run_cli") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
             llm.generate("test")
 
@@ -114,7 +114,7 @@ class TestClaudeCall:
         with patch.object(LLM, '_verify'):
             llm = LLM("claude/opus", system_prompt="test", timeout=600)
 
-        with patch("subprocess.run") as mock_run:
+        with patch("merceka_core._cli.run_cli") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
             llm.generate("test")
 
@@ -124,7 +124,7 @@ class TestClaudeCall:
         with patch.object(LLM, '_verify'):
             llm = LLM("claude/opus", system_prompt="test", timeout=600)
 
-        with patch("subprocess.run") as mock_run:
+        with patch("merceka_core._cli.run_cli") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
             llm.generate("test", timeout=30)
 
@@ -134,7 +134,7 @@ class TestClaudeCall:
         with patch.object(LLM, '_verify'):
             llm = LLM("claude/opus", system_prompt="test")
 
-        with patch("subprocess.run") as mock_run:
+        with patch("merceka_core._cli.run_cli") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
             llm.generate("test")
 
@@ -145,7 +145,7 @@ class TestClaudeCall:
         with patch.object(LLM, '_verify'):
             llm = LLM("claude/opus", system_prompt="test", timeout=600)
 
-        with patch("subprocess.run") as mock_run:
+        with patch("merceka_core._cli.run_cli") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
             await llm.agenerate("test")
 
@@ -155,7 +155,7 @@ class TestClaudeCall:
         with patch.object(LLM, '_verify'):
             llm = LLM("claude/opus", system_prompt="test")
 
-        with patch("subprocess.run") as mock_run:
+        with patch("merceka_core._cli.run_cli") as mock_run:
             mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="error")
             with pytest.raises(subprocess.CalledProcessError):
                 llm.generate("test")
@@ -169,7 +169,7 @@ class TestFallback:
         with patch.object(LLM, '_verify'):
             llm = LLM("claude/sonnet", fallback="gemma4:26b", system_prompt="test")
 
-        with patch("subprocess.run", side_effect=FileNotFoundError("claude not found")):
+        with patch("merceka_core._cli.run_cli", side_effect=FileNotFoundError("claude not found")):
             with patch.object(LLM, '_verify'):  # mock verify on fallback LLM too
                 with patch.object(LLM, '_local_call', return_value="fallback response"):
                     result = llm.generate("hello")
@@ -180,7 +180,7 @@ class TestFallback:
         with patch.object(LLM, '_verify'):
             llm = LLM("claude/sonnet", fallback="gemma4:26b", system_prompt="test")
 
-        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("claude", 120)):
+        with patch("merceka_core._cli.run_cli", side_effect=subprocess.TimeoutExpired("claude", 120)):
             with patch.object(LLM, '_verify'):
                 with patch.object(LLM, '_local_call', return_value="timeout fallback"):
                     result = llm.generate("hello")
@@ -191,7 +191,7 @@ class TestFallback:
         with patch.object(LLM, '_verify'):
             llm = LLM("claude/sonnet", fallback="gemma4:26b", system_prompt="test")
 
-        with patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, "claude")):
+        with patch("merceka_core._cli.run_cli", side_effect=subprocess.CalledProcessError(1, "claude")):
             with patch.object(LLM, '_verify'):
                 with patch.object(LLM, '_local_call', return_value="error fallback"):
                     result = llm.generate("hello")
@@ -203,7 +203,7 @@ class TestFallback:
         with patch.object(LLM, '_verify'):
             llm = LLM("claude/sonnet", system_prompt="test")
 
-        with patch("subprocess.run", side_effect=FileNotFoundError):
+        with patch("merceka_core._cli.run_cli", side_effect=FileNotFoundError):
             with pytest.raises(FileNotFoundError):
                 llm.generate("hello")
 
@@ -251,7 +251,7 @@ class TestClaudeToolsDelegation:
         with patch.object(LLM, '_verify'):
             llm = LLM("claude/sonnet", fallback="gemma4:26b", system_prompt="test")
 
-        with patch("subprocess.run") as mock_run:
+        with patch("merceka_core._cli.run_cli") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="claude response", stderr="")
             result = llm.generate("hello")
 
@@ -266,7 +266,7 @@ class TestChatHistory:
         with patch.object(LLM, '_verify'):
             llm = LLM("claude/sonnet", system_prompt="You are helpful")
 
-        with patch("subprocess.run") as mock_run:
+        with patch("merceka_core._cli.run_cli") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="reply", stderr="")
             llm.chat("Hello")
 
@@ -282,7 +282,7 @@ class TestAsync:
         with patch.object(LLM, '_verify'):
             llm = LLM("claude/sonnet", system_prompt="test")
 
-        with patch("subprocess.run") as mock_run:
+        with patch("merceka_core._cli.run_cli") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="async ok", stderr="")
             result = await llm.agenerate("hello")
 
@@ -293,7 +293,7 @@ class TestAsync:
         with patch.object(LLM, '_verify'):
             llm = LLM("claude/sonnet", fallback="gemma4:26b", system_prompt="test")
 
-        with patch("subprocess.run", side_effect=FileNotFoundError):
+        with patch("merceka_core._cli.run_cli", side_effect=FileNotFoundError):
             with patch.object(LLM, '_verify'):
                 with patch.object(LLM, '_local_call', return_value="async fallback"):
                     result = await llm.agenerate("hello")

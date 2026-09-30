@@ -10,6 +10,9 @@ differences are explicit parameters below, not parallel copies.
 
 from __future__ import annotations
 
+import os
+import signal
+import subprocess
 from typing import Any
 
 from merceka_core._env import scrubbed_env
@@ -21,7 +24,9 @@ __all__ = [
   "codex_env",
   "codex_exec_command",
   "is_claude_result_event",
+  "run_cli",
   "scrubbed_env",
+  "signal_process_group",
 ]
 
 # Read-only tools that locked-down Claude sessions confine to the working directories.
@@ -164,3 +169,63 @@ def claude_stream_text_delta(payload: dict[str, Any]) -> str | None:
 def is_claude_result_event(payload: dict[str, Any]) -> bool:
   """True when the stream-json event marks the end of the response."""
   return payload.get("type") == "result"
+
+
+# How long a timed-out CLI gets to exit after SIGTERM before its group is killed.
+_TIMEOUT_GRACE_S = 5.0
+
+
+def run_cli(
+  cmd: list[str],
+  *,
+  input: str | None = None,
+  timeout: float | None = None,
+  env: dict[str, str] | None = None,
+  cwd: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+  """``subprocess.run(cmd, capture_output=True, text=True, ...)`` for provider CLIs.
+
+  The CLI leads a new process group, and a timeout stops that whole group.
+  ``subprocess.run`` kills only the direct child: codex and pi are node wrappers
+  around the real worker, and grok runs tools in subprocesses, so those kept
+  running after the caller gave up. Raises ``subprocess.TimeoutExpired`` as
+  ``subprocess.run`` does.
+  """
+  with subprocess.Popen(
+    cmd,
+    stdin=subprocess.PIPE if input is not None else None,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+    env=env,
+    cwd=cwd,
+    start_new_session=True,
+  ) as process:
+    try:
+      stdout, stderr = process.communicate(input, timeout=timeout)
+    except subprocess.TimeoutExpired:
+      signal_process_group(process, signal.SIGTERM)
+      try:
+        process.wait(timeout=_TIMEOUT_GRACE_S)
+      except subprocess.TimeoutExpired:
+        pass
+      signal_process_group(process, signal.SIGKILL)
+      process.wait()
+      raise
+    except BaseException:
+      signal_process_group(process, signal.SIGKILL)
+      process.wait()
+      raise
+  return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+
+
+def signal_process_group(process: subprocess.Popen[str], sig: signal.Signals) -> None:
+  """Send ``sig`` to the process group ``process`` leads (see ``start_new_session``)."""
+  try:
+    os.killpg(process.pid, sig)
+  except ProcessLookupError:
+    pass  # The group is gone.
+  except PermissionError:
+    # macOS refuses to signal a group whose only member is an unreaped zombie.
+    if process.poll() is None:
+      process.send_signal(sig)

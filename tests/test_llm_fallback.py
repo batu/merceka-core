@@ -149,7 +149,7 @@ class TestFallbackKwargs:
     """Regression: timeout= reached ollama.chat (TypeError, so the fallback never
     ran), then was dropped (an unbounded local call). It is the HTTP timeout."""
     monkeypatch.setattr(
-      llm_module.subprocess, "run", _failing(subprocess.TimeoutExpired("claude", 30)).__get__(0))
+      llm_module._cli, "run_cli", _failing(subprocess.TimeoutExpired("claude", 30)).__get__(0))
     llm = LLM("claude/sonnet", fallback="gemma4:26b")
     assert llm.generate("q", timeout=30) == "local answer"
     assert ollama_calls[0]["timeout"] == 30
@@ -235,7 +235,7 @@ class TestFallbackKwargs:
       failed = len(runs) == 1
       return SimpleNamespace(returncode=1 if failed else 0, stdout="seen", stderr="")
 
-    monkeypatch.setattr(llm_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(llm_module._cli, "run_cli", fake_run)
     llm = LLM("codex/gpt-5", fallback="codex/default")
     assert llm.generate("describe", images=[str(png)]) == "seen"
     assert all(str(png) in cmd for cmd in runs) and len(runs) == 2
@@ -246,7 +246,7 @@ class TestFallbackKwargs:
     png = tmp_path / "x.png"
     png.write_bytes(b"\x89PNG")
     monkeypatch.setattr(
-      llm_module.subprocess, "run",
+      llm_module._cli, "run_cli",
       lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout="", stderr="not logged in"))
     monkeypatch.setattr(LLM, "_cloud_call", lambda *_a, **_k: pytest.fail("fallback ran blind"))
     llm = LLM("codex/default", fallback="openrouter/google/gemini-3-flash")

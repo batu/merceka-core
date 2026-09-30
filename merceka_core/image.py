@@ -646,13 +646,10 @@ def _grok_run(prompt: str, job_dir: str, model: str) -> str:
     "--sandbox", "workspace", "--always-approve", "--no-plan", "--no-subagents",
     "--disable-web-search", "--max-turns", "6", "--verbatim", "--output-format", "json",
   ]
-  from merceka_core._env import scrubbed_env
+  from merceka_core._cli import run_cli, scrubbed_env
 
   try:
-    proc = subprocess.run(
-      cmd, capture_output=True, text=True, timeout=_GROK_TIMEOUT_S,
-      env=scrubbed_env(keep=("XAI_API_KEY",)),
-    )
+    proc = run_cli(cmd, timeout=_GROK_TIMEOUT_S, env=scrubbed_env(keep=("XAI_API_KEY",)))
   except subprocess.TimeoutExpired:
     _grok_record(model, {}, status="timeout")
     raise

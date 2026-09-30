@@ -17,7 +17,7 @@ class TestCodexProvider:
         stderr = ""
       return R()
 
-    monkeypatch.setattr("merceka_core.llm.subprocess.run", fake_run)
+    monkeypatch.setattr("merceka_core._cli.run_cli", fake_run)
     llm = LLM("codex/gpt-5.2", system_prompt="SYS")
     out = llm.generate("MSG", images=["/tmp/a.jpg"])
     assert out == "hello"
@@ -40,7 +40,7 @@ class TestCodexProvider:
         stderr = ""
       return R()
 
-    monkeypatch.setattr("merceka_core.llm.subprocess.run", fake_run)
+    monkeypatch.setattr("merceka_core._cli.run_cli", fake_run)
     assert LLM("codex/default").generate("x") == "ok"
 
 

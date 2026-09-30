@@ -552,10 +552,7 @@ def _call_codex_cli_judge(
         "-c", f'model_reasoning_effort="{judge.get("effort", "high")}"',
         "--output-last-message", str(last_message),
       ]
-      completed = subprocess.run(
-        cmd, input=prompt, capture_output=True, text=True, timeout=600,
-        cwd=workdir, env=_cli.codex_env(),
-      )
+      completed = _cli.run_cli(cmd, input=prompt, timeout=600, cwd=workdir, env=_cli.codex_env())
       if completed.returncode != 0:
         return {"ok": False, "reason": "cli-error"}
       text = last_message.read_text() if last_message.exists() else ""
@@ -623,15 +620,7 @@ def _call_claude_cli_judge(
         allowed_tools=("Read",),
         binary=binary,
       )
-      completed = subprocess.run(
-        cmd,
-        input=prompt,
-        capture_output=True,
-        text=True,
-        timeout=600,
-        cwd=workdir,
-        env=_cli.claude_env(),
-      )
+      completed = _cli.run_cli(cmd, input=prompt, timeout=600, cwd=workdir, env=_cli.claude_env())
   except (OSError, subprocess.TimeoutExpired):
     return {"ok": False, "reason": "cli-error"}
   finally:

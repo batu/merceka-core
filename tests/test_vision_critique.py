@@ -25,7 +25,7 @@ PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
 
 
 def _fake_cli_run(outcomes: dict[str, tuple[int, str]], stdout: str | None = None):
-  """subprocess.run stand-in keyed on the CLI binary name: (returncode, answer text).
+  """_cli.run_cli stand-in keyed on the CLI binary name: (returncode, answer text).
 
   The answer goes to codex's --output-last-message file when the command names
   one, and to stdout unless ``stdout`` overrides it.
@@ -847,7 +847,7 @@ def test_zero_arg_budget_false_skips_without_chat_call(monkeypatch):
 def test_budget_denial_skips_paid_judges_but_still_runs_cli_judges(monkeypatch):
   # Review repro r2 F: a falsy budget_check also skipped the free CLI judges after it.
   monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
-  monkeypatch.setattr(critique_module.subprocess, "run", _fake_cli_run({"codex": (0, _content(70))}))
+  monkeypatch.setattr(critique_module._cli, "run_cli", _fake_cli_run({"codex": (0, _content(70))}))
   seen = []
 
   def budget_check(context):
@@ -903,7 +903,7 @@ def test_budget_check_gates_the_paid_zoom_judge(monkeypatch):
 def test_cli_only_roster_runs_without_an_openrouter_key(monkeypatch):
   # Review repro r2 G: this used to raise "OPENROUTER_API_KEY is not configured".
   monkeypatch.setenv("OPENROUTER_API_KEY", "")
-  monkeypatch.setattr(critique_module.subprocess, "run", _fake_cli_run({"codex": (0, _content(90))}))
+  monkeypatch.setattr(critique_module._cli, "run_cli", _fake_cli_run({"codex": (0, _content(90))}))
 
   result = run_critique([PNG_BYTES], judges=["codex/gpt-5.6-terra"], client=_client_for([]))
 
@@ -913,7 +913,7 @@ def test_cli_only_roster_runs_without_an_openrouter_key(monkeypatch):
 
 def test_openrouter_judges_skip_with_no_key(monkeypatch):
   monkeypatch.setenv("OPENROUTER_API_KEY", "")
-  monkeypatch.setattr(critique_module.subprocess, "run", _fake_cli_run({"codex": (0, _content(90))}))
+  monkeypatch.setattr(critique_module._cli, "run_cli", _fake_cli_run({"codex": (0, _content(90))}))
   client = _client_for([])
   budget_calls = []
 
@@ -950,7 +950,7 @@ def test_default_roster_raises_when_most_judges_fail(monkeypatch):
   # Review repro r2 A / r8: expired CLI logins used to leave gemini deciding alone.
   monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
   monkeypatch.setattr(
-    critique_module.subprocess, "run", _fake_cli_run({"codex": (1, ""), "claude": (1, "")})
+    critique_module._cli, "run_cli", _fake_cli_run({"codex": (1, ""), "claude": (1, "")})
   )
   client = _client_for([_content(86)])
 
@@ -1041,7 +1041,7 @@ def test_explicit_string_roster_keeps_registry_transports(monkeypatch):
   # Review repro r1: plain ids lost cli/effort/api and went to OpenRouter as bare models.
   monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
   fake_run = _fake_cli_run({"codex": (0, _content(40)), "claude": (0, _content(40))})
-  monkeypatch.setattr(critique_module.subprocess, "run", fake_run)
+  monkeypatch.setattr(critique_module._cli, "run_cli", fake_run)
   client = _client_for([_content(92)])
 
   result = run_critique(
@@ -1128,7 +1128,7 @@ def _metered_response(content: str, generation_id: str, cost: float) -> httpx.Re
 
 def test_openrouter_judge_calls_are_metered_and_cli_judges_are_not(monkeypatch):
   monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
-  monkeypatch.setattr(critique_module.subprocess, "run", _fake_cli_run({"codex": (0, _content(90))}))
+  monkeypatch.setattr(critique_module._cli, "run_cli", _fake_cli_run({"codex": (0, _content(90))}))
   client = _client_for(
     [
       _metered_response(_content(92), "gen-1", 0.0123),
@@ -1193,7 +1193,7 @@ def test_codex_judge_reads_the_final_message_not_the_transcript(monkeypatch):
   answer = "Checked the ribbon: tokens used in the banner font look fine.\n" + _content(35)
   transcript = f"codex\n{answer}\ntokens used\n1,234\n{answer}\n"
   fake_run = _fake_cli_run({"codex": (0, answer)}, stdout=transcript)
-  monkeypatch.setattr(critique_module.subprocess, "run", fake_run)
+  monkeypatch.setattr(critique_module._cli, "run_cli", fake_run)
 
   result = run_critique([PNG_BYTES], judges=[_CODEX], client=_client_for([]))
 
@@ -1204,7 +1204,7 @@ def test_codex_judge_reads_the_final_message_not_the_transcript(monkeypatch):
 def test_codex_judge_without_a_final_message_is_a_parse_failure(monkeypatch):
   monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
   fake_run = _fake_cli_run({"codex": (0, "")}, stdout=_content(90))
-  monkeypatch.setattr(critique_module.subprocess, "run", fake_run)
+  monkeypatch.setattr(critique_module._cli, "run_cli", fake_run)
 
   with pytest.raises(RuntimeError, match="codex/gpt-5.6-terra: parse-failure"):
     run_critique([PNG_BYTES], judges=[_CODEX], client=_client_for([]))
@@ -1218,7 +1218,7 @@ def test_codex_judge_runs_read_only_in_a_scratch_directory(monkeypatch, tmp_path
   (caller_repo / "shot.png").write_bytes(PNG_BYTES)
   monkeypatch.chdir(caller_repo)
   fake_run = _fake_cli_run({"codex": (0, _content(90))})
-  monkeypatch.setattr(critique_module.subprocess, "run", fake_run)
+  monkeypatch.setattr(critique_module._cli, "run_cli", fake_run)
 
   run_critique(["shot.png", PNG_BYTES], judges=[_CODEX], client=_client_for([]))
 

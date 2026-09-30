@@ -122,7 +122,7 @@ class TestLLMGenerateWithResource:
     def ollama_trap(**_kwargs):
       raise AssertionError("codex model must not reach Ollama")
 
-    monkeypatch.setattr(llm_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(llm_module._cli, "run_cli", fake_run)
     monkeypatch.setattr(llm_module, "ollama_chat", ollama_trap)
     llm = LLM("codex/gpt-5", system_prompt="SYS")
     assert llm.generate_with_resource("what is this?", png) == "an arrow"
@@ -148,7 +148,7 @@ class TestLLMGenerateWithResource:
         stderr = ""
       return Result()
 
-    monkeypatch.setattr(llm_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(llm_module._cli, "run_cli", fake_run)
     assert asyncio.run(LLM("codex/default").agenerate_with_resource("x", png)) == "ok"
     assert str(png) in seen[0]
 
@@ -161,7 +161,7 @@ class TestLLMGenerateWithResource:
     pdf = tmp_path / "doc.pdf"
     pdf.write_bytes(b"%PDF-1.4")
     monkeypatch.setattr(
-      llm_module.subprocess, "run", lambda *_args, **_kwargs: pytest.fail("ran codex"))
+      llm_module._cli, "run_cli", lambda *_args, **_kwargs: pytest.fail("ran codex"))
     llm = LLM("codex/gpt-5")
     with pytest.raises(ValueError, match="codex"):
       llm.generate_with_resource("x", pdf)

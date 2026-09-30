@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import signal
 import subprocess
 import threading
@@ -21,6 +20,7 @@ import time
 from collections.abc import Callable
 from typing import Any, TypeVar
 
+from merceka_core._cli import signal_process_group
 from merceka_core.agent import ProviderFailure, RawProviderEvent
 
 # How long a CLI gets to exit after SIGTERM before its process group is killed.
@@ -207,26 +207,16 @@ def terminate_process(process: subprocess.Popen[str]) -> None:
   Blocks for up to the grace period, so async callers run it in a thread.
   """
   if process.poll() is None:
-    _signal_group(process, signal.SIGTERM)
+    signal_process_group(process, signal.SIGTERM)
     try:
       process.wait(timeout=TERMINATE_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
       pass
   # SIGKILL whatever is left: the leader if it ignored SIGTERM, and any
   # descendant still in the group after the leader exited.
-  _signal_group(process, signal.SIGKILL)
+  signal_process_group(process, signal.SIGKILL)
   process.wait()
 
-
-def _signal_group(process: subprocess.Popen[str], sig: signal.Signals) -> None:
-  try:
-    os.killpg(process.pid, sig)
-  except ProcessLookupError:
-    pass  # The group is gone.
-  except PermissionError:
-    # macOS refuses to signal a group whose only member is an unreaped zombie.
-    if process.poll() is None:
-      process.send_signal(sig)
 
 
 def close_pipe(pipe: Any) -> None:
