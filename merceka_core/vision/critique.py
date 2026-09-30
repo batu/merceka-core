@@ -162,6 +162,7 @@ Respond with ONLY a JSON object, no prose, in this exact shape:
   "recurring_checks": [
     {{
       "id": <one of: {", ".join(RECURRING_CHECK_IDS)}>,
+      "subject": "<the recurring check subject this entry judges, exactly as listed>",
       "pass": <true if this recurring defect is absent, false if present>,
       "evidence": "<short phrase naming the subject and pixel location>"
     }}
@@ -175,9 +176,11 @@ empty defects array.
 Recurring defects checklist:
 {_RECURRING_CHECK_PROMPT}
 
-For recurring_checks, emit one entry per judged subject per checklist id. If
-multiple OURS images or named crop subjects are listed, repeat the ids for each
-subject and include the image/crop name plus a pixel location in evidence."""
+For recurring_checks, emit one entry per judged subject per checklist id, with
+subject set to that subject's name exactly as listed under "Recurring check
+subjects". If multiple OURS images or named crop subjects are listed, repeat the
+ids for each subject and include the image/crop name plus a pixel location in
+evidence."""
 
 _OPENROUTER_RESPONSE_FORMAT = {
   "type": "json_schema",
@@ -210,9 +213,10 @@ _OPENROUTER_RESPONSE_FORMAT = {
           "items": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["id", "pass", "evidence"],
+            "required": ["id", "subject", "pass", "evidence"],
             "properties": {
               "id": {"type": "string", "enum": RECURRING_CHECK_IDS},
+              "subject": {"type": "string"},
               "pass": {"type": "boolean"},
               "evidence": {"type": "string"},
             },
@@ -827,6 +831,7 @@ def _normalize_defect(raw: Any) -> dict[str, str]:
 
 
 def _normalize_recurring_checks(raw: Any, recurring_check_units: list[str]) -> list[dict[str, Any]]:
+  """One judge's checks: one entry per check id for each subject, in subject order."""
   if not isinstance(raw, list):
     return _skipped_recurring_checks(recurring_check_units, "model omitted recurring_checks")
 
@@ -837,7 +842,7 @@ def _normalize_recurring_checks(raw: Any, recurring_check_units: list[str]) -> l
       checks.append(check)
   if not checks:
     return _skipped_recurring_checks(recurring_check_units, "model returned no valid checks")
-  return _complete_recurring_checks(checks, recurring_check_units)
+  return _assign_recurring_check_subjects(checks, recurring_check_units)
 
 
 def _normalize_recurring_check(raw: Any) -> dict[str, Any] | None:
@@ -855,6 +860,8 @@ def _normalize_recurring_check(raw: Any) -> dict[str, Any] | None:
 
   return {
     "id": check_id,
+    # The subject as the model named it; replaced by the matched subject label.
+    "subject": raw.get("subject", raw.get("unit")),
     "pass": pass_value,
     "evidence": evidence,
   }
@@ -879,17 +886,69 @@ def _coerce_check_pass(value: Any) -> bool | None:
   return None
 
 
-def _complete_recurring_checks(
+def _assign_recurring_check_subjects(
   checks: list[dict[str, Any]],
   recurring_check_units: list[str],
 ) -> list[dict[str, Any]]:
-  expected_count = len(recurring_check_units)
-  counts = Counter(check["id"] for check in checks)
-  completed = list(checks)
-  for check_id in RECURRING_CHECK_IDS:
-    for unit in recurring_check_units[counts[check_id] : expected_count]:
-      completed.append(_skipped_recurring_check(check_id, unit, "model omitted check"))
-  return completed
+  """Place each check on the subject it names; unnamed checks fill free subjects in order.
+
+  A check whose subject matches no listed subject counts as unnamed. Checks
+  beyond the listed subjects become extra subjects ("subject 3", ...). Every
+  (subject, check id) the model skipped gets a skipped entry.
+  """
+  placed: dict[tuple[str, int], dict[str, Any]] = {}
+  unnamed: list[dict[str, Any]] = []
+  for check in checks:
+    index = _subject_index(check["subject"], recurring_check_units)
+    if index is None:
+      unnamed.append(check)
+      continue
+    slot = (check["id"], index)
+    # A subject named twice keeps the first entry unless a later one fails it.
+    if slot not in placed or check["pass"] is False:
+      placed[slot] = check
+  for check in unnamed:
+    index = 0
+    while (check["id"], index) in placed:
+      index += 1
+    placed[(check["id"], index)] = check
+
+  subject_count = max([len(recurring_check_units), *(index + 1 for _id, index in placed)])
+  labels = [
+    *recurring_check_units,
+    *(f"subject {n}" for n in range(len(recurring_check_units) + 1, subject_count + 1)),
+  ]
+  return [
+    {**placed[(check_id, index)], "subject": label}
+    if (check_id, index) in placed
+    else _skipped_recurring_check(check_id, label, "model omitted check")
+    for index, label in enumerate(labels)
+    for check_id in RECURRING_CHECK_IDS
+  ]
+
+
+def _subject_index(name: Any, recurring_check_units: list[str]) -> int | None:
+  """Index of the listed subject ``name`` refers to, or None when it names none or several.
+
+  Matching ignores case and whitespace; failing an exact match, a subject that
+  appears in ``name`` as a whole word or phrase counts when it is the only one.
+  """
+  if not isinstance(name, str) or not name.strip():
+    return None
+  wanted = _subject_key(name)
+  keys = [_subject_key(unit) for unit in recurring_check_units]
+  if wanted in keys:
+    return keys.index(wanted)
+  matches = [
+    index
+    for index, key in enumerate(keys)
+    if re.search(rf"(?<!\w){re.escape(key)}(?!\w)", wanted)
+  ]
+  return matches[0] if len(matches) == 1 else None
+
+
+def _subject_key(value: str) -> str:
+  return " ".join(value.lower().split())
 
 
 def _skipped_recurring_checks(
@@ -906,6 +965,7 @@ def _skipped_recurring_checks(
 def _skipped_recurring_check(check_id: str, unit: str, reason: str) -> dict[str, Any]:
   return {
     "id": check_id,
+    "subject": unit,
     "pass": None,
     "evidence": _clip(f"skipped: {reason} for {unit}"),
   }
@@ -1172,7 +1232,11 @@ def _aggregate_recurring_checks(
 def _slot_recurring_checks(
   checks: list[dict[str, Any]],
 ) -> dict[tuple[str, int], dict[str, Any]]:
-  """Map one judge's checks onto (check id, subject index) slots, by emission order."""
+  """Key one judge's checks by (check id, subject index).
+
+  Parsing leaves one entry per check id for each subject, in subject order, so
+  the n-th entry for an id belongs to subject n.
+  """
   slots: dict[tuple[str, int], dict[str, Any]] = {}
   counts: Counter[str] = Counter()
   for check in checks:
@@ -1205,12 +1269,12 @@ def _aggregate_recurring_check_slot(
 ) -> dict[str, Any]:
   for check in checks:
     if check["pass"] is False:
-      return {"id": check_id, "pass": False, "evidence": check["evidence"]}
+      return {"id": check_id, "subject": unit, "pass": False, "evidence": check["evidence"]}
   for check in checks:
     if check["pass"] is True:
-      return {"id": check_id, "pass": True, "evidence": check["evidence"]}
+      return {"id": check_id, "subject": unit, "pass": True, "evidence": check["evidence"]}
   if checks:
-    return {"id": check_id, "pass": None, "evidence": checks[0]["evidence"]}
+    return {"id": check_id, "subject": unit, "pass": None, "evidence": checks[0]["evidence"]}
   return _skipped_recurring_check(check_id, unit, "model omitted check")
 
 
@@ -1243,6 +1307,7 @@ def _public_defect(defect: dict[str, str], *, include_key: bool = False) -> dict
 def _public_recurring_check(check: dict[str, Any]) -> dict[str, Any]:
   return {
     "id": check["id"],
+    "subject": check["subject"],
     "pass": check["pass"],
     "evidence": check["evidence"],
   }

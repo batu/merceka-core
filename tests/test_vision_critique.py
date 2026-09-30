@@ -234,7 +234,7 @@ def test_parse_keeps_recurring_checks_despite_a_trailing_brace_note():
   parsed = parse_judge_response(text)
 
   assert parsed["score"] == 91
-  assert parsed["recurring_checks"] == checks
+  assert parsed["recurring_checks"] == [dict(check, subject="OURS 1") for check in checks]
 
 
 @pytest.mark.parametrize(
@@ -344,8 +344,121 @@ def test_recurring_checks_parse_pass_fail_from_model_response(monkeypatch):
     client=client,
   )
 
-  assert result["recurring_checks"] == _recurring_checks("hud crop")
-  assert result["per_model"]["judge"]["recurring_checks"] == _recurring_checks("hud crop")
+  expected = [dict(check, subject="hud crop") for check in _recurring_checks("hud crop")]
+  assert result["recurring_checks"] == expected
+  assert result["per_model"]["judge"]["recurring_checks"] == expected
+
+
+def test_response_schema_and_prompt_ask_for_the_check_subject():
+  items = critique_module._OPENROUTER_RESPONSE_FORMAT["json_schema"]["schema"]["properties"][
+    "recurring_checks"
+  ]["items"]
+
+  assert items["properties"]["subject"] == {"type": "string"}
+  assert items["required"] == ["id", "subject", "pass", "evidence"]
+  assert '"subject": "<' in critique_module.CRITIQUE_PROMPT
+
+
+def _banner(subject: str | None, passed: bool, evidence: str) -> dict:
+  check = {"id": "banner-transparency", "pass": passed, "evidence": evidence}
+  return check if subject is None else {**check, "subject": subject}
+
+
+def _banner_rows(result: dict) -> list[dict]:
+  return [c for c in result["recurring_checks"] if c["id"] == "banner-transparency"]
+
+
+def test_recurring_checks_follow_the_named_subject_not_emission_order(monkeypatch):
+  # Review repro r7 A: judge B fails only "cta"; its FAIL used to land on "hud".
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  judge_a = [_banner("hud", True, "hud ribbon x=10"), _banner("cta", True, "cta ribbon x=40")]
+  judge_b = [_banner("cta", False, "cta ribbon opaque box x=40")]
+  client = _client_for(
+    [_content_with_recurring_checks(95, judge_a), _content_with_recurring_checks(95, judge_b)]
+  )
+
+  result = run_critique(
+    [PNG_BYTES],
+    recurring_check_units=["hud", "cta"],
+    judges=[_judge("A"), _judge("B")],
+    client=client,
+  )
+
+  assert _banner_rows(result) == [
+    {"id": "banner-transparency", "subject": "hud", "pass": True, "evidence": "hud ribbon x=10"},
+    {
+      "id": "banner-transparency",
+      "subject": "cta",
+      "pass": False,
+      "evidence": "cta ribbon opaque box x=40",
+    },
+  ]
+  per_b = [c for c in result["per_model"]["B"]["recurring_checks"] if c["id"] == "banner-transparency"]
+  assert [(c["subject"], c["pass"]) for c in per_b] == [("hud", None), ("cta", False)]
+  assert result["failed_recurring_checks"] == ["banner-transparency"]
+
+
+def test_a_single_named_check_lands_on_its_subject(monkeypatch):
+  # Review repro r2 E: a lone "cta" check used to be attributed to "hud".
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  client = _client_for(
+    [_content_with_recurring_checks(90, [_banner("CTA", True, "cta ribbon x=40 y=300")])]
+  )
+
+  result = run_critique(
+    [PNG_BYTES], recurring_check_units=["hud", "cta"], judges=[_judge("A")], client=client
+  )
+
+  hud, cta = _banner_rows(result)
+  assert (hud["subject"], hud["pass"]) == ("hud", None)
+  assert hud["evidence"] == "skipped: model omitted check for hud"
+  assert (cta["subject"], cta["pass"]) == ("cta", True)
+
+
+def test_unnamed_checks_fill_the_remaining_subjects_in_order(monkeypatch):
+  monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+  checks = [
+    _banner(None, False, "unnamed ribbon"),
+    _banner("hud crop", True, "hud ribbon"),  # names "hud" by whole word
+  ]
+  client = _client_for([_content_with_recurring_checks(90, checks)])
+
+  result = run_critique(
+    [PNG_BYTES], recurring_check_units=["hud", "cta"], judges=[_judge("A")], client=client
+  )
+
+  assert [(c["subject"], c["pass"]) for c in _banner_rows(result)] == [
+    ("hud", True),
+    ("cta", False),
+  ]
+
+
+def test_unknown_subject_names_fall_back_to_emission_order():
+  parsed = parse_judge_response(
+    json.dumps(
+      {"score": 90, "defects": [], "recurring_checks": [_banner("screenshot", False, "x=1")]}
+    ),
+    recurring_check_units=["capture"],
+  )
+
+  banner = next(c for c in parsed["recurring_checks"] if c["id"] == "banner-transparency")
+  assert (banner["subject"], banner["pass"]) == ("capture", False)
+
+
+def test_surplus_checks_become_extra_subjects():
+  parsed = parse_judge_response(
+    json.dumps(
+      {
+        "score": 90,
+        "defects": [],
+        "recurring_checks": [_banner(None, True, "top"), _banner(None, False, "bottom")],
+      }
+    ),
+    recurring_check_units=["OURS 1"],
+  )
+
+  banners = [c for c in parsed["recurring_checks"] if c["id"] == "banner-transparency"]
+  assert [(c["subject"], c["pass"]) for c in banners] == [("OURS 1", True), ("subject 2", False)]
 
 
 def test_missing_recurring_checks_are_recorded_as_skipped(monkeypatch):
