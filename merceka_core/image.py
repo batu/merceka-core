@@ -10,13 +10,18 @@ __all__ = [
 import base64
 import io
 import json
+import logging
+import math
 import os
 import re
+import shutil
 
 import httpx
 from PIL import Image
 
 from merceka_core import costs as _costs
+
+_logger = logging.getLogger(__name__)
 
 
 def _image_to_base64_uri(image: Image.Image) -> str:
@@ -154,8 +159,10 @@ def _openai_size(aspect_ratio: str, image_size: str, model: str = "") -> str:
   fixed 1K-ish sizes plus `auto` path.
   """
   normalized_size = image_size.strip().upper()
-  normalized_model = model.strip().lower()
-  if normalized_model == "gpt-image-2":
+  normalized_model = model.strip().lower().removeprefix("openai/")
+  # gpt-image-2 and the gpt-image-2.5 variants (sunburst/flare, 2026-09-08)
+  # share the explicit-size contract: multiples of 16, edges <= 3840.
+  if normalized_model.startswith("gpt-image-2"):
     if normalized_size == "2K":
       return _OPENAI_GPT_IMAGE_2_2K_SIZES.get(aspect_ratio, "2048x2048")
     if normalized_size == "4K":
@@ -212,44 +219,119 @@ def _generate_openai(
     item = data["data"][0]
     if "b64_json" in item:
       raw = base64.b64decode(item["b64_json"])
-      return Image.open(io.BytesIO(raw)).convert(target_mode)
-    # Some responses use a URL instead of b64_json.
-    url = item["url"]
-    with httpx.Client(timeout=120) as client:
-      r = client.get(url)
-      r.raise_for_status()
-      return Image.open(io.BytesIO(r.content)).convert(target_mode)
+      result = Image.open(io.BytesIO(raw)).convert(target_mode)
+    else:
+      # Some responses use a URL instead of b64_json.
+      url = item["url"]
+      with httpx.Client(timeout=120) as client:
+        r = client.get(url)
+        r.raise_for_status()
+        result = Image.open(io.BytesIO(r.content)).convert(target_mode)
   except (KeyError, IndexError) as e:
     raise RuntimeError(
       f"No image in OpenAI response: {e}\nResponse: {json.dumps(data, indent=2)[:500]}"
     ) from e
+  if transparent and result.getchannel("A").getextrema() == (255, 255):
+    # Still RGBA, so callers keep their type, but "RGBA" alone no longer proves
+    # there is a cut-out: callers with a matting fallback need to hear about it.
+    _logger.warning(
+      "OpenAI %s returned a fully opaque image for a transparent request; "
+      "the alpha channel carries no cut-out",
+      model,
+    )
+  return result
 
 
-def _edit_openai(image: Image.Image, prompt: str, model: str) -> Image.Image:
+_OPENAI_CUSTOM_SIZE_MAX_EDGE = 3840
+# Measured 2026-09-16 on gpt-image-2.5-sunburst edits: 768x768 is rejected as
+# "below the current minimum pixel budget", 896x896 is accepted. The floor sits
+# between 589,824 and 802,816 px; 1024x768 = 786,432 is the natural candidate.
+_OPENAI_CUSTOM_SIZE_MIN_PIXELS = 786_432
+
+
+def _openai_native_edit_size(model: str, w: int, h: int) -> str | None:
+  """Return the input's own dimensions as an OpenAI `size` when the model
+  accepts custom sizes (gpt-image-2 family: multiples of 16, edges <= 3840,
+  aspect within 1:3..3:1). A native-size request keeps the edit at the
+  input's pixel grid instead of a 1024-ish round trip that is then resized
+  back — the level-editor's alignment gate measures exactly that drift.
+  None means: fall back to the fixed 1K table."""
+  normalized_model = model.strip().lower().removeprefix("openai/")
+  if not normalized_model.startswith("gpt-image-2"):
+    return None
+  if w % 16 or h % 16 or max(w, h) > _OPENAI_CUSTOM_SIZE_MAX_EDGE:
+    return None
+  if w * h < _OPENAI_CUSTOM_SIZE_MIN_PIXELS:
+    return None
+  if w / h > 3 or h / w > 3:
+    return None
+  return f"{w}x{h}"
+
+
+def _pad_to_multiple_of_16(image: Image.Image) -> tuple[Image.Image, tuple[int, int, int, int]]:
+  """Pad the right/bottom edges by replicating the last column/row so both
+  edges become multiples of 16. Returns the padded image and the box of the
+  original content, so the model output can be cropped back. Lets a
+  gpt-image-2 edit of an arbitrary crop (the level editor's 182 px sticker
+  crops, 2026-09-16) take the native-size path instead of a 1024 round trip
+  that costs the 1024 price and hands back a downscaled result."""
+  w, h = image.size
+  pw, ph = (w + 15) // 16 * 16, (h + 15) // 16 * 16
+  if (pw, ph) == (w, h):
+    return image, (0, 0, w, h)
+  rgba = image.convert("RGBA")
+  out = Image.new("RGBA", (pw, ph))
+  out.paste(rgba, (0, 0))
+  if pw > w:
+    out.paste(rgba.crop((w - 1, 0, w, h)).resize((pw - w, h), Image.NEAREST), (w, 0))
+  if ph > h:
+    out.paste(out.crop((0, h - 1, pw, h)).resize((pw, ph - h), Image.NEAREST), (0, h))
+  return out, (0, 0, w, h)
+
+
+def _edit_openai(
+  image: Image.Image,
+  prompt: str,
+  model: str,
+  quality: str | None = None,
+  resize_to_input: bool = True,
+) -> Image.Image:
   """Edit one image via OpenAI's image edits endpoint.
 
   Sends multipart/form-data with the image file + prompt. The returned
   image is resized back to the input's dimensions so downstream
-  compositing (which assumes identical crop sizes) keeps working.
+  compositing (which assumes identical crop sizes) keeps working. With
+  ``resize_to_input=False`` the model's own output size is returned.
   """
   api_key = os.environ.get("OPENAI_API_KEY")
   if not api_key:
     raise RuntimeError("OPENAI_API_KEY not set in environment")
 
   original_size = image.size
+  content_box = (0, 0, *original_size)
+  # Gate on the padded size itself: an input that becomes a native size once its
+  # edges are padded to multiples of 16 keeps its own pixel grid.
+  if not _openai_native_edit_size(model, *original_size):
+    padded, padded_box = _pad_to_multiple_of_16(image)
+    if _openai_native_edit_size(model, *padded.size):
+      image, content_box = padded, padded_box
   # Encode input as PNG bytes for the multipart upload.
   buf = io.BytesIO()
   image.convert("RGBA").save(buf, format="PNG")
   buf.seek(0)
 
-  w, h = original_size
+  w, h = image.size
   if w == h:
     ar = "1:1"
   elif w > h:
     ar = "16:9" if w / h > 1.5 else "4:3"
   else:
     ar = "9:16" if h / w > 1.5 else "3:4"
-  size = _openai_size(ar, "1K", model)
+  size = _openai_native_edit_size(model, w, h) or _openai_size(ar, "1K", model)
+  # The fixed sizes cover three aspects. Anything else would be charged and then
+  # refused by the aspect guard below, so refuse before the paid call.
+  if resize_to_input:
+    _require_servable_aspect(size, image.size, model)
 
   files = {"image": ("input.png", buf.getvalue(), "image/png")}
   form = {
@@ -258,6 +340,10 @@ def _edit_openai(image: Image.Image, prompt: str, model: str) -> Image.Image:
     "size": size,
     "n": "1",
   }
+  if quality:
+    # low/medium/high/xhigh/max/auto on the gpt-image-2 family; omitted →
+    # the API default (auto). Callers pick low for cheap sticker recreates.
+    form["quality"] = quality
 
   with httpx.Client(timeout=300) as client:
     response = client.post(
@@ -289,6 +375,10 @@ def _edit_openai(image: Image.Image, prompt: str, model: str) -> Image.Image:
       f"No image in OpenAI edit response: {e}\nResponse: {json.dumps(data, indent=2)[:500]}"
     ) from e
 
+  if image.size != original_size and result.size == image.size:
+    result = result.crop(content_box)
+  if not resize_to_input:
+    return result
   return _resize_to_input_guarded(result, original_size)
 
 
@@ -307,6 +397,44 @@ def _mask_to_openai_alpha(mask: Image.Image) -> bytes:
   return buf.getvalue()
 
 
+def _aspect_matches(size: tuple[int, int], original_size: tuple[int, int]) -> bool:
+  """True when ``size`` is within 2% of the aspect ratio of ``original_size``."""
+  ow, oh = original_size
+  rw, rh = size
+  in_aspect = ow / oh if oh else 1.0
+  out_aspect = rw / rh if rh else 1.0
+  return abs(out_aspect - in_aspect) / in_aspect <= 0.02
+
+
+# Aspect ratios every Gemini image model accepts as imageConfig.aspectRatio;
+# OpenRouter's image_config.aspect_ratio takes the same values.
+_SUPPORTED_ASPECT_RATIOS = ("1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9")
+
+
+def _nearest_aspect_ratio(w: int, h: int) -> str:
+  """The supported aspect ratio closest to ``w``x``h``, compared in log space."""
+  target = math.log(w / h)
+
+  def distance(ratio: str) -> float:
+    num, den = ratio.split(":")
+    return abs(math.log(int(num) / int(den)) - target)
+
+  return min(_SUPPORTED_ASPECT_RATIOS, key=distance)
+
+
+def _require_servable_aspect(size: str, original_size: tuple[int, int], model: str) -> None:
+  """Raise ValueError before a paid call whose ``WxH`` output the aspect guard would refuse."""
+  dims = size.split("x")
+  if len(dims) != 2 or _aspect_matches((int(dims[0]), int(dims[1])), original_size):
+    return
+  ow, oh = original_size
+  raise ValueError(
+    f"{model} cannot edit a {ow}x{oh} input at its aspect: the closest supported size is "
+    f"{size}, which would have to be stretched. Refusing before the paid call; crop or pad "
+    "the input to a supported aspect first."
+  )
+
+
 def _resize_to_input_guarded(result: Image.Image, original_size: tuple[int, int]) -> Image.Image:
   """Resize a model output back to the input size, refusing aspect mismatches.
 
@@ -319,9 +447,7 @@ def _resize_to_input_guarded(result: Image.Image, original_size: tuple[int, int]
     return result
   ow, oh = original_size
   rw, rh = result.size
-  in_aspect = ow / oh if oh else 1.0
-  out_aspect = rw / rh if rh else 1.0
-  if abs(out_aspect - in_aspect) / in_aspect > 0.02:
+  if not _aspect_matches(result.size, original_size):
     raise RuntimeError(
       f"model returned aspect {rw}x{rh} for input {ow}x{oh} — refusing to stretch "
       "(would spatially warp content). Request an aspect-matched size or handle explicitly."
@@ -346,6 +472,13 @@ def _inpaint_openai(
     raise RuntimeError("OPENAI_API_KEY not set in environment")
 
   original_size = image.size
+  # size picks the supported shape nearest the input aspect. There is no
+  # padding path for masks: an aspect none of the three sizes serves would be
+  # charged and then refused by the aspect guard, so refuse it first.
+  w, h = image.size
+  aspect = w / h if h else 1.0
+  size = "1536x1024" if aspect > 1.25 else "1024x1536" if aspect < 0.8 else "1024x1024"
+  _require_servable_aspect(size, original_size, model)
   image_buf = io.BytesIO()
   image.convert("RGBA").save(image_buf, format="PNG")
 
@@ -357,12 +490,8 @@ def _inpaint_openai(
   # tuned for latency-sensitive previews and leaked into final art: JPEG
   # noise straddles the level-editor's diff-extract threshold (torn subject
   # masks) and the sizeless request forced an aspect-distorting 1024² round
-  # trip on non-square crops. size picks the supported shape nearest the
-  # input aspect; input_fidelity=high asks the model to preserve unmasked
-  # input, which is the entire point of a masked edit.
-  w, h = image.size
-  aspect = w / h if h else 1.0
-  size = "1536x1024" if aspect > 1.25 else "1024x1536" if aspect < 0.8 else "1024x1024"
+  # trip on non-square crops. input_fidelity=high asks the model to preserve
+  # unmasked input, which is the entire point of a masked edit.
   form = {
     "model": model.removeprefix("openai/"),
     "prompt": prompt,
@@ -420,12 +549,34 @@ def _google_image_or_raise(data: dict) -> Image.Image:
   raise RuntimeError(f"Gemini API returned no image: {str(data)[:400]}")
 
 
+# imageConfig.imageSize tiers per Gemini image model, from Google's image
+# generation docs: 3.1 Flash Image adds 512, 3.1 Flash Lite Image serves 1K
+# only, and 2.5 Flash Image documents no imageSize. Unlisted models get none.
+_GOOGLE_IMAGE_SIZES = (
+  ("gemini-3.1-flash-lite-image", ("1K",)),
+  ("gemini-3.1-flash-image", ("512", "1K", "2K", "4K")),
+  ("gemini-3-pro-image", ("1K", "2K", "4K")),
+)
+
+
+def _google_image_size(model: str, image_size: str | None) -> str | None:
+  """``image_size`` as a Gemini imageSize tier, or None when the model can't take it."""
+  if not image_size:
+    return None
+  tier = image_size.strip().upper()
+  for prefix, tiers in _GOOGLE_IMAGE_SIZES:
+    if model.startswith(prefix):
+      return tier if tier in tiers else None
+  return None
+
+
 def _generate_google(
   prompt: str,
   model: str,
   aspect_ratio: str,
   transparent: bool,
   input_images: list[Image.Image] | None = None,
+  image_size: str | None = None,
 ) -> Image.Image:
   """Direct Google Gemini API image generation/editing (key-gated fallback
   when OpenRouter is unavailable). Same prompt contract as the OpenRouter
@@ -445,11 +596,15 @@ def _generate_google(
       }
     )
   parts.append({"text": prompt + suffix})
+  image_config = {"aspectRatio": aspect_ratio}
+  tier = _google_image_size(model, image_size)
+  if tier:
+    image_config["imageSize"] = tier
   payload = {
     "contents": [{"parts": parts}],
     "generationConfig": {
       "responseModalities": ["IMAGE"],
-      "imageConfig": {"aspectRatio": aspect_ratio},
+      "imageConfig": image_config,
     },
   }
   with httpx.Client(timeout=300) as client:
@@ -465,6 +620,122 @@ def _generate_google(
   return _google_image_or_raise(data)
 
 
+# ── Grok (xAI) via the Grok Build CLI ────────────────────────────────────────
+# There is no xAI image API key on this host and OpenRouter lists no x-ai
+# image model (checked live 2026-09-16), so `grok/...` ids run through the
+# subscription-billed `grok -p` CLI (image_gen / image_edit tools). The CLI
+# returns 1024x1024 JPEG regardless of the input size and takes an aspect
+# ratio, not pixel dimensions. `total_cost_usd` in its JSON result is the
+# agent-token meter; the image tool itself is not itemized there.
+_GROK_TIMEOUT_S = 600
+
+
+def _grok_run(prompt: str, job_dir: str, model: str) -> str:
+  """Run the grok CLI in ``job_dir`` and return the path of the image it wrote.
+
+  The CLI bills agent tokens whether or not an image comes out, so every run
+  writes one ledger row: priced from the CLI's JSON result when it printed one,
+  unpriced otherwise, with ``meta.status`` naming any failure."""
+  import subprocess
+
+  prompt_path = os.path.join(job_dir, "prompt.txt")
+  with open(prompt_path, "w") as fh:
+    fh.write(prompt)
+  cmd = [
+    "grok", "--prompt-file", prompt_path, "--cwd", job_dir,
+    "--sandbox", "workspace", "--always-approve", "--no-plan", "--no-subagents",
+    "--disable-web-search", "--max-turns", "6", "--verbatim", "--output-format", "json",
+  ]
+  from merceka_core._cli import run_cli, scrubbed_env
+
+  try:
+    proc = run_cli(cmd, timeout=_GROK_TIMEOUT_S, env=scrubbed_env(keep=("XAI_API_KEY",)))
+  except subprocess.TimeoutExpired:
+    _grok_record(model, {}, status="timeout")
+    raise
+  if proc.returncode != 0:
+    _grok_record(model, {}, status="error")
+    raise RuntimeError(f"grok CLI failed ({proc.returncode}): {proc.stderr[-500:]}")
+  try:
+    data = json.loads(proc.stdout)
+  except json.JSONDecodeError as e:
+    _grok_record(model, {}, status="error")
+    raise RuntimeError(f"grok CLI returned non-JSON: {proc.stdout[-500:]}") from e
+  out_dir = os.path.join(job_dir, "output")
+  files = sorted(os.listdir(out_dir)) if os.path.isdir(out_dir) else []
+  if not files:
+    _grok_record(model, data, status="no_image")
+    raise RuntimeError(f"grok produced no image (stop={data.get('stopReason')}): {str(data.get('text'))[-300:]}")
+  _grok_record(model, data)
+  return os.path.join(out_dir, files[-1])
+
+
+def _grok_record(model: str, data: dict, status: str | None = None) -> None:
+  # grokSessionId, not sessionId: call-site meta wins over ambient attribution,
+  # and the ambient sessionId is the caller's (a level id, for the level editor).
+  meta = {
+    key: value
+    for key, value in (("grokSessionId", data.get("sessionId")), ("numTurns", data.get("num_turns")))
+    if value is not None
+  }
+  if status:
+    meta["status"] = status
+  _costs.record(
+    source="grok-cli", model=model, usage=data.get("usage") or {},
+    usd=data.get("total_cost_usd"), meta=meta or None,
+  )
+
+
+def _grok_job_dir() -> str:
+  import tempfile
+  import uuid
+
+  base = os.path.join(tempfile.gettempdir(), "merceka-grok")
+  job_dir = os.path.join(base, uuid.uuid4().hex)
+  os.makedirs(os.path.join(job_dir, "output"), exist_ok=True)
+  return job_dir
+
+
+def _generate_grok(prompt: str, model: str, aspect_ratio: str) -> Image.Image:
+  job_dir = _grok_job_dir()
+  full = (
+    "Call image_gen exactly once. Do not describe the image, do not list or search "
+    "directories, do not read files.\n\n"
+    f"Prompt for image_gen (use verbatim):\n{prompt}\n\n"
+    f"Aspect ratio: {aspect_ratio}.\n"
+    "Copy the generated file to output/result.png (or output/result.jpg if JPEG). "
+    "Final response: only that relative path."
+  )
+  try:
+    path = _grok_run(full, job_dir, model)
+    with Image.open(path) as img:
+      img.load()
+      return img.convert("RGB")
+  finally:
+    shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def _edit_grok(image: Image.Image, prompt: str, model: str) -> Image.Image:
+  job_dir = _grok_job_dir()
+  try:
+    src = os.path.join(job_dir, "source.png")
+    image.convert("RGB").save(src, format="PNG")
+    full = (
+      f"Call image_edit exactly once with the source image at the absolute path {src} "
+      "(it exists; do not search for it, do not list directories, do not read other files). "
+      "Do not describe the image. Use this exact text as the edit prompt:\n\n"
+      f"{prompt}\n\n"
+      "Copy the result to output/result.png (or output/result.jpg if JPEG). "
+      "Final response: only that relative path."
+    )
+    path = _grok_run(full, job_dir, model)
+    with Image.open(path) as img:
+      img.load()
+      return img.convert("RGB")
+  finally:
+    shutil.rmtree(job_dir, ignore_errors=True)
+
+
 def generate_image(
   prompt: str,
   *,
@@ -476,7 +747,11 @@ def generate_image(
   """Generate an image from a text prompt.
 
   Dispatches by model prefix:
-  - `openai/...` → OpenAI's direct image API (gpt-image-2, etc).
+  - `grok/...` → the grok CLI (prompt and aspect ratio only; see below).
+  - `openai/...` → OpenAI's direct image API (gpt-image-2, etc) when
+    OPENAI_API_KEY is set, else OpenRouter.
+  - `google/...` → Google's direct API when GEMINI_API_KEY/GOOGLE_API_KEY is
+    set, else OpenRouter.
   - Anything else → OpenRouter chat-completions with image modality.
 
   Args:
@@ -484,8 +759,10 @@ def generate_image(
     model: OpenRouter model id OR `openai/<openai-model>`.
     aspect_ratio: Aspect ratio string (e.g., "1:1", "9:16", "16:9").
     image_size: Resolution tier ("1K", "2K", "4K") — OpenAI maps to WxH.
+      Ignored by grok/ models (a warning is logged).
     transparent: Request a transparent background. OpenAI: native alpha via
-      `background: "transparent"` (RGBA result). OpenRouter: prompt-requested;
+      `background: "transparent"` (RGBA result; a warning is logged when the
+      model nonetheless returns every pixel opaque). OpenRouter: prompt-requested;
       alpha is preserved only when the model actually returns it — callers
       needing guaranteed alpha must check the result mode and fall back to
       matting.
@@ -493,6 +770,15 @@ def generate_image(
   Returns:
     PIL Image — RGBA when `transparent` produced real alpha, RGB otherwise.
   """
+  if model.startswith("grok/"):
+    # The grok CLI takes only a prompt: no size tier and no alpha channel. Say so
+    # instead of silently returning a different image; the RGB result tells
+    # transparent callers to fall back to matting, as documented above.
+    if transparent:
+      _logger.warning("%s cannot produce transparency; returning an opaque RGB image", model)
+    if image_size != "1K":
+      _logger.warning("%s ignores image_size=%r; the CLI picks the resolution", model, image_size)
+    return _generate_grok(prompt, model, aspect_ratio)
   if model.startswith("openai/") and os.environ.get("OPENAI_API_KEY"):
     return _generate_openai(
       prompt, model.removeprefix("openai/"), aspect_ratio, image_size, transparent
@@ -507,7 +793,9 @@ def generate_image(
   ):
     # Key-gated direct Gemini dispatch; OpenRouter remains the default when
     # only OPENROUTER_API_KEY is present.
-    return _generate_google(prompt, model.removeprefix("google/"), aspect_ratio, transparent)
+    return _generate_google(
+      prompt, model.removeprefix("google/"), aspect_ratio, transparent, image_size=image_size
+    )
 
   api_key = os.environ.get("OPENROUTER_API_KEY")
   if not api_key:
@@ -550,6 +838,7 @@ def edit_image(
   *,
   model: str = "google/gemini-3.1-flash-image-preview",
   resize_to_input: bool = True,
+  quality: str | None = None,
 ) -> Image.Image:
   """Send one image + text prompt, get back a modified image.
 
@@ -566,18 +855,27 @@ def edit_image(
   Returns:
     PIL Image in RGB mode, resized to the input's original dimensions.
   """
+  if model.startswith("grok/"):
+    result = _edit_grok(image, prompt, model)
+    if resize_to_input and result.size != image.size:
+      result = _resize_to_input_guarded(result, image.size)
+    return result
   if model.startswith("openai/") and os.environ.get("OPENAI_API_KEY"):
-    return _edit_openai(image, prompt, model.removeprefix("openai/"))
+    return _edit_openai(
+      image, prompt, model.removeprefix("openai/"), quality=quality,
+      resize_to_input=resize_to_input,
+    )
   if (
     model.startswith("google/")
     and os.environ.get("GOOGLE_API_KEY")
     and not os.environ.get("MERCEKA_FORCE_OPENROUTER")
   ):
     result = _generate_google(
-      prompt, model.removeprefix("google/"), "1:1", False, input_images=[image]
+      prompt, model.removeprefix("google/"), _nearest_aspect_ratio(*image.size), False,
+      input_images=[image],
     )
-    if resize_to_input and result.size != image.size:
-      result = result.resize(image.size, Image.Resampling.LANCZOS)
+    if resize_to_input:
+      result = _resize_to_input_guarded(result, image.size)
     return result
 
   api_key = os.environ.get("OPENROUTER_API_KEY")
@@ -588,13 +886,13 @@ def edit_image(
   original_size = image.size
 
   w, h = image.size
-  if w == h:
-    ar = "1:1"
-  elif w > h:
-    ar = "16:9" if w / h > 1.5 else "4:3"
-  else:
-    ar = "9:16" if h / w > 1.5 else "3:4"
+  ar = _nearest_aspect_ratio(w, h)
   img_size = "1K" if max(w, h) <= 1024 else "2K"
+  image_config = {"aspect_ratio": ar, "image_size": img_size}
+  if quality:
+    # OpenRouter passes image_config through to the provider; providers
+    # without a quality knob ignore it.
+    image_config["quality"] = quality
 
   payload = {
     "model": model,
@@ -608,10 +906,7 @@ def edit_image(
       }
     ],
     "modalities": ["image", "text"],
-    "image_config": {
-      "aspect_ratio": ar,
-      "image_size": img_size,
-    },
+    "image_config": image_config,
     # Ask the biller to state the exact cost of this call in the response.
     "usage": {"include": True},
   }
@@ -632,8 +927,8 @@ def edit_image(
   usage = data.get("usage") or {}
   _costs.record(source="openrouter", model=model, usage=usage, usd=usage.get("cost"))
   result = _openrouter_image_or_raise(data)
-  if resize_to_input and result.size != original_size:
-    result = result.resize(original_size, Image.Resampling.LANCZOS)
+  if resize_to_input:
+    result = _resize_to_input_guarded(result, original_size)
   return result
 
 
@@ -790,7 +1085,11 @@ def _inpaint_fal(
     if response.status_code != 200:
       raise RuntimeError(f"fal.ai API error {response.status_code}: {response.text[:500]}")
     result_data = response.json()
+    # fal states no per-call cost in the body. The gateway's request id rides in
+    # a response header; it tells a duplicated write apart from a repeat call.
+    request_id = (getattr(response, "headers", None) or {}).get("x-fal-request-id")
 
+  _costs.record(source="fal", model=model, usage={"calls": 1}, request_id=request_id)
   try:
     result_image_url = result_data["images"][0]["url"]
   except (KeyError, IndexError) as e:
@@ -803,10 +1102,7 @@ def _inpaint_fal(
     img_response.raise_for_status()
 
   result = Image.open(io.BytesIO(img_response.content)).convert("RGB")
-  # Resize to match input dimensions (fal.ai may return different size)
-  if result.size != image.size:
-    result = result.resize(image.size, Image.Resampling.LANCZOS)
-  return result
+  return _resize_to_input_guarded(result, image.size)
 
 
 def _inpaint_openrouter(

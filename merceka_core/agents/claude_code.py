@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-import json
-import subprocess
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -19,6 +16,7 @@ from merceka_core.agent import (
   ProviderFailure,
   RawProviderEvent,
 )
+from merceka_core.agents import _process
 
 CLAUDE_CODE_PROVIDER = "claude_code"
 CLAUDE_CODE_TIMEOUT_SECONDS = 120
@@ -33,21 +31,13 @@ class ClaudeCodeAgentProvider:
   timeout_seconds: int = CLAUDE_CODE_TIMEOUT_SECONDS
 
   async def run(self, request: AgentRequest) -> AgentResult:
-    return await asyncio.to_thread(self._run_sync, request)
-
-  def stream(self, request: AgentRequest) -> AsyncIterator[AgentStreamEvent]:
-    return self._stream(request)
-
-  def _run_sync(self, request: AgentRequest) -> AgentResult:
-    cmd = self._command(request, stream=False)
-    result = subprocess.run(
-      cmd,
+    result = await _process.run(
+      self._command(request, stream=False),
       input=request.message,
-      capture_output=True,
-      text=True,
       timeout=self.timeout_seconds,
-      env=self._env(),
       cwd=str(request.roots[0]),
+      env=self._env(),
+      label="Claude Code",
     )
     raw_event = RawProviderEvent(
       provider=CLAUDE_CODE_PROVIDER,
@@ -63,37 +53,32 @@ class ClaudeCodeAgentProvider:
       raise ProviderFailure(f"Claude Code failed with exit {result.returncode}: {message}")
     return AgentResult(text=result.stdout.strip(), raw_events=(raw_event,))
 
+  def stream(self, request: AgentRequest) -> AsyncIterator[AgentStreamEvent]:
+    return self._stream(request)
+
   async def _stream(self, request: AgentRequest) -> AsyncIterator[AgentStreamEvent]:
-    cmd = self._command(request, stream=True)
-    process = subprocess.Popen(
-      cmd,
-      stdin=subprocess.PIPE,
-      stdout=subprocess.PIPE,
-      stderr=subprocess.PIPE,
-      text=True,
-      bufsize=1,
-      env=self._env(),
+    stream = _process.Stream(
+      self._command(request, stream=True),
       cwd=str(request.roots[0]),
+      env=self._env(),
+      timeout=self.timeout_seconds,
+      label="Claude Code stream",
     )
-    if process.stdin is None or process.stdout is None or process.stderr is None:
-      raise ProviderFailure("Claude Code stream did not expose stdio pipes")
-
-    process.stdin.write(request.message)
-    process.stdin.close()
-
     raw_events: list[RawProviderEvent] = []
     text_chunks: list[str] = []
     completed = False
+    failure: str | None = None
     try:
+      await stream.send(request.message)
       while True:
-        line = await asyncio.to_thread(process.stdout.readline)
+        line = await stream.readline()
         if line == "":
           break
         line = line.strip()
         if not line:
           continue
 
-        raw_event = self._raw_event_from_line(line)
+        raw_event = _process.raw_event_from_line(line, CLAUDE_CODE_PROVIDER)
         raw_events.append(raw_event)
         yield AgentRawProviderEvent(raw_event=raw_event)
 
@@ -108,10 +93,14 @@ class ClaudeCodeAgentProvider:
 
         if _cli.is_claude_result_event(payload):
           completed = True
+          failure = _result_failure(payload)
           break
 
-      returncode = await asyncio.to_thread(process.wait)
-      stderr = await asyncio.to_thread(process.stderr.read)
+      returncode, stderr = await stream.finish()
+      if failure is not None:
+        # Checked before the exit code: the CLI prints in-run failures as the
+        # result on stdout, so its stderr is often empty.
+        raise ProviderFailure(f"Claude Code stream failed: {failure}")
       if returncode != 0:
         message = stderr.strip() or f"exit {returncode}"
         raise ProviderFailure(f"Claude Code stream failed with exit {returncode}: {message}")
@@ -124,17 +113,8 @@ class ClaudeCodeAgentProvider:
         raw_events.append(completion_event)
         yield AgentRawProviderEvent(raw_event=completion_event)
       yield AgentComplete(result=AgentResult(text="".join(text_chunks), raw_events=tuple(raw_events)))
-    except GeneratorExit:
-      self._terminate_process(process)
-      raise
-    except asyncio.CancelledError:
-      self._terminate_process(process)
-      raise
     finally:
-      if not completed and process.returncode is None:
-        self._terminate_process(process)
-      self._close_pipe(process.stdout)
-      self._close_pipe(process.stderr)
+      await stream.close()
 
   def _command(self, request: AgentRequest, *, stream: bool) -> list[str]:
     tools = WRITE_TOOLS if request.profile == AgentProfile.WRITE else READ_ONLY_TOOLS
@@ -148,28 +128,32 @@ class ClaudeCodeAgentProvider:
       binary=self.claude_binary,
     )
 
-  def _raw_event_from_line(self, line: str) -> RawProviderEvent:
-    try:
-      payload: Any = json.loads(line)
-    except json.JSONDecodeError as exc:
-      return RawProviderEvent(
-        provider=CLAUDE_CODE_PROVIDER,
-        event_type="malformed_json",
-        payload={"line": line, "error": str(exc)},
-      )
-    event_type = str(payload.get("type", "raw")) if isinstance(payload, dict) else "raw"
-    return RawProviderEvent(provider=CLAUDE_CODE_PROVIDER, event_type=event_type, payload=payload)
-
   def _text_delta_from_payload(self, payload: dict[str, Any]) -> str | None:
     return _cli.claude_stream_text_delta(payload)
 
   def _env(self) -> dict[str, str]:
     return _cli.claude_env()
 
-  def _terminate_process(self, process: subprocess.Popen[str]) -> None:
-    process.terminate()
-    process.wait()
 
-  def _close_pipe(self, pipe: Any) -> None:
-    if pipe is not None:
-      pipe.close()
+def _result_failure(payload: dict[str, Any]) -> str | None:
+  """Why a stream-json ``result`` event reports a failed run, else None.
+
+  ``is_error`` is set on every ``error_*`` subtype (max turns, budget, an
+  error during execution), with the detail in ``errors``. It is also set on a
+  ``success`` result whose final model request failed, with the API error in
+  ``result``.
+  """
+  if not payload.get("is_error"):
+    return None
+  errors = payload.get("errors")
+  details = [str(error) for error in errors if error] if isinstance(errors, list) else []
+  result = payload.get("result")
+  if isinstance(result, str) and result.strip():
+    details.append(result.strip())
+  subtype = payload.get("subtype")
+  if isinstance(subtype, str) and subtype.startswith("error"):
+    return f"{subtype}: {'; '.join(details)}" if details else subtype
+  if details:
+    return "; ".join(details)
+  status = payload.get("api_error_status")
+  return f"final request failed (HTTP {status})" if status else "final request failed"

@@ -73,3 +73,12 @@ class TestLazyImportStaysLight:
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "light"
+
+
+def test_llm_response_error_is_exported():
+  """LLM.generate raises it for error bodies and empty completions; callers
+  should not have to import it from a private module."""
+  from merceka_core.errors import LLMResponseError
+
+  assert merceka_core.LLMResponseError is LLMResponseError
+  assert "LLMResponseError" in merceka_core.__all__

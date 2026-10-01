@@ -12,7 +12,6 @@ import inspect
 import json
 import math
 import mimetypes
-import os
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -22,13 +21,14 @@ from typing import Any, Callable
 import httpx
 import shutil
 
+from merceka_core import _cli, _env
+from merceka_core import costs as _costs
 from merceka_core.vision import zoom_judge as _zoom_judge
 import subprocess
 import tempfile as _tempfile
 
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits"
-_ENV_FALLBACK_PATH = Path("/Users/base/dev/appletolye/.env")
 
 JUDGE_REGISTRY: list[dict[str, Any]] = [
   {
@@ -101,7 +101,17 @@ FINDING_KEYS = [
   "other",
 ]
 SEVERITY_RANK = {"blocker": 3, "major": 2, "minor": 1}
-_SEVERITIES = set(SEVERITY_RANK)
+# Severity words models use, matched case- and whitespace-insensitively. Anything
+# else is minor.
+_SEVERITY_ALIASES = {
+  "blocker": "blocker",
+  "critical": "blocker",
+  "high": "blocker",
+  "major": "major",
+  "medium": "major",
+  "minor": "minor",
+  "low": "minor",
+}
 _MAX_TEXT = 400
 RECURRING_CHECKS = [
   {
@@ -162,6 +172,7 @@ Respond with ONLY a JSON object, no prose, in this exact shape:
   "recurring_checks": [
     {{
       "id": <one of: {", ".join(RECURRING_CHECK_IDS)}>,
+      "subject": "<the recurring check subject this entry judges, exactly as listed>",
       "pass": <true if this recurring defect is absent, false if present>,
       "evidence": "<short phrase naming the subject and pixel location>"
     }}
@@ -175,9 +186,11 @@ empty defects array.
 Recurring defects checklist:
 {_RECURRING_CHECK_PROMPT}
 
-For recurring_checks, emit one entry per judged subject per checklist id. If
-multiple OURS images or named crop subjects are listed, repeat the ids for each
-subject and include the image/crop name plus a pixel location in evidence."""
+For recurring_checks, emit one entry per judged subject per checklist id, with
+subject set to that subject's name exactly as listed under "Recurring check
+subjects". If multiple OURS images or named crop subjects are listed, repeat the
+ids for each subject and include the image/crop name plus a pixel location in
+evidence."""
 
 _OPENROUTER_RESPONSE_FORMAT = {
   "type": "json_schema",
@@ -210,9 +223,10 @@ _OPENROUTER_RESPONSE_FORMAT = {
           "items": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["id", "pass", "evidence"],
+            "required": ["id", "subject", "pass", "evidence"],
             "properties": {
               "id": {"type": "string", "enum": RECURRING_CHECK_IDS},
+              "subject": {"type": "string"},
               "pass": {"type": "boolean"},
               "evidence": {"type": "string"},
             },
@@ -235,8 +249,18 @@ def critique(
   floor: float = 85.0,
   timeout: float = 60.0,
   client: httpx.Client | None = None,
+  quorum: int | None = None,
+  recurring_checks_gate: bool = True,
 ) -> dict[str, Any]:
   """Run a multi-model visual critique and aggregate participating judges.
+
+  The verdict is ``"fail"`` when the median score is below ``floor``, when a
+  majority of participants flag a blocker under the same defect key, or (with
+  ``recurring_checks_gate``) when a majority of participants fail the same
+  recurring check for the same subject. Majority means ``ceil(n / 2)`` of the n
+  participating judges. Defect consensus matches on the finding key only: judges
+  that report the same blocker under different keys (say "background" and
+  "extra-element" for one opaque box) do not agree.
 
   Args:
     images: One or more image paths or raw image bytes to judge.
@@ -244,10 +268,16 @@ def critique(
       against this target; otherwise they use ``spec`` as the target.
     spec: Optional written target/specification.
     judges: Optional judge roster. Items may be strings or dicts with
-      ``id``, ``model``, and optional ``enabled``.
-    budget_check: Optional callable run before each billable judge call. A
-      falsy return skips the current and remaining judges with reason
-      ``"budget"``.
+      ``id``, ``model``, and optional ``enabled``. A registry id, given as a
+      string or a partial dict, keeps the registry's model and transport
+      (``cli``, ``effort``, ``api``); fields set in the dict override them.
+      Listing a judge enables it unless its dict sets ``enabled: False``.
+    budget_check: Optional callable run before each paid API judge call
+      (OpenRouter and the Anthropic zoom judge); CLI judges run on
+      subscriptions and are never gated. It may take no arguments or one
+      context dict with ``judge``, ``model`` and ``transport``
+      (``"openrouter"`` or ``"anthropic"``). A falsy return skips that judge
+      and every later paid judge with reason ``"budget"``.
     recurring_check_units: Optional labels for the subjects that need recurring
       defect checks. Defaults to one subject per OURS image.
     floor: Informational pass/fail score floor. Defaults to 85.
@@ -255,24 +285,48 @@ def critique(
       client.
     client: Optional injected ``httpx.Client`` for tests or caller-managed
       connection reuse.
+    quorum: Minimum number of judges that must return a parseable score.
+      Defaults to a majority of the enabled roster, ``ceil(n / 2)`` and at least
+      1, so a panel that lost most of its judges (expired CLI login, HTTP
+      errors, parse failures) raises instead of letting the survivors decide
+      alone. Pass ``quorum=1`` to accept any non-empty panel.
+    recurring_checks_gate: When True (the default), a recurring check that a
+      majority of participants fail for the same subject fails the verdict.
+      These checks cover defects that keep recurring, so they gate like a
+      consensus blocker. Pass False to restore the score-and-blocker verdict;
+      ``failed_recurring_checks`` is reported either way.
 
   Returns:
     A dict with score, verdict, defects, per_model, consensus, participated,
-    and skipped.
+    and skipped, plus ``participants`` (judges that returned a score),
+    ``roster_size`` (enabled judges) and ``degraded`` (True when any enabled
+    judge was skipped). Judges disabled in the roster are listed in skipped
+    but do not count toward the roster or degrade the panel. A paid judge
+    whose key (``OPENROUTER_API_KEY`` or ``ANTHROPIC_API_KEY``) is not
+    configured is skipped with reason ``"no-key"`` and counts against the
+    quorum.
+    ``recurring_checks`` shows, per subject and check, a failure if any judge
+    reported one; ``failed_recurring_checks`` lists the check ids that failed
+    by majority.
 
   Raises:
-    RuntimeError: When no judge produced a parseable score.
+    RuntimeError: When fewer than ``quorum`` judges produced a parseable score.
+      The message names every skipped judge and its reason.
+    ValueError: When ``images`` is empty or ``quorum`` is below 1 or above the
+      number of enabled judges.
   """
   if not images:
     raise ValueError("critique requires at least one image")
 
-  api_key = _openrouter_api_key()
-  if not api_key:
-    raise RuntimeError(
-      f"OPENROUTER_API_KEY is not configured in the environment or {_ENV_FALLBACK_PATH}"
-    )
-
   roster = _normalize_judges(judges)
+  roster_size = sum(1 for judge in roster if judge.get("enabled", True))
+  if quorum is not None and not 1 <= quorum <= roster_size:
+    raise ValueError(
+      f"quorum {quorum} exceeds the {roster_size} enabled judges"
+      if quorum > roster_size
+      else f"quorum must be at least 1, got {quorum}"
+    )
+  required = quorum if quorum is not None else max(1, math.ceil(roster_size / 2))
   check_units = _normalize_recurring_check_units(images, recurring_check_units)
   messages = _build_messages(
     images,
@@ -288,6 +342,8 @@ def critique(
   owns_client = client is None
   http_client = client or httpx.Client(timeout=timeout)
   budget_halted = False
+  # Resolved once, only if an OpenRouter judge runs; "" means no key.
+  openrouter_key: str | None = None
 
   try:
     for judge in roster:
@@ -295,27 +351,38 @@ def critique(
       if not judge.get("enabled", True):
         _record_skip(per_model, skipped, judge, "disabled")
         continue
-      if budget_halted:
-        _record_skip(per_model, skipped, judge, "budget")
-        continue
       if judge.get("cli") == "codex":
-        # CLI judges bill the codex subscription, not OpenRouter credits, so
-        # the OpenRouter budget gate does not apply to them.
+        # Bills the codex subscription, so neither the budget gate nor any
+        # API key applies.
         result = _call_codex_cli_judge(judge, images, reference, spec, check_units)
       elif judge.get("cli") == "claude":
-        # Bills the Claude subscription through the local CLI, not OpenRouter
-        # credits, so the OpenRouter budget gate does not apply.
+        # Bills the Claude subscription through the local CLI.
         result = _call_claude_cli_judge(judge, images, reference, spec, check_units)
       elif judge.get("api") == "anthropic-zoom":
-        # Bills the Anthropic API directly; the OpenRouter budget gate does
-        # not apply. Skips itself when no key is configured.
-        result = _call_anthropic_zoom_judge(judge, images, reference, spec, check_units)
-      else:
-        if budget_check is not None and not _budget_allows(budget_check, judge):
+        # Bills the Anthropic API directly.
+        anthropic_key = _anthropic_api_key()
+        if not anthropic_key:
+          _record_skip(per_model, skipped, judge, "no-key")
+          continue
+        if budget_halted or not _budget_allows(budget_check, judge, "anthropic"):
           budget_halted = True
           _record_skip(per_model, skipped, judge, "budget")
           continue
-        result = _call_judge(http_client, judge, messages, api_key, check_units)
+        result = _call_anthropic_zoom_judge(
+          judge, images, reference, spec, check_units, api_key=anthropic_key
+        )
+      else:
+        # Spends OpenRouter credits.
+        if openrouter_key is None:
+          openrouter_key = _openrouter_api_key() or ""
+        if not openrouter_key:
+          _record_skip(per_model, skipped, judge, "no-key")
+          continue
+        if budget_halted or not _budget_allows(budget_check, judge, "openrouter"):
+          budget_halted = True
+          _record_skip(per_model, skipped, judge, "budget")
+          continue
+        result = _call_judge(http_client, judge, messages, openrouter_key, check_units)
       if result["ok"]:
         per_model[judge_id] = {
           "model": judge["model"],
@@ -339,9 +406,13 @@ def critique(
     if owns_client:
       http_client.close()
 
-  if not participant_results:
+  participants = len(participant_results)
+  if participants < required:
     reasons = ", ".join(f"{s['judge']}: {s['reason']}" for s in skipped) or "none"
-    raise RuntimeError(f"vision critique had 0 participating judges; skipped={reasons}")
+    raise RuntimeError(
+      f"vision critique had {participants} participating judges, below the quorum of "
+      f"{required} (roster of {roster_size}); skipped={reasons}"
+    )
 
   score = float(median([r["score"] for r in participant_results]))
   consensus = _consensus_keys(participant_results)
@@ -350,17 +421,23 @@ def critique(
     _public_recurring_check(c) for c in _aggregate_recurring_checks(participant_results, check_units)
   ]
   consensus_blocker = _has_consensus_blocker(consensus, participant_results)
-  verdict = "fail" if score < floor or consensus_blocker else "pass"
+  failed_recurring_checks = _failed_recurring_checks(participant_results)
+  recurring_fail = recurring_checks_gate and bool(failed_recurring_checks)
+  verdict = "fail" if score < floor or consensus_blocker or recurring_fail else "pass"
 
   return {
     "score": score,
     "verdict": verdict,
     "defects": defects,
     "recurring_checks": recurring_checks,
+    "failed_recurring_checks": failed_recurring_checks,
     "per_model": per_model,
     "consensus": consensus,
     "participated": participated,
     "skipped": skipped,
+    "participants": participants,
+    "roster_size": roster_size,
+    "degraded": participants < roster_size,
   }
 
 
@@ -414,10 +491,9 @@ def _call_anthropic_zoom_judge(
   reference: str | Path | None,
   spec: str | None,
   recurring_check_units: list[str],
+  *,
+  api_key: str,
 ) -> dict[str, Any]:
-  api_key = _anthropic_api_key()
-  if not api_key:
-    return {"ok": False, "reason": "no-key"}
   raw = _zoom_judge.call_zoom_judge(
     judge,
     images,
@@ -441,7 +517,12 @@ def _call_codex_cli_judge(
   spec: str | None,
   recurring_check_units: list[str],
 ) -> dict[str, Any]:
-  """Run one judge through the local `codex` CLI (vision via -i attachments)."""
+  """Run one judge through the local `codex` CLI (vision via -i attachments).
+
+  The judge runs read-only in a scratch working directory, so the calling
+  repo's AGENTS.md never reaches it, and its answer is read from
+  ``--output-last-message`` instead of being cut out of the stdout transcript.
+  """
   binary = shutil.which("codex") or "/opt/homebrew/bin/codex"
   prompt = _prompt_with_spec(spec, reference, recurring_check_units)
   ordered: list[str | Path | bytes | bytearray | memoryview] = []
@@ -452,33 +533,32 @@ def _call_codex_cli_judge(
     prompt += "\n\nAttached images are OURS, in order."
   ordered.extend(images)
 
-  args = [binary, "exec", "-m", judge["model"],
-          "-c", f"model_reasoning_effort={judge.get('effort', 'high')}"]
-  temps: list[str] = []
   try:
-    for item in ordered:
-      if isinstance(item, (bytes, bytearray, memoryview)):
-        handle = _tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        handle.write(bytes(item))
-        handle.close()
-        temps.append(handle.name)
-        args.extend(["-i", handle.name])
-      else:
-        args.extend(["-i", str(item)])
-    args.append("-")
-    completed = subprocess.run(
-      args, input=prompt, capture_output=True, text=True, timeout=600,
-    )
+    with _tempfile.TemporaryDirectory(prefix="critique-codex-") as workdir:
+      attachments: list[str] = []
+      for index, item in enumerate(ordered):
+        if isinstance(item, (bytes, bytearray, memoryview)):
+          path = Path(workdir, f"image-{index}.png")
+          path.write_bytes(bytes(item))
+          attachments.append(str(path))
+        else:
+          # Relative paths would otherwise resolve against the scratch cwd.
+          attachments.append(str(Path(item).resolve()))
+      last_message = Path(workdir, "last-message.txt")
+      cmd = _cli.codex_exec_command(judge["model"], cd=workdir, images=attachments, binary=binary)
+      # codex_exec_command applies reasoning effort only to alias models; the
+      # judge names both a model and an effort.
+      cmd[2:2] = [
+        "-c", f'model_reasoning_effort="{judge.get("effort", "high")}"',
+        "--output-last-message", str(last_message),
+      ]
+      completed = _cli.run_cli(cmd, input=prompt, timeout=600, cwd=workdir, env=_cli.codex_env())
+      if completed.returncode != 0:
+        return {"ok": False, "reason": "cli-error"}
+      text = last_message.read_text() if last_message.exists() else ""
   except (OSError, subprocess.TimeoutExpired):
     return {"ok": False, "reason": "cli-error"}
-  finally:
-    for name in temps:
-      Path(name).unlink(missing_ok=True)
 
-  if completed.returncode != 0:
-    return {"ok": False, "reason": "cli-error"}
-  # codex exec prints the answer, a "tokens used" line, then echoes the answer.
-  text = completed.stdout.split("tokens used", 1)[0]
   try:
     parsed = parse_judge_response(text, recurring_check_units=recurring_check_units)
   except (TypeError, ValueError, json.JSONDecodeError):
@@ -531,19 +611,16 @@ def _call_claude_cli_judge(
       "Output ONLY the JSON object. No preamble, no commentary, no code fence."
     )
 
-    allow_dirs: list[str] = []
-    for parent in dict.fromkeys(str(p.parent) for p in paths):
-      allow_dirs.extend(["--add-dir", parent])
-
     with _tempfile.TemporaryDirectory(prefix="critique-claude-") as workdir:
-      completed = subprocess.run(
-        [binary, "-p", "--model", judge["model"], "--allowedTools", "Read", *allow_dirs],
-        input=prompt,
-        capture_output=True,
-        text=True,
-        timeout=600,
-        cwd=workdir,
+      # Same locked-down session as read-only agents: Read is the only tool, and
+      # it only reaches the scratch cwd and the images' directories.
+      cmd = _cli.claude_command(
+        judge["model"],
+        add_dirs=list(dict.fromkeys(str(p.parent) for p in paths)),
+        allowed_tools=("Read",),
+        binary=binary,
       )
+      completed = _cli.run_cli(cmd, input=prompt, timeout=600, cwd=workdir, env=_cli.claude_env())
   except (OSError, subprocess.TimeoutExpired):
     return {"ok": False, "reason": "cli-error"}
   finally:
@@ -573,9 +650,12 @@ def _call_judge(
     "messages": messages,
     "temperature": 0,
     # response_format is best-effort: providers that ignore it (e.g. anthropic)
-    # fall back to the tolerant fenced/prose parser. require_parameters would
-    # hard-400 those providers (found live: anthropic 400 vs gemini 200).
+    # fall back to the fenced/embedded JSON extraction in parse_judge_response.
+    # require_parameters would hard-400 those providers (found live: anthropic
+    # 400 vs gemini 200).
     "response_format": _OPENROUTER_RESPONSE_FORMAT,
+    # Ask OpenRouter to report the call's cost so the ledger row is metered.
+    "usage": {"include": True},
   }
   try:
     response = client.post(
@@ -595,7 +675,12 @@ def _call_judge(
     return {"ok": False, "reason": _skip_reason_for_status(response.status_code)}
 
   try:
-    content = _extract_openrouter_text(response.json())
+    body = response.json()
+  except ValueError:
+    return {"ok": False, "reason": "parse-failure"}
+  _record_openrouter_cost(judge["model"], body)
+  try:
+    content = _extract_openrouter_text(body)
     parsed = parse_judge_response(content, recurring_check_units=recurring_check_units)
   except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
     return {"ok": False, "reason": "parse-failure"}
@@ -603,80 +688,129 @@ def _call_judge(
   return {"ok": True, **parsed}
 
 
+def _record_openrouter_cost(model: str, body: Any) -> None:
+  """Meter one billed OpenRouter call; the verdict may still fail to parse."""
+  if not isinstance(body, dict):
+    return
+  usage = body.get("usage")
+  usage = usage if isinstance(usage, dict) else {}
+  cost = usage.get("cost")
+  _costs.record(
+    source="openrouter",
+    model=model,
+    usage=usage,
+    usd=cost if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
+    request_id=body.get("id"),
+  )
+
+
 def parse_judge_response(
   text: str,
   *,
   recurring_check_units: list[str] | None = None,
 ) -> dict[str, Any]:
-  """Parse one judge response into a clamped score and normalized defects."""
+  """Parse one judge response into a clamped score and normalized defects.
+
+  The verdict is the last JSON object in ``text`` that fits the response schema:
+  a finite numeric ``score`` (a number, or a string holding one), a ``defects``
+  list and a ``recurring_checks`` list. The whole text is tried first;
+  otherwise fenced ```json blocks and balanced top-level objects are
+  candidates, ordered by position, so narration with braces, a draft before the
+  final answer or a trailing note cannot displace the verdict. When no object
+  carries ``recurring_checks``, the last one with a score and defects list is
+  used and its checks are recorded as skipped.
+
+  Raises:
+    ValueError: When no object fits the schema. There is no prose fallback;
+      the panel records the judge as ``parse-failure``.
+  """
   if not isinstance(text, str):
     raise ValueError("judge response is not text")
   check_units = _normalize_recurring_check_units([b""], recurring_check_units)
-  obj = _extract_json_object(text)
+  obj = _extract_verdict(text)
   if obj is None:
-    return _parse_prose_response(text, check_units)
+    raise ValueError("judge response has no JSON verdict with a numeric score and defects list")
 
-  raw_score = obj.get("score", obj.get("fidelity"))
-  score = _clamp_score(raw_score)
+  score = _clamp_score(_verdict_score(obj))
   if score is None:
     raise ValueError("judge response missing numeric score")
 
-  raw_defects = obj.get("defects", obj.get("findings", []))
-  defects = [_normalize_defect(d) for d in raw_defects] if isinstance(raw_defects, list) else []
+  defects = [_normalize_defect(d) for d in _verdict_defects(obj)]
   defects.sort(key=lambda d: SEVERITY_RANK[d["severity"]], reverse=True)
   recurring_checks = _normalize_recurring_checks(obj.get("recurring_checks"), check_units)
   return {"score": score, "defects": defects, "recurring_checks": recurring_checks}
 
 
-def _extract_json_object(text: str) -> dict[str, Any] | None:
-  start = text.find("{")
-  end = text.rfind("}")
-  if start == -1 or end <= start:
-    return None
+_FENCED_BLOCK = re.compile(r"```(?:json)?\s*(.*?)```", re.S | re.I)
+
+
+def _extract_verdict(text: str) -> dict[str, Any] | None:
   try:
-    return json.loads(text[start : end + 1])
+    whole = json.loads(text.strip())
   except json.JSONDecodeError:
-    return None
+    whole = None
+  if _is_verdict(whole):
+    return whole
+  # Fenced blocks and bare objects compete by position, so a final answer
+  # outranks an earlier draft however each one is formatted.
+  candidates = {**_balanced_objects(text), **_fenced_objects(text)}
+  verdicts = [obj for _start, obj in sorted(candidates.items()) if _is_verdict(obj)]
+  # An object with every schema field outranks one that omits recurring_checks.
+  complete = [obj for obj in verdicts if "recurring_checks" in obj]
+  return (complete or verdicts or [None])[-1]
 
 
-def _parse_prose_response(text: str, recurring_check_units: list[str]) -> dict[str, Any]:
-  match = re.search(r"\b(?:score|fidelity)\b[^0-9-]*(-?\d+(?:\.\d+)?)\s*%?", text, re.I)
-  if match is None:
-    match = re.search(r"(-?\d+(?:\.\d+)?)\s*%\s*(?:fidelity|match|score)", text, re.I)
-  score = _clamp_score(match.group(1) if match else None)
-  if score is None:
-    raise ValueError("judge prose response missing numeric score")
-
-  defects = []
-  for line in text.splitlines():
-    sev = re.search(r"\b(blocker|major|minor)\b", line, re.I)
-    if not sev:
+def _fenced_objects(text: str) -> dict[int, Any]:
+  """JSON values of fenced blocks, keyed by where each value starts in ``text``."""
+  objects = {}
+  for match in _FENCED_BLOCK.finditer(text):
+    block = match.group(1)
+    try:
+      value = json.loads(block)
+    except json.JSONDecodeError:
       continue
-    severity = sev.group(1).lower()
-    key_match = re.search(
-      r"\b(" + "|".join(re.escape(k) for k in FINDING_KEYS) + r")\b", line, re.I
-    )
-    key = _normalize_key(key_match.group(1).lower() if key_match else line)
-    defect_text = re.sub(r"^\s*[-*0-9.)\s]+", "", line).strip()
-    defects.append(
-      {
-        "key": key,
-        "region": "unspecified",
-        "severity": severity,
-        "defect": _clip(defect_text),
-        "direction": _clip(defect_text),
-      }
-    )
+    objects[match.start(1) + len(block) - len(block.lstrip())] = value
+  return objects
 
-  defects.sort(key=lambda d: SEVERITY_RANK[d["severity"]], reverse=True)
-  return {
-    "score": score,
-    "defects": defects,
-    "recurring_checks": _skipped_recurring_checks(
-      recurring_check_units,
-      "model returned prose only",
-    ),
-  }
+
+def _balanced_objects(text: str) -> dict[int, Any]:
+  """Every top-level JSON object in ``text``, keyed by its start offset.
+
+  Spans that do not decode are skipped.
+  """
+  decoder = json.JSONDecoder()
+  objects = {}
+  index = text.find("{")
+  while index != -1:
+    try:
+      obj, end = decoder.raw_decode(text, index)
+    except json.JSONDecodeError:
+      index = text.find("{", index + 1)
+      continue
+    objects[index] = obj
+    index = text.find("{", end)
+  return objects
+
+
+def _is_verdict(obj: Any) -> bool:
+  if not isinstance(obj, dict):
+    return False
+  score = _verdict_score(obj)
+  return (
+    not isinstance(score, bool)
+    and _clamp_score(score) is not None
+    and isinstance(_verdict_defects(obj), list)
+    and isinstance(obj.get("recurring_checks", []), list)
+  )
+
+
+def _verdict_score(obj: dict[str, Any]) -> Any:
+  # "fidelity"/"findings" are the legacy field names.
+  return obj.get("score", obj.get("fidelity"))
+
+
+def _verdict_defects(obj: dict[str, Any]) -> Any:
+  return obj.get("defects", obj.get("findings"))
 
 
 def _normalize_defect(raw: Any) -> dict[str, str]:
@@ -693,9 +827,7 @@ def _normalize_defect(raw: Any) -> dict[str, str]:
     if reference or ours:
       direction = f"reference: {reference or ''}; ours: {ours or ''}"
   key = _normalize_key(raw.get("key") or defect_text)
-  severity = str(raw.get("severity", "minor")).lower()
-  if severity not in _SEVERITIES:
-    severity = "minor"
+  severity = _SEVERITY_ALIASES.get(str(raw.get("severity", "minor")).strip().lower(), "minor")
 
   return {
     "key": key,
@@ -707,6 +839,7 @@ def _normalize_defect(raw: Any) -> dict[str, str]:
 
 
 def _normalize_recurring_checks(raw: Any, recurring_check_units: list[str]) -> list[dict[str, Any]]:
+  """One judge's checks: one entry per check id for each subject, in subject order."""
   if not isinstance(raw, list):
     return _skipped_recurring_checks(recurring_check_units, "model omitted recurring_checks")
 
@@ -717,7 +850,7 @@ def _normalize_recurring_checks(raw: Any, recurring_check_units: list[str]) -> l
       checks.append(check)
   if not checks:
     return _skipped_recurring_checks(recurring_check_units, "model returned no valid checks")
-  return _complete_recurring_checks(checks, recurring_check_units)
+  return _assign_recurring_check_subjects(checks, recurring_check_units)
 
 
 def _normalize_recurring_check(raw: Any) -> dict[str, Any] | None:
@@ -735,6 +868,8 @@ def _normalize_recurring_check(raw: Any) -> dict[str, Any] | None:
 
   return {
     "id": check_id,
+    # The subject as the model named it; replaced by the matched subject label.
+    "subject": raw.get("subject", raw.get("unit")),
     "pass": pass_value,
     "evidence": evidence,
   }
@@ -759,17 +894,69 @@ def _coerce_check_pass(value: Any) -> bool | None:
   return None
 
 
-def _complete_recurring_checks(
+def _assign_recurring_check_subjects(
   checks: list[dict[str, Any]],
   recurring_check_units: list[str],
 ) -> list[dict[str, Any]]:
-  expected_count = len(recurring_check_units)
-  counts = Counter(check["id"] for check in checks)
-  completed = list(checks)
-  for check_id in RECURRING_CHECK_IDS:
-    for unit in recurring_check_units[counts[check_id] : expected_count]:
-      completed.append(_skipped_recurring_check(check_id, unit, "model omitted check"))
-  return completed
+  """Place each check on the subject it names; unnamed checks fill free subjects in order.
+
+  A check whose subject matches no listed subject counts as unnamed. Checks
+  beyond the listed subjects become extra subjects ("subject 3", ...). Every
+  (subject, check id) the model skipped gets a skipped entry.
+  """
+  placed: dict[tuple[str, int], dict[str, Any]] = {}
+  unnamed: list[dict[str, Any]] = []
+  for check in checks:
+    index = _subject_index(check["subject"], recurring_check_units)
+    if index is None:
+      unnamed.append(check)
+      continue
+    slot = (check["id"], index)
+    # A subject named twice keeps the first entry unless a later one fails it.
+    if slot not in placed or check["pass"] is False:
+      placed[slot] = check
+  for check in unnamed:
+    index = 0
+    while (check["id"], index) in placed:
+      index += 1
+    placed[(check["id"], index)] = check
+
+  subject_count = max([len(recurring_check_units), *(index + 1 for _id, index in placed)])
+  labels = [
+    *recurring_check_units,
+    *(f"subject {n}" for n in range(len(recurring_check_units) + 1, subject_count + 1)),
+  ]
+  return [
+    {**placed[(check_id, index)], "subject": label}
+    if (check_id, index) in placed
+    else _skipped_recurring_check(check_id, label, "model omitted check")
+    for index, label in enumerate(labels)
+    for check_id in RECURRING_CHECK_IDS
+  ]
+
+
+def _subject_index(name: Any, recurring_check_units: list[str]) -> int | None:
+  """Index of the listed subject ``name`` refers to, or None when it names none or several.
+
+  Matching ignores case and whitespace; failing an exact match, a subject that
+  appears in ``name`` as a whole word or phrase counts when it is the only one.
+  """
+  if not isinstance(name, str) or not name.strip():
+    return None
+  wanted = _subject_key(name)
+  keys = [_subject_key(unit) for unit in recurring_check_units]
+  if wanted in keys:
+    return keys.index(wanted)
+  matches = [
+    index
+    for index, key in enumerate(keys)
+    if re.search(rf"(?<!\w){re.escape(key)}(?!\w)", wanted)
+  ]
+  return matches[0] if len(matches) == 1 else None
+
+
+def _subject_key(value: str) -> str:
+  return " ".join(value.lower().split())
 
 
 def _skipped_recurring_checks(
@@ -786,6 +973,7 @@ def _skipped_recurring_checks(
 def _skipped_recurring_check(check_id: str, unit: str, reason: str) -> dict[str, Any]:
   return {
     "id": check_id,
+    "subject": unit,
     "pass": None,
     "evidence": _clip(f"skipped: {reason} for {unit}"),
   }
@@ -917,35 +1105,27 @@ def _normalize_judges(judges: list[str | dict[str, Any]] | None) -> list[dict[st
   source = judges if judges is not None else [j for j in JUDGE_REGISTRY if j.get("enabled", True)]
   normalized = []
   registry_by_id = {j["id"]: j for j in JUDGE_REGISTRY}
-  for item in source:
-    if isinstance(item, str):
-      registry_item = registry_by_id.get(item)
-      if registry_item and judges is None:
-        normalized.append(dict(registry_item))
-      else:
-        normalized.append(
-          {
-            "id": item,
-            "model": registry_item.get("model", item) if registry_item else item,
-            "enabled": True,
-          }
-        )
-      continue
-
-    model = item.get("model") or item.get("id")
-    judge_id = item.get("id") or model
+  for raw in source:
+    item: dict[str, Any] = {"id": raw} if isinstance(raw, str) else raw
+    # A registry id, as a plain string or a partial dict, keeps the registry's
+    # model and transport; fields the caller sets override them. Without this,
+    # "codex/gpt-5.6-terra" went to OpenRouter as a bare model id.
+    merged = {**registry_by_id.get(item.get("id") or "", {}), **item}
+    model = merged.get("model") or merged.get("id")
+    judge_id = merged.get("id") or model
     if not model or not judge_id:
-      raise ValueError(f"invalid judge registry item: {item!r}")
+      raise ValueError(f"invalid judge registry item: {raw!r}")
     normalized_item = {
       "id": str(judge_id),
       "model": str(model),
+      # Listing a judge enables it, even one the registry disables by default.
       "enabled": bool(item.get("enabled", True)),
     }
     # Transport selectors must survive normalization or dispatch falls back
     # to the default OpenRouter path.
     for transport_key in ("cli", "effort", "api"):
-      if transport_key in item:
-        normalized_item[transport_key] = item[transport_key]
+      if transport_key in merged:
+        normalized_item[transport_key] = merged[transport_key]
     normalized.append(normalized_item)
   return normalized
 
@@ -961,8 +1141,14 @@ def _normalize_recurring_check_units(
   return units or [f"OURS {index}" for index in range(1, len(images) + 1)]
 
 
-def _budget_allows(fn: Callable[..., Any], judge: dict[str, Any]) -> bool:
-  context = {"judge": judge["id"], "model": judge["model"]}
+def _budget_allows(
+  fn: Callable[..., Any] | None,
+  judge: dict[str, Any],
+  transport: str,
+) -> bool:
+  if fn is None:
+    return True
+  context = {"judge": judge["id"], "model": judge["model"], "transport": transport}
   try:
     signature = inspect.signature(fn)
   except (TypeError, ValueError):
@@ -1032,17 +1218,11 @@ def _aggregate_recurring_checks(
   recurring_check_units: list[str],
 ) -> list[dict[str, Any]]:
   checks_by_slot: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
-  max_slot_by_id: Counter[str] = Counter()
   for result in results:
-    counts: Counter[str] = Counter()
-    for check in result["recurring_checks"]:
-      check_id = check["id"]
-      slot = counts[check_id]
-      counts[check_id] += 1
-      max_slot_by_id[check_id] = max(max_slot_by_id[check_id], slot + 1)
-      checks_by_slot[(check_id, slot)].append(check)
+    for slot_key, check in _slot_recurring_checks(result["recurring_checks"]).items():
+      checks_by_slot[slot_key].append(check)
 
-  slot_count = max([len(recurring_check_units), *max_slot_by_id.values()] or [1])
+  slot_count = max([len(recurring_check_units), *(slot + 1 for _id, slot in checks_by_slot)])
   aggregated = []
   for slot in range(slot_count):
     unit = (
@@ -1057,6 +1237,39 @@ def _aggregate_recurring_checks(
   return aggregated
 
 
+def _slot_recurring_checks(
+  checks: list[dict[str, Any]],
+) -> dict[tuple[str, int], dict[str, Any]]:
+  """Key one judge's checks by (check id, subject index).
+
+  Parsing leaves one entry per check id for each subject, in subject order, so
+  the n-th entry for an id belongs to subject n.
+  """
+  slots: dict[tuple[str, int], dict[str, Any]] = {}
+  counts: Counter[str] = Counter()
+  for check in checks:
+    slot = counts[check["id"]]
+    counts[check["id"]] += 1
+    slots[(check["id"], slot)] = check
+  return slots
+
+
+def _failed_recurring_checks(results: list[dict[str, Any]]) -> list[str]:
+  """Check ids that a majority of participants failed for the same subject.
+
+  The threshold is ``ceil(n / 2)`` participants, as for defect consensus. A judge
+  that omitted or skipped a check casts no failure vote but still counts in n.
+  """
+  threshold = math.ceil(len(results) / 2)
+  fail_votes: Counter[tuple[str, int]] = Counter()
+  for result in results:
+    for slot_key, check in _slot_recurring_checks(result["recurring_checks"]).items():
+      if check["pass"] is False:
+        fail_votes[slot_key] += 1
+  failed = {check_id for (check_id, _slot), votes in fail_votes.items() if votes >= threshold}
+  return [check_id for check_id in RECURRING_CHECK_IDS if check_id in failed]
+
+
 def _aggregate_recurring_check_slot(
   check_id: str,
   unit: str,
@@ -1064,12 +1277,12 @@ def _aggregate_recurring_check_slot(
 ) -> dict[str, Any]:
   for check in checks:
     if check["pass"] is False:
-      return {"id": check_id, "pass": False, "evidence": check["evidence"]}
+      return {"id": check_id, "subject": unit, "pass": False, "evidence": check["evidence"]}
   for check in checks:
     if check["pass"] is True:
-      return {"id": check_id, "pass": True, "evidence": check["evidence"]}
+      return {"id": check_id, "subject": unit, "pass": True, "evidence": check["evidence"]}
   if checks:
-    return {"id": check_id, "pass": None, "evidence": checks[0]["evidence"]}
+    return {"id": check_id, "subject": unit, "pass": None, "evidence": checks[0]["evidence"]}
   return _skipped_recurring_check(check_id, unit, "model omitted check")
 
 
@@ -1102,6 +1315,7 @@ def _public_defect(defect: dict[str, str], *, include_key: bool = False) -> dict
 def _public_recurring_check(check: dict[str, Any]) -> dict[str, Any]:
   return {
     "id": check["id"],
+    "subject": check["subject"],
     "pass": check["pass"],
     "evidence": check["evidence"],
   }
@@ -1120,23 +1334,6 @@ def _anthropic_api_key() -> str | None:
 
 
 def _api_key(name: str) -> str | None:
-  key = os.getenv(name)
-  if key:
-    return key
-  return _env_file_key(_ENV_FALLBACK_PATH, name)
-
-
-def _env_file_key(path: Path, target_name: str = "OPENROUTER_API_KEY") -> str | None:
-  try:
-    lines = path.read_text().splitlines()
-  except OSError:
-    return None
-  for line in lines:
-    stripped = line.strip()
-    if not stripped or stripped.startswith("#") or "=" not in stripped:
-      continue
-    name, value = stripped.split("=", 1)
-    name = name.removeprefix("export ").strip()
-    if name == target_name:
-      return value.strip().strip("\"'") or None
-  return None
+  # The package .env is the same file llm.py loads; a hardcoded Mac path broke
+  # on Ubuntu, and an explicitly blank variable now disables the judge.
+  return _env.provider_key(name)

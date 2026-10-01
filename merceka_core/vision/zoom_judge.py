@@ -9,7 +9,9 @@ and returns them magnified to fill the budget.
 
 Talks to the Anthropic Messages API directly with httpx (no SDK dependency),
 matching how the rest of the panel talks to OpenRouter. Key-gated on
-ANTHROPIC_API_KEY by the caller in critique.py.
+ANTHROPIC_API_KEY by the caller in critique.py. Every billed round is written
+to the cost ledger with the API's token usage; usd stays null because the
+rate table has no entry for these models.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from typing import Any
 import httpx
 from PIL import Image
 
+from merceka_core import costs as _costs
 from merceka_core.vision.zoom import (
   MAX_EDGE_HIGHRES,
   MAX_TOKENS_HIGHRES,
@@ -33,6 +36,15 @@ ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 _ANTHROPIC_VERSION = "2023-06-01"
 _MAX_ROUNDS = 8
 _MAX_OUTPUT_TOKENS = 4096
+# Stop reasons that end a turn with a complete answer. max_tokens and refusal
+# (and any reason added later) leave a truncated or absent verdict.
+_FINAL_STOP_REASONS = frozenset({"end_turn", "stop_sequence"})
+# Modes Pillow can write as PNG; anything else (CMYK, YCbCr, LAB, ...) is converted.
+_PNG_MODES = frozenset({"1", "L", "LA", "I", "I;16", "P", "RGB", "RGBA"})
+# Crop backdrop for transparent pixels: mid greys contrast with light and dark edges.
+_CHECKER_CELL = 32
+_CHECKER_LIGHT = (160, 160, 160, 255)
+_CHECKER_DARK = (96, 96, 96, 255)
 
 _ZOOM_TOOL = {
   "name": "zoom",
@@ -41,8 +53,10 @@ _ZOOM_TOOL = {
     "whenever text, edges, glyphs, or details are too small to judge "
     "confidently in the full view. The region is cropped from the image's "
     "full-resolution original and scaled up to fill the image budget. "
-    "Coordinates are absolute pixels in the image as you see it, origin at "
-    "the top-left corner. Zoom again on the result for even finer detail."
+    "Coordinates are always absolute pixels in the numbered image's full view, "
+    "at the dimensions stated next to it, origin at the top-left corner; they "
+    "never refer to a magnified result. For finer detail, zoom again with a "
+    "smaller box in those full-view coordinates."
   ),
   "input_schema": {
     "type": "object",
@@ -74,23 +88,16 @@ def call_zoom_judge(
   """Run the zoom-tool judging loop; returns raw response text or a skip reason.
 
   Returns {"ok": True, "text": <final text>} on success — the caller parses it
-  with the panel's shared tolerant parser — or {"ok": False, "reason": ...}.
+  with the panel's JSON verdict parser — or {"ok": False, "reason": ...}. Only a
+  turn that ends with ``end_turn`` or ``stop_sequence`` succeeds; ``max_tokens``,
+  ``refusal`` and other stop reasons return their name as the reason. Unreadable
+  images and malformed API responses also return a reason instead of raising,
+  so the panel keeps the judges that already finished.
   """
-  originals: list[Image.Image] = []
-  views: list[Image.Image] = []
-  for image in images if reference is None else [reference, *images]:
-    original = _load_image(image)
-    originals.append(original)
-    views.append(prepare_image(original, MAX_EDGE_HIGHRES, MAX_TOKENS_HIGHRES))
-
-  content: list[dict[str, Any]] = [{"type": "text", "text": _prompt_with_zoom_note(prompt, views)}]
-  for index, view in enumerate(views):
-    if reference is not None and index == 0:
-      label = f"Image {index}: REFERENCE"
-    else:
-      label = f"Image {index}: OURS"
-    content.append({"type": "text", "text": f"{label} ({view.width}x{view.height} px)"})
-    content.append(_image_block(view, "image/png"))
+  try:
+    originals, views, content = _first_turn(images, reference, prompt)
+  except (OSError, ValueError, Image.DecompressionBombError):
+    return {"ok": False, "reason": "image-error"}
 
   messages: list[dict[str, Any]] = [{"role": "user", "content": content}]
   owns_client = client is None
@@ -119,22 +126,32 @@ def call_zoom_judge(
       if response.status_code != 200:
         return {"ok": False, "reason": f"anthropic-{response.status_code}"}
 
-      body = response.json()
-      blocks = body.get("content", [])
+      try:
+        body = response.json()
+      except ValueError:
+        return {"ok": False, "reason": "malformed-response"}
+      _record_anthropic_cost(judge["model"], body)
+      blocks = _content_blocks(body)
+      if blocks is None:
+        return {"ok": False, "reason": "malformed-response"}
       messages.append({"role": "assistant", "content": blocks})
       stop_reason = body.get("stop_reason")
 
       if stop_reason == "tool_use":
-        results = [
-          _tool_result(block, originals, views)
-          for block in blocks
-          if block.get("type") == "tool_use"
-        ]
+        tool_uses = [block for block in blocks if block.get("type") == "tool_use"]
+        if not tool_uses:
+          return {"ok": False, "reason": "malformed-response"}
+        results = [_tool_result(block, originals, views) for block in tool_uses]
         messages.append({"role": "user", "content": results})
         continue
       if stop_reason == "pause_turn":
         # Server paused a long turn; replaying the transcript resumes it.
         continue
+      if stop_reason not in _FINAL_STOP_REASONS:
+        # A truncated or refused turn has no trustworthy verdict.
+        if not isinstance(stop_reason, str) or not stop_reason:
+          return {"ok": False, "reason": "malformed-response"}
+        return {"ok": False, "reason": stop_reason.replace("_", "-")}
 
       text = "\n".join(
         str(block.get("text", "")) for block in blocks if block.get("type") == "text"
@@ -146,6 +163,55 @@ def call_zoom_judge(
   finally:
     if owns_client:
       http_client.close()
+
+
+def _first_turn(
+  images: list[str | Path | bytes | bytearray | memoryview],
+  reference: str | Path | None,
+  prompt: str,
+) -> tuple[list[Image.Image], list[Image.Image], list[dict[str, Any]]]:
+  originals: list[Image.Image] = []
+  views: list[Image.Image] = []
+  for image in images if reference is None else [reference, *images]:
+    original = _load_image(image)
+    originals.append(original)
+    views.append(prepare_image(original, MAX_EDGE_HIGHRES, MAX_TOKENS_HIGHRES))
+
+  content: list[dict[str, Any]] = [{"type": "text", "text": _prompt_with_zoom_note(prompt, views)}]
+  for index, view in enumerate(views):
+    if reference is not None and index == 0:
+      label = f"Image {index}: REFERENCE"
+    else:
+      label = f"Image {index}: OURS"
+    content.append({"type": "text", "text": f"{label} ({view.width}x{view.height} px)"})
+    content.append(_image_block(view, "image/png"))
+  return originals, views, content
+
+
+def _record_anthropic_cost(model: str, body: Any) -> None:
+  """Meter one billed Messages API round. There is no rate entry, so usd stays null."""
+  if not isinstance(body, dict):
+    return
+  usage = body.get("usage")
+  _costs.record(
+    source="anthropic",
+    model=model,
+    usage=usage if isinstance(usage, dict) else {},
+    request_id=body.get("id"),
+  )
+
+
+def _content_blocks(body: Any) -> list[dict[str, Any]] | None:
+  """The message's content blocks, or None when the body is not a well-formed message."""
+  blocks = body.get("content") if isinstance(body, dict) else None
+  if not isinstance(blocks, list):
+    return None
+  for block in blocks:
+    if not isinstance(block, dict):
+      return None
+    if block.get("type") == "tool_use" and not isinstance(block.get("input"), dict):
+      return None
+  return blocks
 
 
 def _prompt_with_zoom_note(prompt: str, views: list[Image.Image]) -> str:
@@ -163,15 +229,14 @@ def _tool_result(
   originals: list[Image.Image],
   views: list[Image.Image],
 ) -> dict[str, Any]:
-  tool_input = block.get("input", {}) or {}
-  index = int(tool_input.get("image_index", 0) or 0)
+  tool_input = block["input"]
   result: dict[str, Any] = {"type": "tool_result", "tool_use_id": block.get("id")}
-  if not 0 <= index < len(originals):
-    result["content"] = [{"type": "text", "text": f"Error: image_index {index} is out of range"}]
-    result["is_error"] = True
-    return result
   try:
-    box = tuple(int(tool_input[key]) for key in ("x1", "y1", "x2", "y2"))
+    index = int(tool_input.get("image_index", 0) or 0)
+    if not 0 <= index < len(originals):
+      raise ValueError(f"image_index {index} is out of range")
+    x1, y1, x2, y2 = (int(tool_input[key]) for key in ("x1", "y1", "x2", "y2"))
+    box = (x1, y1, x2, y2)
     crop = zoom_crop(
       originals[index],
       (views[index].width, views[index].height),
@@ -179,19 +244,52 @@ def _tool_result(
       MAX_EDGE_HIGHRES,
       MAX_TOKENS_HIGHRES,
     )
-  except (KeyError, TypeError, ValueError) as exc:
+  except (KeyError, TypeError, ValueError, OverflowError) as exc:
     result["content"] = [{"type": "text", "text": f"Error: {exc}"}]
     result["is_error"] = True
     return result
+  flat, transparent = _flatten_transparency(crop)
+  label = f"Magnified view of image {index}, region {list(box)} in full-view coordinates:"
+  if transparent:
+    label += " transparent pixels are drawn over a grey checkerboard."
   # JPEG keeps accumulated tool results well under the API request size limit.
   result["content"] = [
-    {"type": "text", "text": f"Magnified view of image {index}, region {list(box)}:"},
-    _image_block(crop.convert("RGB"), "image/jpeg"),
+    {"type": "text", "text": label},
+    _image_block(flat, "image/jpeg"),
   ]
   return result
 
 
+def _flatten_transparency(crop: Image.Image) -> tuple[Image.Image, bool]:
+  """An RGB copy for JPEG, with transparent pixels drawn over a grey checkerboard.
+
+  ``convert("RGB")`` alone paints transparent pixels black, which looks exactly
+  like the opaque box the banner-transparency check looks for.
+  """
+  rgba = crop.convert("RGBA")
+  if rgba.getchannel("A").getextrema()[0] == 255:
+    return crop.convert("RGB"), False
+  board = _checkerboard(rgba.size)
+  board.alpha_composite(rgba)
+  return board.convert("RGB"), True
+
+
+def _checkerboard(size: tuple[int, int]) -> Image.Image:
+  width, height = size
+  cols = -(-width // _CHECKER_CELL)
+  rows = -(-height // _CHECKER_CELL)
+  cells = Image.new("RGBA", (cols, rows))
+  cells.putdata(
+    [_CHECKER_DARK if (x + y) % 2 else _CHECKER_LIGHT for y in range(rows) for x in range(cols)]
+  )
+  board = cells.resize((cols * _CHECKER_CELL, rows * _CHECKER_CELL), Image.Resampling.NEAREST)
+  return board.crop((0, 0, width, height))
+
+
 def _image_block(image: Image.Image, mime_type: str) -> dict[str, Any]:
+  if mime_type == "image/png" and image.mode not in _PNG_MODES:
+    # CMYK, YCbCr, LAB and friends cannot be written as PNG.
+    image = image.convert("RGBA" if {"A", "a"} & set(image.getbands()) else "RGB")
   buffer = BytesIO()
   image.save(buffer, format="JPEG" if mime_type == "image/jpeg" else "PNG")
   return {

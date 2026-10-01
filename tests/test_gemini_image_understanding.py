@@ -4,7 +4,7 @@ import pytest
 from pydantic import Field
 
 from merceka_core import llm_gemini
-from merceka_core.errors import VideoBackendError
+from merceka_core.errors import VideoBackendError, VideoUploadError
 from merceka_core.llm import LLM, OutputSchema
 from merceka_core.retry import _RETRY_MAX_ATTEMPTS
 
@@ -116,13 +116,25 @@ class TestGeminiImageCall:
     assert len(models.calls) == 2
     assert len(sleeps) == 1
 
-  def test_non_retryable_raises_video_backend_error(self, monkeypatch, png):
-    exc = RuntimeError("400 bad request")
-    exc.status_code = 400
+  @pytest.mark.parametrize("status", [400, 401, 403, 404])
+  def test_client_errors_raise_terminal_upload_error(self, monkeypatch, png, status):
+    """A bad request, key, permission or model name is not retried and is not
+    the transient VideoBackendError consumers retry on."""
+    exc = RuntimeError(f"{status} client error")
+    exc.status_code = status
     models = install_client(monkeypatch, [exc])
-    with pytest.raises(VideoBackendError, match="Gemini image"):
+    with pytest.raises(VideoUploadError, match="Gemini image"):
       LLM("gemini/gemini-flash-latest").generate_with_resource("hi", png)
     assert len(models.calls) == 1  # no retry on 4xx
+
+  def test_bad_argument_type_error_is_terminal(self, monkeypatch, png):
+    """Review item 10: an unknown generate_content kwarg (TypeError) was the
+    transient VideoBackendError; retrying the same call cannot succeed."""
+    models = install_client(
+      monkeypatch, [TypeError("generate_content() got an unexpected keyword argument 'sed'")])
+    with pytest.raises(VideoUploadError, match="unexpected keyword argument"):
+      LLM("gemini/gemini-flash-latest").generate_with_resource("hi", png, sed=1)
+    assert len(models.calls) == 1
 
   def test_retries_exhausted(self, monkeypatch, png):
     monkeypatch.setattr(llm_gemini.time, "sleep", lambda _delay: None)

@@ -5,10 +5,25 @@ from merceka_core import _cli
 
 class TestClaudeCommand:
   def test_plain_text_call_grants_no_tools(self):
-    # LLM's no-tools text path: no --allowedTools, no --add-dir
+    # LLM's no-tools text path: an empty --tools list disables every built-in
+    # tool; before this, a bare `claude -p` had the full default tool set.
     cmd = _cli.claude_command("sonnet", system_prompt="Be helpful")
     assert cmd == ["claude", "-p", "--model", "sonnet",
+                   "--permission-mode", "dontAsk", "--setting-sources", "user",
+                   "--strict-mcp-config", "--disallowedTools", "mcp__*", "--tools", "",
                    "--append-system-prompt", "Be helpful"]
+
+  def test_scoped_rules_restrict_by_name_and_keep_scope(self):
+    cmd = _cli.claude_command(
+      "sonnet", allowed_tools=("Read", "Bash(git log *)", "WebSearch"))
+    assert cmd[cmd.index("--tools") + 1] == "Read,Bash,WebSearch"
+    # Read stays fenced to the working directories; the rest are pre-approved as given.
+    assert cmd[cmd.index("--allowedTools") + 1] == "Bash(git log *),WebSearch"
+
+  def test_write_profile_keeps_accept_edits_semantics(self):
+    cmd = _cli.claude_command("opus", allowed_tools=("Read", "Edit"), accept_edits=True)
+    assert "--tools" not in cmd and "dontAsk" not in cmd
+    assert cmd[cmd.index("--allowedTools") + 1] == "Read,Edit"
 
   def test_agent_write_profile_shape(self):
     cmd = _cli.claude_command(
@@ -22,6 +37,22 @@ class TestClaudeCommand:
 
   def test_env_blanks_api_key(self):
     assert _cli.claude_env()["ANTHROPIC_API_KEY"] == ""
+
+  def test_env_withholds_credentials_but_keeps_oauth(self, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-test")
+    monkeypatch.setenv("GNOME_KEYRING_CONTROL", "/run/user/1000/keyring")
+    env = _cli.claude_env()
+    assert "OPENROUTER_API_KEY" not in env
+    assert "GITHUB_TOKEN" not in env
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-test"
+    assert env["GNOME_KEYRING_CONTROL"] == "/run/user/1000/keyring"
+    assert env["PATH"]
+
+  def test_codex_env_withholds_api_keys(self, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    assert "OPENAI_API_KEY" not in _cli.codex_env()
 
 
 class TestCodexExecCommand:

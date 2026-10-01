@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import signal
+import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -18,6 +21,22 @@ from merceka_core.agent import (
 from merceka_core.agents.claude_code import ClaudeCodeAgentProvider
 
 
+RUN = "merceka_core.agents._process.run"
+
+
+@pytest.fixture(autouse=True)
+def signals(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
+  """No test here may start the real CLI or signal a real process group."""
+
+  def refuse(*args, **_kwargs):
+    raise AssertionError(f"unit test tried to launch a real CLI: {args[:1]}")
+
+  sent: list[tuple[int, int]] = []
+  monkeypatch.setattr(subprocess, "Popen", refuse)
+  monkeypatch.setattr(os, "killpg", lambda pgid, sig: sent.append((pgid, sig)))
+  return sent
+
+
 def _request(root: Path) -> AgentRequest:
   return AgentRequest(
     message="What is in the book?",
@@ -30,7 +49,7 @@ def _request(root: Path) -> AgentRequest:
 async def test_claude_agent_run_builds_read_only_command(tmp_path: Path):
   provider = ClaudeCodeAgentProvider(model="sonnet")
 
-  with patch("subprocess.run") as mock_run:
+  with patch(RUN, new_callable=AsyncMock) as mock_run:
     mock_run.return_value = MagicMock(returncode=0, stdout="Answer\n", stderr="")
     result = await provider.run(_request(tmp_path))
 
@@ -40,12 +59,21 @@ async def test_claude_agent_run_builds_read_only_command(tmp_path: Path):
     "-p",
     "--model",
     "sonnet",
+    *[
+    "--permission-mode",
+    "dontAsk",
+    "--setting-sources",
+    "user",
+    "--strict-mcp-config",
+    "--disallowedTools",
+    "mcp__*",
+    "--tools",
+    "Read,Grep,Glob",
+  ],
     "--append-system-prompt",
     "Read before answering.",
     "--add-dir",
     str(tmp_path),
-    "--allowedTools",
-    "Read,Grep,Glob",
   ]
   assert mock_run.call_args.kwargs["input"] == "What is in the book?"
   assert mock_run.call_args.kwargs["cwd"] == str(tmp_path)
@@ -64,7 +92,7 @@ async def test_claude_agent_run_builds_write_command(tmp_path: Path):
     profile=AgentProfile.WRITE,
   )
 
-  with patch("subprocess.run") as mock_run:
+  with patch(RUN, new_callable=AsyncMock) as mock_run:
     mock_run.return_value = MagicMock(returncode=0, stdout="Done\n", stderr="")
     await provider.run(request)
 
@@ -86,28 +114,30 @@ async def test_claude_agent_run_builds_write_command(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_claude_read_only_command_is_unchanged(tmp_path: Path):
-  """Regression guard: READ_ONLY must assemble the exact historical command line."""
+async def test_claude_read_only_command_is_locked_down(tmp_path: Path):
+  """READ_ONLY must restrict the tool set, not just pre-approve Read/Grep/Glob.
+
+  The historical command passed only ``--allowedTools Read,Grep,Glob``. That
+  pre-approves those tools but leaves Bash, Edit and Write available under the
+  user's ``defaultMode`` (``auto`` on both machines).
+  """
   provider = ClaudeCodeAgentProvider(model="sonnet")
 
-  with patch("subprocess.run") as mock_run:
+  with patch(RUN, new_callable=AsyncMock) as mock_run:
     mock_run.return_value = MagicMock(returncode=0, stdout="Answer\n", stderr="")
     await provider.run(_request(tmp_path))
 
   cmd = mock_run.call_args.args[0]
-  assert "--permission-mode" not in cmd
-  assert cmd == [
-    "claude",
-    "-p",
-    "--model",
-    "sonnet",
-    "--append-system-prompt",
-    "Read before answering.",
-    "--add-dir",
-    str(tmp_path),
-    "--allowedTools",
-    "Read,Grep,Glob",
-  ]
+  assert cmd[cmd.index("--tools") + 1] == "Read,Grep,Glob"
+  assert cmd[cmd.index("--permission-mode") + 1] == "dontAsk"
+  assert cmd[cmd.index("--setting-sources") + 1] == "user"
+  assert cmd[cmd.index("--disallowedTools") + 1] == "mcp__*"
+  assert "--strict-mcp-config" in cmd
+  # Read/Grep/Glob are not pre-approved: under dontAsk they stay confined to the
+  # working directories instead of reaching ~/.ssh or a .env elsewhere.
+  assert "--allowedTools" not in cmd
+  for tool in ("Bash", "Edit", "Write"):
+    assert tool not in cmd[cmd.index("--tools") + 1].split(",")
 
 
 @pytest.mark.asyncio
@@ -118,7 +148,7 @@ async def test_claude_agent_run_passes_multiple_roots(tmp_path: Path):
   second_root.mkdir()
   provider = ClaudeCodeAgentProvider(model="sonnet")
 
-  with patch("subprocess.run") as mock_run:
+  with patch(RUN, new_callable=AsyncMock) as mock_run:
     mock_run.return_value = MagicMock(returncode=0, stdout="Answer", stderr="")
     await provider.run(AgentRequest(message="Q", system_prompt="P", roots=(first_root, second_root)))
 
@@ -133,27 +163,31 @@ async def test_claude_agent_run_passes_multiple_roots(tmp_path: Path):
 async def test_claude_agent_run_raises_on_nonzero_exit(tmp_path: Path):
   provider = ClaudeCodeAgentProvider(model="sonnet")
 
-  with patch("subprocess.run") as mock_run:
+  with patch(RUN, new_callable=AsyncMock) as mock_run:
     mock_run.return_value = MagicMock(returncode=2, stdout="partial", stderr="boom")
     with pytest.raises(ProviderFailure, match="Claude Code failed"):
       await provider.run(_request(tmp_path))
 
 
 class FakePopen:
+  pid = 424242
+
   def __init__(self, lines: list[str], returncode: int = 0, stderr: str = ""):
     self.stdin = io.StringIO()
     self.stdout = io.StringIO("".join(lines))
     self.stderr = io.StringIO(stderr)
-    self.returncode = returncode
-    self.terminated = False
+    self.returncode: int | None = None
+    self._exit_code = returncode
     self.wait_called = False
 
-  def wait(self) -> int:
-    self.wait_called = True
+  def poll(self) -> int | None:
     return self.returncode
 
-  def terminate(self) -> None:
-    self.terminated = True
+  def wait(self, timeout: float | None = None) -> int:
+    del timeout  # accepted like Popen.wait; the fake exits at once
+    self.wait_called = True
+    self.returncode = self._exit_code
+    return self.returncode
 
 
 def _stream_line(obj: dict) -> str:
@@ -203,6 +237,101 @@ async def test_claude_agent_stream_nonzero_exit_raises_failure(tmp_path: Path):
       [event async for event in provider.stream(_request(tmp_path))]
 
 
+async def _stream_until_failure(provider: ClaudeCodeAgentProvider, request: AgentRequest):
+  """The events a stream yields before it raises."""
+  events = []
+  with pytest.raises(ProviderFailure) as failure:
+    async for event in provider.stream(request):
+      events.append(event)
+  events.append(failure.value)
+  return events
+
+
+def _text_delta_line(text: str) -> str:
+  return _stream_line({
+    "type": "stream_event",
+    "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": text}},
+  })
+
+
+# stream-json result shapes, from the Agent SDK's SDKResultMessage / ResultMessage.
+@pytest.mark.asyncio
+async def test_claude_agent_stream_error_subtype_result_raises_failure(tmp_path: Path):
+  process = FakePopen([
+    _text_delta_line("Let me check "),
+    _stream_line({
+      "type": "result",
+      "subtype": "error_max_turns",
+      "is_error": True,
+      "num_turns": 3,
+      "stop_reason": "tool_use",
+      "errors": ["Reached maximum number of turns (3)"],
+    }),
+  ])
+  provider = ClaudeCodeAgentProvider(model="sonnet")
+
+  with patch("subprocess.Popen", return_value=process):
+    events = await _stream_until_failure(provider, _request(tmp_path))
+
+  assert "error_max_turns" in str(events[-1])
+  assert "Reached maximum number of turns (3)" in str(events[-1])
+  assert not any(isinstance(event, AgentComplete) for event in events)
+  assert process.wait_called
+
+
+@pytest.mark.asyncio
+async def test_claude_agent_stream_failed_request_result_raises_failure(tmp_path: Path):
+  # subtype "success" with is_error: the loop finished but its last API call failed.
+  process = FakePopen([
+    _stream_line({
+      "type": "result",
+      "subtype": "success",
+      "is_error": True,
+      "api_error_status": 529,
+      "result": "API Error: 529 Overloaded",
+    }),
+  ])
+  provider = ClaudeCodeAgentProvider(model="sonnet")
+
+  with patch("subprocess.Popen", return_value=process):
+    with pytest.raises(ProviderFailure, match="529 Overloaded"):
+      [event async for event in provider.stream(_request(tmp_path))]
+
+
+@pytest.mark.asyncio
+async def test_claude_agent_stream_failure_prefers_result_text_to_exit_code(tmp_path: Path):
+  # Failures inside the run are printed as the result on stdout, with an
+  # empty stderr, so "exit 1" alone says nothing.
+  process = FakePopen([
+    _stream_line({
+      "type": "result",
+      "subtype": "success",
+      "is_error": True,
+      "result": "Invalid API key · Please run /login",
+    }),
+  ], returncode=1)
+  provider = ClaudeCodeAgentProvider(model="sonnet")
+
+  with patch("subprocess.Popen", return_value=process):
+    with pytest.raises(ProviderFailure, match="Invalid API key"):
+      [event async for event in provider.stream(_request(tmp_path))]
+
+
+@pytest.mark.asyncio
+async def test_claude_agent_stream_successful_result_completes(tmp_path: Path):
+  process = FakePopen([
+    _text_delta_line("Page 3."),
+    _stream_line({"type": "result", "subtype": "success", "is_error": False, "result": "Page 3."}),
+  ])
+  provider = ClaudeCodeAgentProvider(model="sonnet")
+
+  with patch("subprocess.Popen", return_value=process):
+    events = [event async for event in provider.stream(_request(tmp_path))]
+
+  assert isinstance(events[-1], AgentComplete)
+  assert events[-1].result.text == "Page 3."
+
+
 @pytest.mark.asyncio
 async def test_claude_agent_stream_malformed_json_becomes_raw_event(tmp_path: Path):
   process = FakePopen(["not json\n", _stream_line({"type": "result"})])
@@ -217,7 +346,7 @@ async def test_claude_agent_stream_malformed_json_becomes_raw_event(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_claude_agent_stream_closes_process_when_generator_closes(tmp_path: Path):
+async def test_claude_agent_stream_closes_process_when_generator_closes(tmp_path: Path, signals):
   process = FakePopen([
     _stream_line({
       "type": "stream_event",
@@ -236,4 +365,27 @@ async def test_claude_agent_stream_closes_process_when_generator_closes(tmp_path
     assert isinstance(event, AgentRawProviderEvent)
     await stream.aclose()
 
-  assert process.terminated is True
+  assert (process.pid, signal.SIGTERM) in signals
+  assert process.stdout.closed and process.stderr.closed
+
+
+class BrokenStdin(io.StringIO):
+  def write(self, text: str) -> int:
+    raise BrokenPipeError(32, "Broken pipe")
+
+
+@pytest.mark.asyncio
+async def test_claude_agent_stream_prompt_write_failure_still_tears_down(tmp_path: Path, signals):
+  # Card 03 A: the child died before reading the prompt. The write used to
+  # happen before the cleanup try block, so BrokenPipeError escaped and the
+  # child and its pipes were left behind.
+  process = FakePopen([], returncode=1, stderr="auth expired")
+  process.stdin = BrokenStdin()
+  provider = ClaudeCodeAgentProvider(model="sonnet")
+
+  with patch("subprocess.Popen", return_value=process):
+    with pytest.raises(ProviderFailure, match="auth expired"):
+      [event async for event in provider.stream(_request(tmp_path))]
+
+  assert process.wait_called
+  assert process.stdin.closed and process.stdout.closed and process.stderr.closed

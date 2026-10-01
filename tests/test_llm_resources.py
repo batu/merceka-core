@@ -51,14 +51,22 @@ class TestCreateMessageWithResource:
     assert url.startswith("data:image/png;base64,")
 
   def test_detects_pdf_mime_type(self, tmp_path: Path):
-    """Should detect PDF MIME type from extension."""
+    """PDFs go as an OpenRouter file part, not as an image_url.
+
+    Regression: a PDF was sent as image_url. OpenRouter documents PDF input
+    as {"type": "file", "file": {"filename", "file_data": <data URL>}}.
+    """
     test_file = tmp_path / "test.pdf"
     test_file.write_bytes(b"fake pdf")
-    
+
     result = create_message_with_resource("test", test_file)
-    
-    url = result["content"][1]["image_url"]["url"]
-    assert url.startswith("data:application/pdf;base64,")
+
+    part = result["content"][1]
+    assert part["type"] == "file"
+    assert part["file"]["filename"] == "test.pdf"
+    assert part["file"]["file_data"] == "data:application/pdf;base64," + base64.b64encode(
+      b"fake pdf").decode()
+    assert "image_url" not in part
 
   def test_detects_jpeg_mime_type(self, tmp_path: Path):
     """Should detect JPEG MIME type from extension."""
@@ -94,6 +102,72 @@ class TestCreateMessageWithResource:
 class TestLLMGenerateWithResource:
   """Tests for LLM.generate_with_resource method."""
 
+  def test_codex_image_goes_to_codex_exec_with_i_flag(self, tmp_path: Path, monkeypatch):
+    """Regression: codex/ models were sent to ollama_chat(model="codex/...")."""
+    import merceka_core.llm as llm_module
+
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"\x89PNG fake")
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+      seen["cmd"], seen["input"] = cmd, kwargs["input"]
+
+      class Result:
+        returncode = 0
+        stdout = "an arrow"
+        stderr = ""
+      return Result()
+
+    def ollama_trap(**_kwargs):
+      raise AssertionError("codex model must not reach Ollama")
+
+    monkeypatch.setattr(llm_module._cli, "run_cli", fake_run)
+    monkeypatch.setattr(llm_module, "ollama_chat", ollama_trap)
+    llm = LLM("codex/gpt-5", system_prompt="SYS")
+    assert llm.generate_with_resource("what is this?", png) == "an arrow"
+    i = seen["cmd"].index("-i")
+    assert seen["cmd"][i + 1] == str(png)
+    assert seen["input"] == "SYS\n\nwhat is this?"
+
+  def test_codex_async_image_goes_to_codex_exec(self, tmp_path: Path, monkeypatch):
+    import asyncio
+
+    import merceka_core.llm as llm_module
+
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"\x89PNG fake")
+    seen = []
+
+    def fake_run(cmd, **_kwargs):
+      seen.append(cmd)
+
+      class Result:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+      return Result()
+
+    monkeypatch.setattr(llm_module._cli, "run_cli", fake_run)
+    assert asyncio.run(LLM("codex/default").agenerate_with_resource("x", png)) == "ok"
+    assert str(png) in seen[0]
+
+  def test_codex_non_image_resource_raises(self, tmp_path: Path, monkeypatch):
+    """codex exec attaches images only (-i); a PDF has no route."""
+    import asyncio
+
+    import merceka_core.llm as llm_module
+
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    monkeypatch.setattr(
+      llm_module._cli, "run_cli", lambda *_args, **_kwargs: pytest.fail("ran codex"))
+    llm = LLM("codex/gpt-5")
+    with pytest.raises(ValueError, match="codex"):
+      llm.generate_with_resource("x", pdf)
+    with pytest.raises(ValueError, match="codex"):
+      asyncio.run(llm.agenerate_with_resource("x", pdf))
+
   def test_raises_for_local_model(self, tmp_path: Path):
     """Should raise error when used with local (non-openrouter) model."""
     # Note: This would try to download the model if it doesn't exist,
@@ -120,3 +194,100 @@ class TestLLMGenerateWithResource:
     assert llm.use_openrouter is True
     # The actual call would need an API key and would hit the network
 
+
+
+class TestResourceFallback:
+  """generate_with_resource/agenerate_with_resource honour fallback= (review item 8)."""
+
+  @pytest.fixture
+  def png(self, tmp_path: Path) -> Path:
+    path = tmp_path / "shot.png"
+    path.write_bytes(b"\x89PNG fake")
+    return path
+
+  @pytest.fixture
+  def cloud(self, monkeypatch):
+    """_cloud_call fake: the primary (openrouter/primary) fails, others answer."""
+    calls = []
+
+    def fake(self, messages, **kwargs):
+      calls.append((self.model_name, messages, kwargs))
+      if self.model_name == "openrouter/primary":
+        raise ConnectionError("down")
+      return f"from {self.model_name}"
+
+    monkeypatch.setattr(LLM, "_cloud_call", fake)
+    return calls
+
+  def test_primary_failure_falls_back_with_the_same_resource(self, png, cloud):
+    llm = LLM("openrouter/primary", fallback="openrouter/fb")
+    assert llm.generate_with_resource("what?", png, temperature=0.0) == "from openrouter/fb"
+    model, messages, kwargs = cloud[1]
+    assert model == "openrouter/fb"
+    assert messages[-1]["content"][1]["type"] == "image_url"  # the image went too
+    assert kwargs == {"temperature": 0.0}
+
+  def test_async_primary_failure_falls_back(self, png, monkeypatch):
+    import asyncio
+
+    async def fake(self, messages, **kwargs):
+      if self.model_name == "openrouter/primary":
+        raise ConnectionError("down")
+      return f"from {self.model_name}"
+
+    monkeypatch.setattr(LLM, "_acloud_call", fake)
+    llm = LLM("openrouter/primary", fallback="openrouter/fb")
+    assert asyncio.run(llm.agenerate_with_resource("what?", png)) == "from openrouter/fb"
+
+  def test_transient_gemini_failure_falls_back(self, png, monkeypatch, cloud):
+    from merceka_core import llm_gemini
+    from merceka_core.errors import VideoBackendError
+
+    def gemini_down(*_args, **_kwargs):
+      raise VideoBackendError("503")
+
+    monkeypatch.setattr(llm_gemini, "_gemini_image_call", gemini_down)
+    monkeypatch.setattr("merceka_core.llm._gemini_image_call", gemini_down)
+    llm = LLM("gemini/gemini-flash-latest", fallback="openrouter/fb")
+    assert llm.generate_with_resource("what?", png) == "from openrouter/fb"
+
+  def test_terminal_gemini_failure_does_not_fall_back(self, png, monkeypatch, cloud):
+    from merceka_core.errors import VideoUploadError
+
+    def bad_key(*_args, **_kwargs):
+      raise VideoUploadError("401")
+
+    monkeypatch.setattr("merceka_core.llm._gemini_image_call", bad_key)
+    llm = LLM("gemini/gemini-flash-latest", fallback="openrouter/fb")
+    with pytest.raises(VideoUploadError):
+      llm.generate_with_resource("what?", png)
+    assert cloud == []
+
+  def test_no_fallback_raises(self, png, cloud):
+    with pytest.raises(ConnectionError):
+      LLM("openrouter/primary").generate_with_resource("what?", png)
+
+  def test_missing_resource_raises_without_trying_the_fallback(self, tmp_path, cloud):
+    llm = LLM("openrouter/primary", fallback="openrouter/fb")
+    with pytest.raises(FileNotFoundError):
+      llm.generate_with_resource("what?", tmp_path / "missing.png")
+    assert cloud == []
+
+  def test_gemini_fallback_gets_only_gemini_config_kwargs(self, png, monkeypatch, cloud):
+    seen = {}
+
+    def gemini(llm, message, resource_path, **kwargs):
+      seen["kwargs"] = kwargs
+      return "from gemini"
+
+    monkeypatch.setattr("merceka_core.llm._gemini_image_call", gemini)
+    llm = LLM("openrouter/primary", fallback="gemini/gemini-flash-latest")
+    out = llm.generate_with_resource(
+      "what?", png, temperature=0.0, max_tokens=400, provider={"order": ["a"]}, timeout=30)
+    assert out == "from gemini"
+    assert seen["kwargs"] == {"temperature": 0.0, "max_tokens": 400}
+
+  def test_claude_fallback_is_not_used_for_a_resource(self, png, cloud):
+    llm = LLM("openrouter/primary", fallback="claude/sonnet")
+    with pytest.raises(ConnectionError):
+      llm.generate_with_resource("what?", png)
