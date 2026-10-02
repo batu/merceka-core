@@ -15,6 +15,7 @@ import math
 import os
 import re
 import shutil
+from collections.abc import Sequence
 
 import httpx
 from PIL import Image
@@ -460,12 +461,19 @@ def _inpaint_openai(
   mask: Image.Image,
   prompt: str,
   model: str,
+  reference_images: Sequence[Image.Image] = (),
 ) -> Image.Image:
   """Masked edit via OpenAI's Images API.
 
   This is the right path for localized edits. It sends an alpha mask instead
   of asking the model to infer the editable region from prose, and uses low
   quality + JPEG output because level-editor dog previews are latency-sensitive.
+
+  ``reference_images`` ride as extra ``image[]`` parts after the edited image,
+  in order (image 2, image 3, ...). The API applies the mask to the first
+  image only, so references guide content (for example a character sheet)
+  without becoming editable canvas. With no references the request is the
+  same single-image request as before.
   """
   api_key = os.environ.get("OPENAI_API_KEY")
   if not api_key:
@@ -482,10 +490,20 @@ def _inpaint_openai(
   image_buf = io.BytesIO()
   image.convert("RGBA").save(image_buf, format="PNG")
 
-  files = {
+  files: dict | list = {
     "image[]": ("input.png", image_buf.getvalue(), "image/png"),
     "mask": ("mask.png", _mask_to_openai_alpha(mask), "image/png"),
   }
+  if reference_images:
+    # Repeated image[] fields need the list form; the first image stays first
+    # so the mask keeps applying to it.
+    parts = [("image[]", files["image[]"])]
+    for index, reference in enumerate(reference_images, start=2):
+      ref_buf = io.BytesIO()
+      reference.convert("RGBA").save(ref_buf, format="PNG")
+      parts.append(("image[]", (f"reference_{index}.png", ref_buf.getvalue(), "image/png")))
+    parts.append(("mask", files["mask"]))
+    files = parts
   # Production-art settings (2026-08-05). The previous low/jpeg combo was
   # tuned for latency-sensitive previews and leaked into final art: JPEG
   # noise straddles the level-editor's diff-extract threshold (torn subject
@@ -517,7 +535,8 @@ def _inpaint_openai(
     data = response.json()
 
   _costs.record(
-    source="openai-direct", model=f"openai/{model.removeprefix('openai/')}", usage=data.get("usage")
+    source="openai-direct", model=f"openai/{model.removeprefix('openai/')}", usage=data.get("usage"),
+    meta={"reference_images": len(reference_images)} if reference_images else None,
   )
   try:
     item = data["data"][0]
@@ -1020,29 +1039,47 @@ def inpaint(
   prompt: str,
   *,
   model: str = "fal-ai/flux-pro/v1/fill",
+  reference_images: Sequence[Image.Image] | None = None,
 ) -> Image.Image:
   """Fill masked region of image using inpainting.
 
-  Supports two provider types:
+  Supports three provider types:
   - fal.ai models (model starts with "fal-ai/"): true mask-based inpainting
-  - OpenRouter models (model starts with "google/" or "openai/"): prompt-directed
-    editing with image + mask sent as visual context
+  - OpenAI models (model starts with "openai/"): masked edit via the Images API
+  - OpenRouter models (anything else): prompt-directed editing with image +
+    mask sent as visual context
 
   Args:
     image: Source image (RGB).
     mask: Mask image — white = edit, black = preserve. Must match image dimensions.
     prompt: Description of what to generate in the masked area.
     model: Model identifier. fal.ai paths or OpenRouter model IDs.
+    reference_images: Optional extra images (for example a character reference
+      sheet) sent after ``image`` as images 2, 3, ... The mask applies to
+      ``image`` only. Only ``openai/`` models accept them; other providers
+      raise ValueError before any paid call rather than silently dropping the
+      reference. ``None`` or empty leaves the request unchanged.
 
   Returns:
     PIL Image in RGB mode with the masked region filled.
   """
   if image.size != mask.size:
     raise ValueError(f"Image size {image.size} doesn't match mask size {mask.size}")
+  references = list(reference_images or ())
+  for reference in references:
+    if not isinstance(reference, Image.Image):
+      raise TypeError(f"reference_images must be PIL images, got {type(reference).__name__}")
+  if references and not model.startswith("openai/"):
+    raise ValueError(
+      f"{model} does not support inpaint reference_images; only openai/ models send them. "
+      "Refusing before the paid call instead of painting without the reference."
+    )
 
   if model.startswith("fal-ai/"):
     return _inpaint_fal(image, mask, prompt, model)
   if model.startswith("openai/"):
+    if references:
+      return _inpaint_openai(image, mask, prompt, model, references)
     return _inpaint_openai(image, mask, prompt, model)
   else:
     return _inpaint_openrouter(image, mask, prompt, model)

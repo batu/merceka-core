@@ -187,3 +187,88 @@ def test_masked_edit_with_a_servable_aspect_is_sent(openai_edits):
   assert "mask" in fake.posts[0][1]["files"]
   assert result.size == size
   assert len(_ledger_rows()) == 1
+
+
+# --- masked edits with reference images ---
+
+
+def _parts(post_kwargs) -> list[tuple[str, tuple]]:
+  files = post_kwargs["files"]
+  return list(files.items()) if isinstance(files, dict) else list(files)
+
+
+def test_masked_edit_without_references_sends_one_image_and_the_mask(openai_edits):
+  fake = openai_edits()
+  size = (1500, 1000)
+
+  inpaint(Image.new("RGB", size), Image.new("L", size, 255), "p", model="openai/gpt-image-2.5-sunburst")
+  inpaint(
+    Image.new("RGB", size), Image.new("L", size, 255), "p",
+    model="openai/gpt-image-2.5-sunburst", reference_images=[],
+  )
+
+  for _url, kwargs in fake.posts:
+    # Unchanged request shape: the same dict of exactly one image[] and the mask.
+    assert isinstance(kwargs["files"], dict)
+    assert list(kwargs["files"]) == ["image[]", "mask"]
+    assert "input_fidelity" not in kwargs["data"]
+  assert all(row.get("meta") in (None, {}) for row in _ledger_rows())
+
+
+def test_masked_edit_sends_references_as_extra_images_after_the_crop(openai_edits):
+  fake = openai_edits()
+  size = (1500, 1000)
+  crop = Image.new("RGB", size, BLUE)
+  sheet = Image.new("RGB", (640, 480), RED)
+  pose = Image.new("RGB", (300, 300), (0, 255, 0))
+
+  result = inpaint(
+    crop, Image.new("L", size, 255), "p",
+    model="openai/gpt-image-2.5-sunburst", reference_images=[sheet, pose],
+  )
+
+  url, kwargs = fake.posts[0]
+  assert url == OPENAI_EDITS
+  parts = _parts(kwargs)
+  assert [name for name, _ in parts] == ["image[]", "image[]", "image[]", "mask"]
+  images = [Image.open(io.BytesIO(part[1])) for name, part in parts if name == "image[]"]
+  # The crop is first, so the mask applies to it; references follow in order.
+  assert images[0].size == size and images[0].convert("RGB").getpixel((0, 0)) == BLUE
+  assert images[1].size == (640, 480) and images[1].convert("RGB").getpixel((0, 0)) == RED
+  assert images[2].size == (300, 300)
+  mask = Image.open(io.BytesIO(dict(parts)["mask"][1]))
+  assert mask.size == size
+  # Output size and the gpt-image-2.5 no-input_fidelity rule are unaffected.
+  assert kwargs["data"]["size"] == "1536x1024"
+  assert "input_fidelity" not in kwargs["data"]
+  assert result.size == size
+  rows = _ledger_rows()
+  assert len(rows) == 1 and rows[0]["meta"] == {"reference_images": 2}
+
+
+@pytest.mark.parametrize("model", ["fal-ai/flux-pro/v1/fill", "google/gemini-3.1-flash-image-preview"])
+def test_references_with_a_non_openai_model_raise_before_any_call(openai_edits, model):
+  fake = openai_edits()
+  size = (1500, 1000)
+
+  with pytest.raises(ValueError, match="does not support inpaint reference_images"):
+    inpaint(
+      Image.new("RGB", size), Image.new("L", size, 255), "p",
+      model=model, reference_images=[Image.new("RGB", (64, 64))],
+    )
+
+  assert fake.posts == []
+  assert _ledger_rows() == []
+
+
+def test_reference_images_must_be_pil_images(openai_edits):
+  fake = openai_edits()
+  size = (1500, 1000)
+
+  with pytest.raises(TypeError, match="PIL images"):
+    inpaint(
+      Image.new("RGB", size), Image.new("L", size, 255), "p",
+      model="openai/gpt-image-2.5-sunburst", reference_images=["/tmp/sheet.png"],
+    )
+
+  assert fake.posts == []

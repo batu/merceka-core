@@ -74,6 +74,11 @@ key is set, otherwise through OpenRouter; `fal-ai/...` goes to fal. Edits that
 cannot keep the input's aspect ratio raise an error instead of stretching the
 image.
 
+`inpaint(..., reference_images=[sheet])` sends extra images after the edited
+one (images 2, 3, ...), for example a character reference sheet. The mask
+applies to the first image only. Only `openai/` models accept references; other
+providers raise before the call.
+
 ### Cost ledger
 
 Every metered provider call appends one JSONL row to `~/.merceka/costs.jsonl`
